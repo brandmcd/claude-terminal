@@ -15,8 +15,11 @@ Before=slices.target
 # spaCy en_core_web_sm) is the unmeasured one — expect 0.9-1.2 GB. 1800M leaves ~1.8 GB of
 # the box's 3.7 GB for everything else. Re-check with:
 #   systemctl show claude-voice.slice -p MemoryPeak -p MemoryCurrent
-MemoryHigh=1500M
-MemoryMax=1800M
+# Headroom for the measured worst case: STT ~270 MB steady + TTS 1379 MB peak = ~1650 MB.
+# The slice cap is what actually protects ttyd, the sidecar and live Claude sessions; the
+# per-unit caps only stop one service starving the other.
+MemoryHigh=1750M
+MemoryMax=2000M
 
 # The terminal wins CPU. Default weight is 100; voice runs at half priority so a synthesis
 # burst never starves an interactive session on 2 vCPUs.

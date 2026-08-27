@@ -5,13 +5,23 @@ paths under `/media/nas/filip/...`). This box is 2 vCPU / 3.7 GB with no GPU, sh
 `ct-ttyd`, `ct-sidecar` and live Claude Code sessions. This file is what actually gets it
 running here.
 
-**What here is measured, and what is not.** The STT half was genuinely executed on this
-box: model timings, RSS, the iOS fragmented-MP4 decode and every `/transcribe` smoke test
-below were run and their output pasted in. The TTS half was **not** — the CPU torch stack
-was never installed here, so the Kokoro download sizes, the step-3 command, the expected
-`/speak` output and the TTS RAM and RTF figures are all *derived or estimated, not
-observed*, and are marked **(not yet run here)** where they appear. If reality diverges
-from a line carrying that marker, trust reality, not this file.
+**Everything in this file has now been executed on this box.** Both venvs were synced, both
+models downloaded, both services started on loopback, and the smoke tests below are real
+transcript. Steps 1-3 and 5 were run end to end; only step 4 (installing the units) and
+step 6 (editing the root-owned sidecar config) are untried, because they need root.
+
+The numbers that changed once measured, all of which had been guessed low:
+
+| | first estimate | measured here |
+|---|---|---|
+| TTS venv | ~1.0 GB | **1.2 GB** |
+| STT RSS serving base.en | ~270 MB | **419 MB** |
+| Kokoro peak RSS | 0.9-1.2 GB | **1379 MB** |
+| Kokoro RTF (warm, 2 threads) | ~0.6-0.9 | **0.65-0.71** |
+
+The two RSS figures mattered: the original `MemoryHigh` values sat *below* the real peaks,
+which would have left both services in permanent reclaim. The units now carry the measured
+numbers.
 
 | | |
 |---|---|
@@ -92,7 +102,7 @@ UV=/home/ctuser/.local/bin/uv
 $UV sync --project /srv/claude-terminal/voice/stt
 
 # TTS — note tts-cpu, NOT tts. 338 MB of wheels (192 MB of that is CPU torch),
-# roughly 1.0 GB installed. (not yet run here — estimated from the lock's wheel sizes)
+# 1.2 GB installed (measured).
 $UV sync --project /srv/claude-terminal/voice/tts-cpu
 ```
 
@@ -170,7 +180,7 @@ cd /srv/claude-terminal/voice/tts && \
 |---|---|---|
 | `Systran/faster-whisper-base.en` | **141 MB** | `~/.cache/huggingface/hub/models--Systran--faster-whisper-base.en` |
 | `Systran/faster-whisper-tiny.en` (optional) | 75 MB | same tree |
-| `hexgrad/Kokoro-82M` weights + `af_heart` | **328 MB** *(not yet run here)* | `~/.cache/huggingface/hub/models--hexgrad--Kokoro-82M` |
+| `hexgrad/Kokoro-82M` weights + `af_heart` | **313 MB** (measured; HF cache totals 454 MB with base.en) | `~/.cache/huggingface/hub/models--hexgrad--Kokoro-82M` |
 | `en_core_web_sm` (step 2) | 12.8 MB wheel, ~33 MB installed | the `tts-cpu` venv |
 
 Grand total for a cold install: **~470 MB of wheels + ~480 MB of models**, about 1.6 GB on
@@ -283,8 +293,12 @@ curl -sS -X POST http://127.0.0.1:7802/speak \
 grep -i '^x-' /tmp/tts.headers
 python3 -c "import wave; w=wave.open('/tmp/tts.wav'); \
 print(w.getnchannels(),'ch',w.getframerate(),'Hz',round(w.getnframes()/w.getframerate(),2),'s')"
-# 1 ch 24000 Hz 2.4 s     <- expected shape, NOT YET RUN HERE. Channels and rate are read
-#                            straight out of voice/tts/main.py; the duration is a guess.
+# 1 ch 24000 Hz 2.73 s    <- actual output on this box.
+# x-audio-seconds: 2.725 / x-synth-seconds: 2.283  -> RTF 0.84 on a cold-ish service.
+#
+# Stronger check, also run here: feed that wav straight back to STT and you get
+#   {"text":"Voice Mode is running on the little box.", ...}
+# which exercises both services on real speech rather than a tone.
 ```
 
 `X-Synth-Seconds` divided by `X-Audio-Seconds` is the real-time factor. Anything under
@@ -427,13 +441,26 @@ shared slice exist to keep away from the terminal.
 
 ## Memory budget
 
-3.7 GB total, ~1.2 GB in use before voice, ~2.6 GB available.
+3.7 GB total, ~1.2 GB in use before voice, ~2.5 GB available.
 
 | Unit | `MemoryHigh` | `MemoryMax` | Basis |
 |---|---|---|---|
-| `claude-stt.local.service` | 420M | 600M | measured ~270 MB |
-| `claude-tts.local.service` | 1100M | 1500M | estimated 0.9–1.2 GB — **retune after day one** |
-| `claude-voice.slice` (both) | 1500M | 1800M | leaves ~1.8 GB for ttyd, the sidecar and Claude sessions |
+| `claude-stt.local.service` | 520M | 700M | **measured 419 MB** serving base.en at 2 threads |
+| `claude-tts.local.service` | 1450M | 1700M | **measured 1379 MB peak** across five syntheses |
+| `claude-voice.slice` (both) | 1750M | 2000M | caps the pair; what actually protects the terminal |
+
+**The number to take seriously.** With both services live and warm, this box measured:
+
+```
+               total        used        free      shared  buff/cache   available
+Mem:           3.7Gi       2.8Gi       175Mi       4.5Mi       1.0Gi       937Mi
+```
+
+Under 1 GB left for ttyd, the sidecar and every Claude Code session. That is enough for one
+session and not much else. If you run several sessions at once, stop the TTS service when
+you are not using voice (`systemctl stop claude-tts.local`) — it is the 1.4 GB half, it
+cold-starts in about 3 s, and STT alone is only 419 MB. The slice cap means the terminal
+survives regardless, but "survives" here means voice gets killed, not that nothing noticed.
 
 `MemoryMax` means a runaway voice service gets cgroup-OOM-killed and restarted by systemd,
 instead of the kernel's global OOM killer picking whichever process looks tastiest — which

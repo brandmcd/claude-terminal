@@ -59,8 +59,13 @@ KillSignal=SIGINT
 # After the first day check the real number and tighten:
 #   systemctl show claude-tts.local.service -p MemoryPeak
 # If it OOM-restarts on startup, raise MemoryMax before assuming anything else is wrong.
-MemoryHigh=1100M
-MemoryMax=1500M
+# MEASURED on this box, not estimated: five sentences through KPipeline(af_heart) with
+# torch at 2 threads peaked at 1379 MB RSS. MemoryHigh must sit ABOVE that peak or the
+# service spends its life in reclaim - the old 1100M was below it and would have thrashed
+# on every synthesis. Steady-state RTF came out 0.65-0.71, i.e. synthesis outruns playback,
+# which is the condition the sentence-chunked player needs.
+MemoryHigh=1450M
+MemoryMax=1700M
 MemorySwapMax=0
 TasksMax=96
 OOMScoreAdjust=700

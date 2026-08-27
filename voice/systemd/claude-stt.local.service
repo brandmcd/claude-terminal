@@ -61,11 +61,13 @@ TimeoutStopSec=20
 KillSignal=SIGINT
 
 # --- resource limits ---------------------------------------------------------
-# Measured steady state is ~270 MB. MemoryHigh throttles and reclaims first; MemoryMax is
+# MEASURED on this box serving base.en at 2 threads: 419 MB RSS after real requests, not
+# the 270 MB first estimated. MemoryHigh has to sit above that or the service throttles
+# permanently - 420M was landing exactly on it. MemoryHigh throttles and reclaims first; MemoryMax is
 # the hard wall, so a runaway here is cgroup-OOM-killed and restarted instead of the
 # kernel picking off ttyd or a Claude session.
-MemoryHigh=420M
-MemoryMax=600M
+MemoryHigh=520M
+MemoryMax=700M
 MemorySwapMax=0
 TasksMax=64
 # Belt and braces: if the *host* goes into global OOM anyway, make the kernel prefer this
