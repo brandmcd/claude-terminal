@@ -41,6 +41,7 @@
   // meta+return (Option/Alt+Enter), whose byte sequence is ESC + CR ("\x1b\r").
   // Intercept Shift+Enter and send that instead.
   document.addEventListener("keydown", (e) => {
+    if (e.target && e.target.closest && e.target.closest("#ct-composer")) return;
     if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
       if (sendToTerminal("\x1b\r")) {
         e.preventDefault();
@@ -125,7 +126,7 @@
   const NOTCH = 20; // px of finger travel per wheel notch
   // don't hijack touches inside our own UI (the history dialog + the tab bar) — they
   // need native scrolling.
-  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-drawer, #claude-tabbar"));
+  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-drawer, #claude-tabbar, #ct-composer"));
   let tStartX = 0, tStartY = 0, tLastY = 0, tAccum = 0, tScroll = false;
   document.addEventListener("touchstart", (e) => {
     tScroll = false; tAccum = 0;
@@ -277,6 +278,15 @@
   // start a session, and a theme toggle. Session data + actions come from the
   // claude-paste sidecar (/_paste/sessions, /_paste/sessions/new|close, /_paste/theme).
   const BAR_H = 34;
+  // iPhone PWAs run edge to edge (the ttyd index sets viewport-fit=cover), so the tab bar
+  // sits under the Dynamic Island unless it pads itself clear of the unsafe area. These
+  // resolve to 0px anywhere with no inset, so desktop and Android are untouched.
+  // Read through custom properties rather than env() directly, so the measured fallback
+  // below can override them when iOS renders edge to edge but reports an inset of 0.
+  const SAT = "var(--ct-sat)";
+  const SAB = "var(--ct-sab)";
+  const SAL = "env(safe-area-inset-left, 0px)";
+  const SAR = "env(safe-area-inset-right, 0px)";
   const MAIN_ID = "1"; // main session is always first; closing it just restarts it
   const curId = () => new URLSearchParams(location.search).get("arg") || MAIN_ID;
 
@@ -311,9 +321,14 @@
   const barStyle = document.createElement("style");
   barStyle.textContent = [
     // make room for the fixed bar
-    "#terminal-container{top:" + BAR_H + "px !important;height:calc(100% - " + BAR_H + "px) !important}",
+    "#terminal-container{top:calc(" + BAR_H + "px + " + SAT + ") !important;height:calc(100% - " + BAR_H + "px - " + SAT + ") !important}",
     // the bar itself (dark defaults; light overrides below via body.theme-light)
-    "#claude-tabbar{position:fixed;top:0;left:0;right:0;height:" + BAR_H + "px;z-index:50;display:flex;align-items:stretch;gap:6px;padding:0 8px;box-sizing:border-box;background:#181818;border-bottom:1px solid #2e2e2e;font:12px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:#cfcfcf;user-select:none;-webkit-user-select:none}",
+    "#claude-tabbar{position:fixed;top:" + SAT + ";left:0;right:0;height:" + BAR_H + "px;z-index:50;display:flex;align-items:stretch;gap:6px;padding:0 calc(8px + " + SAR + ") 0 calc(8px + " + SAL + ");box-sizing:border-box;background:#181818;border-bottom:1px solid #2e2e2e;font:12px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:#cfcfcf;user-select:none;-webkit-user-select:none}",
+    // Solid strip filling the status-bar / Dynamic Island region. Always dark, because
+    // black-translucent forces white status text regardless of the app theme.
+    ":root{--ct-sat:env(safe-area-inset-top, 0px);--ct-sab:env(safe-area-inset-bottom, 0px)}",
+    "#ct-safetop{position:fixed;top:0;left:0;right:0;height:" + SAT + ";z-index:60;background:#181818;pointer-events:none}",
+    "html,body{background:#0d1117}",
     "#claude-tabbar *{box-sizing:border-box}",
     // chips scroll; the + sits right after them (left-aligned, browser-style)
     "#claude-tabbar .ctab-list{display:flex;align-items:stretch;gap:6px;overflow-x:auto;scrollbar-width:none;flex:0 1 auto;min-width:0;-webkit-overflow-scrolling:touch}",
@@ -356,7 +371,7 @@
     "#ct-install.ios{align-items:flex-start}",
     // history dialog (resume a past conversation)
     "#ct-histmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5)}",
-    "#ct-histmodal .ct-hist{margin-top:" + (BAR_H + 12) + "px;width:min(640px,92vw);max-height:78vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-histmodal .ct-hist{margin-top:calc(" + (BAR_H + 12) + "px + " + SAT + ");width:min(640px,92vw);max-height:78vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
     "#ct-histmodal .ct-hist-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
     "#ct-histmodal .ct-hist-search{margin:8px 10px 2px;padding:7px 10px;border-radius:7px;border:1px solid #3a3a3a;background:#161616;color:#e6e6e6;font:13px system-ui,sans-serif;outline:none}",
     "#ct-histmodal .ct-hist-search:focus{border-color:#3d6cc4}",
@@ -460,8 +475,44 @@
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
 
+  const safeTop = document.createElement("div");
+  safeTop.id = "ct-safetop";
+
+  // iOS in a standalone PWA sometimes renders edge to edge while still reporting
+  // safe-area-inset-top: 0, which collapses every calc() that depends on it and puts the
+  // tab bar back under the camera. The viewport being as tall as the screen means nothing
+  // is reserving the status bar, so the inset is applied by hand in that case only. When
+  // iOS reports a real value, or the status bar is opaque, this changes nothing.
+  const iosStandalone = (() => {
+    try {
+      const ua = navigator.userAgent || "";
+      const ios = /iPhone|iPad|iPod/.test(ua) ||
+                  (/Mac/.test(navigator.platform || "") && (navigator.maxTouchPoints || 0) > 1);
+      const sa = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) ||
+                 window.navigator.standalone === true;
+      return ios && sa;
+    } catch { return false; }
+  })();
+
+  function applyInsetFallback() {
+    const root = document.documentElement;
+    root.style.removeProperty("--ct-sat");
+    const measured = readInset("top");
+    if (measured > 0 || !iosStandalone) return measured;
+    const sh = ((window.screen || {}).height) || 0;
+    const portrait = window.innerHeight >= window.innerWidth;
+    const longest = Math.max(window.innerHeight, window.innerWidth);
+    if (!(sh > 0 && longest >= sh - 8)) return 0; // status bar is reserved already
+    if (!portrait) return 0;                      // landscape puts the island on the side
+    const px = sh >= 800 ? 59 : sh >= 700 ? 47 : 20;
+    root.style.setProperty("--ct-sat", px + "px");
+    return px;
+  }
+
   function mountBar() {
     if (!document.body) return;
+    if (!safeTop.isConnected) document.body.appendChild(safeTop);
+    applyInsetFallback();
     if (!bar.isConnected) document.body.appendChild(bar);
     setTimeout(reflow, 50);
   }
@@ -953,7 +1004,7 @@
     add("meta", { name: "mobile-web-app-capable", content: "yes" });
     add("meta", { name: "apple-mobile-web-app-status-bar-style", content: "black-translucent" });
     add("meta", { name: "apple-mobile-web-app-title", content: "Claude" });
-    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png?v=3" });
+    if (!document.querySelector('link[rel="apple-touch-icon"]')) add("link", { rel: "apple-touch-icon", href: "/_ct/pwa/apple-touch-icon.png?v=6" });
   })();
 
   // Service worker (root scope) — drives push + installability. Served from /_ct/sw.js
@@ -1002,7 +1053,7 @@
         sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) });
       }
       await api("subscribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub) });
-      showToast("Notifications enabled 🦆", "success");
+      showToast("Notifications enabled", "success");
     } catch (e) {
       log("subscribe failed", e);
       showToast("Could not enable notifications", "error");
@@ -1052,15 +1103,37 @@
     if (!isMobile() && typeof document.hasFocus === "function" && !document.hasFocus()) return false;
     return true;
   }
+  // Reported with the heartbeat so the real device values show up in the sidecar log.
+  // Reading them here also proves whether iOS is handing us an inset at all.
+  function readInset(side) {
+    const probe = document.createElement("div");
+    probe.style.cssText =
+      "position:fixed;left:0;top:0;width:0;visibility:hidden;pointer-events:none;height:env(safe-area-inset-" + side + ",0px)";
+    document.documentElement.appendChild(probe);
+    const v = Math.round(probe.getBoundingClientRect().height);
+    probe.remove();
+    return v;
+  }
+  function insetReport() {
+    let standalone = false;
+    try {
+      standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) ||
+                   window.navigator.standalone === true;
+    } catch {}
+    return { top: readInset("top"), bottom: readInset("bottom"), standalone,
+             ih: window.innerHeight, sh: (window.screen || {}).height || 0 };
+  }
   function sendActive() {
     if (!isWatching()) return;
-    api("active", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: curId() }) }).catch(() => {});
+    api("active", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: curId(), inset: insetReport() }) }).catch(() => {});
   }
   sendActive();
   setInterval(sendActive, 10000);
   document.addEventListener("visibilitychange", sendActive);
   window.addEventListener("focus", sendActive);
   window.addEventListener("pageshow", sendActive);
+  window.addEventListener("orientationchange", () => setTimeout(() => { applyInsetFallback(); reflow(); }, 250));
+  window.addEventListener("resize", () => { applyInsetFallback(); });
   // #endregion
 
   // #region mobile install prompt
@@ -1077,7 +1150,7 @@
     installBanner.id = "ct-install";
     installBanner.className = opts.ios ? "ios" : "";
     const icon = document.createElement("img");
-    icon.src = "/_ct/pwa/icon-192.png?v=3";
+    icon.src = "/_ct/pwa/icon-192.png?v=6";
     icon.alt = "";
     const txt = document.createElement("div");
     txt.className = "ct-inst-txt";
@@ -1115,7 +1188,7 @@
     deferredPrompt = e;
     if (isMobile() && !isStandalone()) showInstallBanner();
   });
-  window.addEventListener("appinstalled", () => { deferredPrompt = null; hideInstallBanner(); showToast("Installed 🦆", "success"); });
+  window.addEventListener("appinstalled", () => { deferredPrompt = null; hideInstallBanner(); showToast("Installed", "success"); });
   // iOS Safari has no beforeinstallprompt — show the add-to-home-screen hint instead.
   if (isIOS() && isMobile() && !isStandalone() && !installDismissed()) {
     setTimeout(() => showInstallBanner({ ios: true }), 1600);
@@ -1159,6 +1232,130 @@
     [0, 80, 200, 400, 700, 1100].forEach((d) => setTimeout(blurTerminalInput, d));
   }
   // #endregion
+  // #endregion
+
+  // #region local composer
+  // Typing here is local and free. Only the submit crosses the Atlantic.
+  // NOTE: `bar` and `reflow` are already bound in this IIFE (tab bar / layout fixes),
+  // so this region uses compBar/compInput and reuses reflow().
+  // The composer helps on a touch keyboard, where typing into xterm is awkward. On a
+  // desktop it only duplicates Claude Code's own prompt, so it is not mounted there.
+  // Coarse pointer is the standard test: a touchscreen laptop with a mouse reports fine.
+  const isTouchDevice = window.matchMedia
+    ? window.matchMedia("(pointer: coarse)").matches
+    : (navigator.maxTouchPoints || 0) > 0;
+  // With no composer the terminal takes the full height below the tab bar, so the
+  // #terminal-container rule built from COMP_H below reserves nothing.
+  const COMP_H = isTouchDevice ? 46 : 0;
+  const compStyle = document.createElement("style");
+  compStyle.textContent = [
+    "#terminal-container{height:calc(100% - " + (BAR_H + COMP_H) + "px - " + SAT + " - " + SAB + ") !important}",
+    "#ct-composer{position:fixed;left:0;right:0;bottom:0;z-index:60;display:flex;gap:8px;align-items:flex-end;padding:7px calc(8px + " + SAR + ") calc(7px + " + SAB + ") calc(8px + " + SAL + ");box-sizing:border-box;background:#181818;border-top:1px solid #2e2e2e;font:14px/1.35 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-composer *{box-sizing:border-box}",
+    "#ct-composer #ct-in{flex:1 1 auto;min-width:0;height:32px;resize:none;overflow-y:auto;padding:7px 9px;border-radius:8px;border:1px solid #333;background:#242424;color:#e8e8e8;font:inherit;outline:none}",
+    "#ct-composer #ct-in:focus{border-color:#3d6cc4}",
+    "#ct-composer #ct-send{flex:0 0 auto;height:32px;padding:0 14px;border-radius:8px;border:1px solid #3d6cc4;background:#2b3b55;color:#fff;font:inherit;cursor:pointer}",
+    "#ct-composer #ct-send:hover{background:#345080}",
+    "body.theme-light #ct-composer{background:#f3f3f3;border-top-color:#d8d8d8}",
+    "body.theme-light #ct-composer #ct-in{background:#fff;color:#1a1a1a;border-color:#ccc}",
+    "body.theme-light #ct-composer #ct-send{background:#dbe7fb;color:#12315f;border-color:#9dbdf0}",
+  ].join("");
+  (document.head || document.documentElement).appendChild(compStyle);
+
+  const compBar = document.createElement("div");
+  compBar.id = "ct-composer";
+  compBar.innerHTML =
+    '<textarea id="ct-in" rows="1" autocapitalize="sentences" autocomplete="off" ' +
+    'autocorrect="off" spellcheck="false" ' +
+    'placeholder="Prompt. Enter sends, Shift+Enter is a newline."></textarea>' +
+    '<button id="ct-send" type="button">Send</button>';
+  const compInput = compBar.querySelector("#ct-in");
+
+  // Only reflow xterm when the bar's height actually changes; a reflow per keystroke
+  // would refit the terminal on every character.
+  let compLastH = 0;
+  let compRaf = 0;
+  let compLastValue = null;
+  const compFrame = window.requestAnimationFrame
+    ? (fn) => window.requestAnimationFrame(fn)
+    : (fn) => setTimeout(fn, 16);
+
+  // Reading scrollHeight straight after writing style.height forces the browser to lay
+  // out the whole page synchronously, xterm's canvas included. Doing that once per
+  // keystroke is what made typing lag on a phone. Measuring is now coalesced into one
+  // pass per animation frame, so a burst of characters costs one layout, not one each.
+  function measureComposer() {
+    compRaf = 0;
+    if (compInput.value === compLastValue) return;
+    compLastValue = compInput.value;
+    compInput.style.height = "auto";
+    const cap = Math.round(window.innerHeight * 0.4);
+    const h = Math.max(32, Math.min(compInput.scrollHeight, cap));
+    compInput.style.height = h + "px";
+    const need = Math.max(COMP_H, h + 14);
+    if (need === compLastH) return;
+    compLastH = need;
+    const tc = document.getElementById("terminal-container");
+    // barStyle/compStyle set height with !important, so an inline set must match it.
+    if (tc) tc.style.setProperty("height", "calc(100% - " + (BAR_H + need) + "px - " + SAT + " - " + SAB + ")", "important");
+    reflow();
+  }
+
+  function autoGrow() {
+    if (compRaf) return;
+    compRaf = compFrame(measureComposer);
+  }
+
+  function submitComposer() {
+    const text = compInput.value;
+    if (!text) return;
+    // Ink reads \r and \n as submit and ESC+CR as "insert a newline". Same mechanism the
+    // Shift+Enter handler above relies on, so this keeps a multi-line prompt in one message.
+    if (!sendToTerminal(text.split("\n").join("\x1b\r"))) return;
+    sendToTerminal("\r");
+    compInput.value = "";
+    autoGrow();
+  }
+
+  compInput.addEventListener("input", autoGrow);
+  compInput.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.ctrlKey || e.altKey || e.metaKey) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.shiftKey) {
+      const i = compInput.selectionStart;
+      compInput.value = compInput.value.slice(0, i) + "\n" + compInput.value.slice(i);
+      compInput.selectionStart = compInput.selectionEnd = i + 1;
+      autoGrow();
+    } else {
+      submitComposer();
+    }
+  });
+  compBar.querySelector("#ct-send").addEventListener("click", submitComposer);
+
+  // Keep the bar above the on-screen keyboard. The terminal-container transform in the
+  // mobile-keyboard region moves the frame; this moves the composer with it.
+  if (window.visualViewport) {
+    const liftComposer = () => {
+      const w = window.visualViewport;
+      const kb = Math.max(0, Math.round(window.innerHeight - w.height - w.offsetTop));
+      compBar.style.bottom = kb > 120 ? kb + "px" : "0px";
+    };
+    window.visualViewport.addEventListener("resize", liftComposer);
+    window.visualViewport.addEventListener("scroll", liftComposer);
+  }
+
+  function mountComposer() {
+    if (!document.body || document.getElementById("ct-composer")) return;
+    document.body.appendChild(compBar);
+    compLastH = 0;
+    autoGrow();
+    setTimeout(reflow, 320);
+  }
+  if (isTouchDevice) {
+    if (document.body) mountComposer();
+    else document.addEventListener("DOMContentLoaded", mountComposer);
+  }
   // #endregion
 
   if (document.body) mountBar();

@@ -496,7 +496,9 @@ const server = Bun.serve({
 
     // #region terminal sidecar (owner-gated where noted)
     if (req.method === "GET" && path === "/overlay.js") {
-      return new Response(Bun.file(overlayPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" } });
+      // The injected tag carries ?v=<n>, so a new overlay gets a new URL. That makes it
+      // safe to cache hard here and saves a revalidation round trip on every page load.
+      return new Response(Bun.file(overlayPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "public, max-age=31536000, immutable" } });
     }
 
     // #region PWA (installable app) — manifest, service worker, icons. Ungated
@@ -508,10 +510,10 @@ const server = Bun.serve({
         display: "standalone", display_override: ["standalone", "fullscreen", "minimal-ui"],
         orientation: "any", background_color: BG_COLOR, theme_color: THEME_COLOR,
         icons: [
-          { src: "/_ct/pwa/icon-192.png?v=3", sizes: "192x192", type: "image/png", purpose: "any" },
-          { src: "/_ct/pwa/icon-512.png?v=3", sizes: "512x512", type: "image/png", purpose: "any" },
-          { src: "/_ct/pwa/icon-maskable-192.png?v=3", sizes: "192x192", type: "image/png", purpose: "maskable" },
-          { src: "/_ct/pwa/icon-maskable-512.png?v=3", sizes: "512x512", type: "image/png", purpose: "maskable" },
+          { src: "/_ct/pwa/icon-192.png?v=6", sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-512.png?v=6", sizes: "512x512", type: "image/png", purpose: "any" },
+          { src: "/_ct/pwa/icon-maskable-192.png?v=6", sizes: "192x192", type: "image/png", purpose: "maskable" },
+          { src: "/_ct/pwa/icon-maskable-512.png?v=6", sizes: "512x512", type: "image/png", purpose: "maskable" },
         ],
       }, { headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "no-cache" } });
     }
@@ -556,6 +558,12 @@ const server = Bun.serve({
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });
       let body: any = {}; try { body = await req.json(); } catch {}
       if (body?.id != null) markWatched(String(body.id));
+      // Device-reported safe-area values, so a layout problem on a phone can be read off
+      // the log here instead of guessed at from a screenshot.
+      if (body?.inset) {
+        const i = body.inset;
+        console.log(`[inset] id=${body.id} top=${i.top} bottom=${i.bottom} standalone=${i.standalone} innerH=${i.ih} screenH=${i.sh} ua=${(req.headers.get("user-agent")||"").slice(0,60)}`);
+      }
       return Response.json({ ok: true }, { headers: cors(req) });
     }
     // Generic: anything the owner (or a local service like stonkbot) wants to push.
@@ -585,7 +593,9 @@ const server = Bun.serve({
       const id = String(body.id || "");
       const kind = String(body.kind || "done");
       if (!id) return new Response("Missing id", { status: 400 });
-      if (isWatched(id)) {
+      // A question waiting on you is worth the push even with the tab on screen. A
+      // finished turn is not, so only that one stays suppressed while you are watching.
+      if (kind !== "waiting" && isWatched(id)) {
         return Response.json({ ok: true, suppressed: true });
       }
       const t = (await titleForSession(id)) || `Session ${id}`;
