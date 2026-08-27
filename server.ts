@@ -188,6 +188,10 @@ function buildLeaderboard() {
     users.push({
       user,
       name: cfg.names?.[user] || titleCase(user),
+      // cfg.colors was documented in config.example.json but nothing ever read it: the
+      // dashboard carried a hardcoded roster instead, so a fresh install showed another
+      // operator's names. Send it per row and let the page fall back to its hash.
+      color: cfg.colors?.[user] || null,
       host: (cfg.hosts || []).includes(user),
       output_5h: rolling(hours, "output", now),
       output_total: cum.output,

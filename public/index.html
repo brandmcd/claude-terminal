@@ -184,10 +184,15 @@
 <script>
 // Fixed color per user so a person keeps their color no matter their rank; unknown users
 // (new guests) get a stable color hashed from their username, not tied to position.
-const COLORS = { filip:"#3b82f6", ian:"#f59e0b", kate:"#10b981", michel:"#ec4899" };
-const POOL = ["#8b5cf6","#ef4444","#14b8a6","#eab308","#06b6d4","#f97316","#a855f7","#84cc16"];
+// Colors come from the backend (config.json "colors", sent per row as .color) so this
+// page carries no roster of its own. Anyone without a configured color keeps a stable
+// hashed one, tied to the username rather than to their rank.
+const COLORS = Object.create(null);
+const POOL = ["#3b82f6","#8b5cf6","#ef4444","#14b8a6","#eab308","#06b6d4","#f97316","#a855f7","#84cc16"];
 function hashIdx(s, n){ let h=0; for(let i=0;i<s.length;i++) h=(h*31 + s.charCodeAt(i))>>>0; return h % n; }
 const colorFor = u => COLORS[u] || POOL[hashIdx(u, POOL.length)];
+// Called on every payload before anything renders; rows without a color are left alone.
+function learnColors(d){ for(const u of (d && d.users) || []) if(u.color) COLORS[u.user] = u.color; }
 
 const fmt = n => n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
 const money = v => "$"+Number(v).toFixed(2);
@@ -386,6 +391,7 @@ async function load(first){
     const r = await fetch("api?t="+Date.now(), {cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const d = await r.json(); DATA = d;
+    learnColors(d); // must precede build/refresh — every chart reads colorFor() as it renders
     const s = sig(d);
     if(first || s !== lastSig){ lastSig = s; build(d); }
     else refresh(d);

@@ -511,7 +511,9 @@
   const usageBtn = document.createElement("a");
   usageBtn.className = "ctab-btn ctab-usage";
   usageBtn.title = "Claude usage";
-  usageBtn.href = "https://users.filipkin.com/usage/";
+  // Same-origin and relative: this instance serves its own dashboard at /usage/.
+  // (Was hardcoded to another operator's host, which every fork inherited.)
+  usageBtn.href = "/usage/";
   usageBtn.target = "_blank";
   usageBtn.rel = "noopener";
   usageBtn.innerHTML = SVG_USAGE;

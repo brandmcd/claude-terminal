@@ -1,6 +1,6 @@
 # Terminal-prompt PWA icon set (">_" in terminal green on the app's dark background).
 #
-# Replaces the upstream duck-in-the-sunburst mark. Kept as a script so the whole set
+# Replaces the upstream sunburst-with-an-emoji mark. Kept as a script so the whole set
 # regenerates consistently: a hand-edited PNG here and a stale one there is what put a
 # transparent-cornered apple-touch-icon and a hairline push badge into the tree.
 #
