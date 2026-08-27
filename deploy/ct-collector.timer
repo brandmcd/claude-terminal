@@ -1,0 +1,13 @@
+[Unit]
+Description=run the claude-terminal usage collector every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=10s
+# The collector POSTs /internal/tick when it finishes, which is what pushes the open
+# dashboard over SSE. Persistent so a reboot does not leave a gap in the hourly series.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,52 @@
+{
+  "owner": "brandon",
+  "host": "127.0.0.1",
+  "port": 7682,
+  "db": "/var/lib/claude-terminal/usage.db",
+  "dataDir": "/home/ctuser/.claude/projects",
+  "spawnHelper": "/srv/claude-terminal/bin/claude-spawn",
+  "spawnCwd": "/home/ctuser/work",
+  "usagePage": true,
+  "subscriptionUsd": 0,
+  "appName": "Claude",
+  "appShort": "Claude",
+  "themeColor": "#c8102e",
+  "bgColor": "#111318",
+  "collectSeconds": 60,
+  "names": {
+    "brandon": "Brandon"
+  },
+  "hosts": [
+    "brandon"
+  ],
+  "colors": {
+    "brandon": "#4ADE80"
+  },
+  "appModels": [
+    {
+      "id": "claude-opus-5",
+      "label": "Opus 5"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "label": "Sonnet 5"
+    },
+    {
+      "id": "claude-fable-5",
+      "label": "Fable 5"
+    }
+  ],
+  "appMoreModels": [
+    {
+      "id": "claude-haiku-4-5",
+      "label": "Haiku 4.5"
+    },
+    {
+      "id": "claude-opus-4-8",
+      "label": "Opus 4.8"
+    }
+  ],
+  "voice": true,
+  "sttUrl": "http://127.0.0.1:7801",
+  "ttsUrl": "http://127.0.0.1:7802"
+}
