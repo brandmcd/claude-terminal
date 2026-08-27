@@ -30,6 +30,14 @@
     if (protos.includes("tty")) {
       log("captured ttyd ws", url);
       ttydWs = ws;
+      // Belt and braces around the feature detect inside attach(). We are running inside
+      // ttyd's `new WebSocket(...)`, so ANY throw from here propagates into connect() and
+      // the terminal never comes up. Predictive echo is a convenience; it does not get to
+      // take the terminal down with it under any circumstances.
+      if (PREDICT_ON) {
+        try { predict.attach(ws, window.term); }
+        catch (e) { log("predict: attach failed, continuing without it", e); }
+      }
     }
     return ws;
   }
@@ -48,6 +56,395 @@
     ttydWs.send("0" + text);
     return true;
   }
+  // #endregion
+
+  // #region predictive local echo
+  // Rollback netcode for a terminal. Ann Arbor -> Nuremberg is ~110ms, so every character
+  // typed into xterm appears a fifth of a second after the finger left the key. Paint the
+  // character locally at the cursor the instant it goes out on the wire, and let the
+  // server's own frame land on top of it.
+  //
+  // This is a PURE DOM OVERLAY over .xterm-screen. It never writes to xterm, never mutates
+  // the buffer, never sends a byte. That is what makes "a wrong prediction cannot corrupt
+  // the terminal" a fact rather than a hope: rolling back is not a repair, it is deleting
+  // our own spans, after which the server's frame — untouched all along — is simply what
+  // is on screen. The invariant is meant to be checked by grep rather than believed:
+  // search this region for a call to write, input or paste on the terminal, or for a call
+  // to send on a socket, and there are none. The only mention of the socket's own send is
+  // the wrapper in attach(), which forwards the caller's frame and originates nothing.
+  //
+  // How long a wrong glyph can survive: NOT one RTT. The bound is the watchdog, which is
+  // max(300ms, 3*srtt) after the LAST keystroke — it is re-armed on every push, so holding
+  // a key down against a hung server postpones it, capped by MAX_DEPTH below. A server
+  // frame that contradicts a prediction clears it immediately; the watchdog is the floor
+  // for the cases nothing contradicts, such as the app blanking the line (a cleared cell
+  // and an unreached cell are indistinguishable to positional reconciliation). Bounded and
+  // self-healing in every path — but "one RTT" would be an overclaim.
+  //
+  // What the stats cover: only characters typed DIRECTLY into xterm. #ct-composer is a real
+  // textarea, so on a phone push() refuses at the activeElement gate and its submissions
+  // arrive as multi-char frames inside the paste window. A low sample count after a day of
+  // phone use is the expected result, not evidence the feature is broken.
+  //
+  // SHIPS MEASURE-ONLY. With PAINT=false the whole pipeline runs — classify, queue,
+  // reconcile, hit/miss, srtt — and paints nothing, so real typing can be judged from
+  // window.__ctPredictStats() before a single speculative pixel is shown. Turn painting on
+  // by flipping PAINT, or with localStorage["ct-predict"]="paint" — overlay.js is served
+  // immutable for a year, so the switch has to be reachable without a redeploy. The same
+  // way out: localStorage["ct-predict"]="off", or ?nopredict in the URL, disables it whole.
+  const PAINT = false;
+
+  const predictMode = (function () {
+    try {
+      if (new URLSearchParams(location.search).has("nopredict")) return "off";
+      const s = localStorage.getItem("ct-predict");
+      if (s === "off" || s === "paint") return s;
+    } catch (e) {}
+    return "on";
+  })();
+  const PREDICT_ON = predictMode !== "off";
+  const PREDICT_PAINT = PAINT || predictMode === "paint";
+
+  const predict = (function () {
+    const MAX_DEPTH = 8;         // hard ceiling on unconfirmed characters
+    const MIN_STREAK = 3;        // consecutive correct predictions before anything is drawn
+    const PASTE_QUIET_MS = 250;  // sit-out after any multi-character payload
+    const MIN_WATCHDOG_MS = 300;
+
+    let term = null;
+    let layer = null;
+    let pending = [];   // [{ch,t}] unconfirmed characters, in screen order from anchor
+    let anchor = null;  // {row,col} absolute buffer coords of pending[0]
+    let epoch = 0;      // bumped by flush(); anything async carrying a stale epoch no-ops
+    let streak = 0;
+    let hits = 0, misses = 0, pushes = 0, srtt = 0;
+    let watchdog = 0;
+    let pasteUntil = 0;
+    let teardown = [];
+
+    // Everything below reaches into xterm internals, which a ttyd upgrade is free to
+    // rename. Check them all up front and stay off if any is missing, so the failure is
+    // "the feature quietly does nothing" instead of "typing throws on every keystroke".
+    function usable(t) {
+      try {
+        const core = t && t._core;
+        if (!core || !core.screenElement) return false;
+        if (!t.buffer || !t.buffer.active || typeof t.buffer.active.getLine !== "function") return false;
+        if (!t.textarea) return false;
+        // Every event hook attach() subscribes to, not just onWriteParsed. Checking only
+        // the one it reconciles on left the other four to throw from inside attach() —
+        // i.e. from inside `new WebSocket(...)` in ttyd's connect(), which would stop the
+        // terminal connecting at all. That is far worse than the failure this guard exists
+        // to prevent, and it fires on exactly the ttyd upgrade the guard is meant to survive.
+        if (typeof t.onWriteParsed !== "function") return false;
+        if (typeof t.onResize !== "function") return false;
+        if (typeof t.onSelectionChange !== "function") return false;
+        if (typeof t.onScroll !== "function") return false;
+        if (typeof t.buffer.onBufferChange !== "function") return false;
+        const rs = core._renderService;
+        const cell = rs && rs.dimensions && rs.dimensions.css && rs.dimensions.css.cell;
+        if (!cell || !(cell.width > 0) || !(cell.height > 0)) return false;
+        const colors = core._themeService && core._themeService.colors;
+        if (!colors || !colors.foreground || !colors.foreground.css) return false;
+        // .css on all four, not just foreground: paint() reads every one of them, and a
+        // missing .css would emit `background:undefined` — inert, so the span turns
+        // transparent and xterm's real block cursor shows through the prediction.
+        if (!colors.background || !colors.background.css) return false;
+        if (!colors.cursor || !colors.cursor.css) return false;
+        if (!colors.cursorAccent || !colors.cursorAccent.css) return false;
+        return true;
+      } catch (e) { return false; }
+    }
+
+    // Drop the speculative layer. Never throws, and is the answer to every doubt.
+    function flush() {
+      epoch++;
+      pending = [];
+      anchor = null;
+      if (watchdog) { clearTimeout(watchdog); watchdog = 0; }
+      try { if (layer && layer.parentNode) layer.parentNode.removeChild(layer); } catch (e) {}
+      layer = null;
+    }
+
+    // A prediction that was contradicted, or never confirmed at all. This is the only
+    // thing that resets the confidence gate — a flush on Enter or a resize must not, or
+    // the first characters of every line would be slow forever.
+    function miss() { misses++; streak = 0; flush(); }
+
+    // The backstop, and deliberately the one safety valve that depends on no xterm
+    // internals whatsoever: if a prediction is not confirmed within three round trips it
+    // disappears, whatever the buffer, the renderer or the event stream are doing.
+    function arm() {
+      if (watchdog) clearTimeout(watchdog);
+      const myEpoch = epoch;
+      watchdog = setTimeout(function () {
+        if (myEpoch !== epoch) return;
+        miss();
+      }, Math.max(MIN_WATCHDOG_MS, 3 * srtt));
+    }
+
+    // ttyd frames input as INPUT('0') + utf8 payload, sent as a Uint8Array by ttyd itself
+    // and as a plain string by sendToTerminal() above; a browser may hand a wrapped send
+    // an ArrayBuffer. Anything not an input frame (the auth JSON, RESIZE, PAUSE/RESUME) is
+    // not ours to look at. Multi-byte input decodes to latin1 nonsense here, which is
+    // harmless: it is >1 char long and therefore refused anyway.
+    function payloadOf(data) {
+      if (typeof data === "string") return data.charCodeAt(0) === 48 ? data.slice(1) : null;
+      let u = null;
+      if (data instanceof Uint8Array) u = data;
+      else if (data instanceof ArrayBuffer) u = new Uint8Array(data);
+      else if (ArrayBuffer.isView(data)) u = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      if (!u || u.length < 2 || u[0] !== 48) return null;
+      let s = "";
+      for (let i = 1; i < u.length; i++) s += String.fromCharCode(u[i]);
+      return s;
+    }
+
+    // Watch the socket, not term.onData: onData never sees overlay.js's own injections
+    // (Shift+Enter, the composer, a pasted image path), and those must flush too.
+    function observe(data) {
+      const p = payloadOf(data);
+      if (p === null || p === "") return;
+      if (p.length > 1) {
+        // A paste, a mouse report, an escape sequence — and, for the next quarter second,
+        // whatever else that burst is about to push through. Predicting inside one means
+        // racing a reflow we cannot see.
+        pasteUntil = Date.now() + PASTE_QUIET_MS;
+        flush();
+        return;
+      }
+      const code = p.charCodeAt(0);
+      if (code === 8 || code === 127) { unpush(); return; }
+      if (code < 0x20 || code > 0x7e) { flush(); return; } // Enter, ESC, arrows, Ctrl-*, Tab
+      push(p);
+    }
+
+    // Backspace is predicted only as the cancellation of our own speculation. A real
+    // backspace reflows the rest of the input line, i.e. repaints cells we do not own, so
+    // with an empty queue we do nothing and wait for the server like any other key.
+    function unpush() {
+      if (!pending.length) return;
+      pending.pop();
+      if (!pending.length && watchdog) { clearTimeout(watchdog); watchdog = 0; }
+      paint();
+    }
+
+    function push(ch) {
+      try {
+        if (!term) return;
+        const buf = term.buffer.active;
+        // Every refusal below drops the whole layer rather than merely skipping this
+        // character: a queue that is missing a character the user actually typed no longer
+        // describes the screen, and the next backspace would cancel the wrong cell.
+        if (buf.type !== "alternate") { flush(); return; }        // tmux keeps us on the alt screen
+        if (document.activeElement !== term.textarea) { flush(); return; }
+        if (Date.now() < pasteUntil) { flush(); return; }
+        if (pending.length >= MAX_DEPTH) { flush(); return; }
+        if (!pending.length) {
+          // NEVER predict the first character of a line. That one rule kills the three
+          // worst mispredictions at a stroke: "/" opening the command menu, "@" opening
+          // the file picker, and painting over Claude Code's dim placeholder in the bright
+          // foreground colour. "Blank to the left" cannot tell a typed space from a cell
+          // nobody has touched, so the cost is one real-latency keystroke per word rather
+          // than per line — still the right trade against opening a menu by accident.
+          const row = buf.baseY + buf.cursorY;
+          const col = buf.cursorX;
+          if (col <= 0) { flush(); return; }
+          const line = buf.getLine(row);
+          const left = line && line.getCell(col - 1);
+          const leftCh = left && left.getChars();
+          if (!leftCh || leftCh === " ") { flush(); return; }
+          anchor = { row: row, col: col };
+        }
+        const col = anchor.col + pending.length;
+        if (col + 2 >= term.cols) { flush(); return; } // no speculating into the wrap
+        const line = buf.getLine(anchor.row);
+        const cell = line && line.getCell(col);
+        if (!cell || !cell.isBgDefault()) { flush(); return; } // a coloured cell is someone's UI
+        pending.push({ ch: ch, t: Date.now() });
+        pushes++;
+        arm();
+        paint();
+      } catch (e) {
+        flush();
+      }
+    }
+
+    // Reconcile on onWriteParsed, NOT on the socket message event: write() is queued
+    // through xterm's WriteBuffer, so the message fires long before the screen agrees.
+    // Confirmation is POSITIONAL, never byte matching — Ink repaints the whole input box
+    // on every keystroke, so there is no per-character echo to match against.
+    function reconcile() {
+      if (!pending.length || !anchor) return;
+      try {
+        const buf = term.buffer.active;
+        if (buf.type !== "alternate") { flush(); return; }
+        const line = buf.getLine(anchor.row);
+        if (!line) { flush(); return; }
+        let k = 0;
+        while (k < pending.length) {
+          const cell = line.getCell(anchor.col + k);
+          if (!cell || cell.getChars() !== pending[k].ch) break;
+          k++;
+        }
+        if (k > 0) {
+          const now = Date.now();
+          for (let i = 0; i < k; i++) {
+            hits++;
+            streak++;
+            const sample = now - pending[i].t;
+            srtt = srtt ? 0.875 * srtt + 0.125 * sample : sample;
+          }
+          pending = pending.slice(k);
+          anchor.col += k;
+          if (watchdog) { clearTimeout(watchdog); watchdog = 0; }
+          if (pending.length) arm();
+        }
+        if (pending.length) {
+          // A cell holding some OTHER character is the server disagreeing, and the whole
+          // speculative tail goes. A cell that is merely still blank is the frame carrying
+          // our character not having landed yet — that is what the watchdog is for, and
+          // treating it as a miss would keep the confidence gate permanently at zero.
+          //
+          // Read at anchor.col, NOT anchor.col + k: the retire above already sliced
+          // `pending` and advanced `anchor.col` past the confirmed prefix, so the first
+          // still-unconfirmed cell is index 0 of what remains. Indexing by k again looked
+          // right but tested `k < N-k` and probed col + 2k — which skipped the check
+          // entirely in the ordinary "one confirmed, one in flight" case, and elsewhere
+          // scored a miss against a cell inside our own span.
+          const cell = line.getCell(anchor.col);
+          const ch = cell && cell.getChars();
+          // A server-blanked cell is indistinguishable from one the frame has not reached,
+          // so a genuine "the app cleared the line" disagreement is caught by the watchdog
+          // rather than here. Bounded either way; positional reconciliation cannot do better.
+          if (!cell || (ch !== "" && ch !== " ")) { miss(); return; }
+        }
+        paint();
+      } catch (e) {
+        flush();
+      }
+    }
+
+    function esc(ch) {
+      return ch === "&" ? "&amp;" : ch === "<" ? "&lt;" : ch === ">" ? "&gt;" : ch;
+    }
+
+    function paint() {
+      if (!PREDICT_PAINT) return;
+      // The confidence gate, and the valve that matters most. Below the threshold the
+      // pipeline still runs and still scores itself, it just shows nothing. That learns
+      // "input box" versus "modal menu" without knowing the first thing about Ink:
+      // walking into a y/n prompt costs one wrong character, once.
+      if (!pending.length || !anchor || streak < MIN_STREAK) {
+        if (layer) { try { layer.parentNode.removeChild(layer); } catch (e) {} layer = null; }
+        return;
+      }
+      try {
+        const core = term._core;
+        const screen = core.screenElement;
+        const cell = core._renderService.dimensions.css.cell;
+        // Re-read on every paint, so the theme toggle needs no listener and a refit needs
+        // no recomputation of ours.
+        const colors = core._themeService.colors;
+        const fg = colors.foreground.css, bg = colors.background.css;
+        const cur = colors.cursor.css, curFg = colors.cursorAccent.css;
+        const w = cell.width, h = cell.height;
+        const top = (anchor.row - term.buffer.active.baseY) * h;
+        const left = anchor.col * w;
+        if (top < 0) { flush(); return; }
+        if (!layer) {
+          layer = document.createElement("div");
+          // z-index 4 sits above xterm's canvases (no z-index) and below its decorations
+          // (6), ruler (8) and a11y tree (10). screenElement is position:relative already,
+          // so absolute coordinates here are cell coordinates.
+          layer.style.cssText = "position:absolute;pointer-events:none;white-space:pre;z-index:4";
+        }
+        if (layer.parentNode !== screen) screen.appendChild(layer);
+        // Deliberately NOT rounded: webgl draws glyphs at unrounded offsets, and rounding
+        // ours makes the prediction shimmer half a pixel when the server's frame replaces it.
+        layer.style.top = top + "px";
+        layer.style.left = left + "px";
+        layer.style.font = (term.options.fontSize || 13) + "px/" + h + "px " + (term.options.fontFamily || "monospace");
+        const box = "display:inline-block;width:" + w + "px;height:" + h + "px;line-height:" + h +
+          "px;overflow:hidden;";
+        const html = [];
+        for (let i = 0; i < pending.length; i++) {
+          // The background MUST be opaque: xterm has painted a real block cursor at the
+          // insertion cell and it would otherwise show straight through the prediction.
+          html.push('<span style="' + box + "color:" + fg + ";background:" + bg + '">' + esc(pending[i].ch) + "</span>");
+        }
+        // cursorBlink is off and cursorStyle is block, so the fake cursor one cell to the
+        // right is a static filled rectangle — no animation to keep in step.
+        html.push('<span style="' + box + "color:" + curFg + ";background:" + cur + '"> </span>');
+        layer.innerHTML = html.join(""); // one atomic swap: no per-span churn, no flicker
+      } catch (e) {
+        flush();
+      }
+    }
+
+    function disposeAll() {
+      for (let i = 0; i < teardown.length; i++) {
+        try { teardown[i].dispose(); } catch (e) {}
+      }
+      teardown = [];
+      flush();
+    }
+
+    // Installed per socket: ttyd builds a brand new WebSocket on every reconnect, and its
+    // xterm listeners have to be re-hung with it or they would pile up one set per blip.
+    function attach(ws, t) {
+      disposeAll();
+      term = null;
+      if (!usable(t)) {
+        log("predict: xterm internals not as expected — predictive echo staying off");
+        return;
+      }
+      term = t;
+
+      const onEvent = function () { flush(); };
+      const hold = function (d) { if (d && typeof d.dispose === "function") teardown.push(d); };
+      hold(t.onWriteParsed(reconcile));
+      hold(t.onResize(onEvent));           // paint() re-reads dimensions.css.cell, which fit just changed
+      hold(t.buffer.onBufferChange(onEvent));
+      hold(t.onSelectionChange(onEvent));
+      hold(t.onScroll(onEvent));
+      const dom = function (el, ev, fn) {
+        if (!el) return;
+        el.addEventListener(ev, fn);
+        teardown.push({ dispose: function () { el.removeEventListener(ev, fn); } });
+      };
+      dom(ws, "close", onEvent);
+      dom(ws, "open", onEvent);            // ttyd calls terminal.reset() on (re)open
+      dom(window.visualViewport, "resize", onEvent); // the iOS keyboard
+
+      // Wrapped only now that everything above validated, and after the real send so a bug
+      // in here can never delay or swallow a keystroke.
+      const nativeSend = ws.send;
+      ws.send = function (data) {
+        const r = nativeSend.apply(this, arguments);
+        try { observe(data); } catch (e) { flush(); }
+        return r;
+      };
+      log("predict: attached", PREDICT_PAINT ? "(painting)" : "(measure-only)");
+    }
+
+    function stats() {
+      const scored = hits + misses;
+      return {
+        hits: hits,
+        misses: misses,
+        rate: scored ? hits / scored : 0,
+        srtt: Math.round(srtt),
+        samples: pushes,
+      };
+    }
+
+    return { attach: attach, stats: stats };
+  })();
+
+  // The whole point of the measure-only ship: read this after a day of real typing.
+  // `samples` counts predictions made, hits+misses the ones that were scored.
+  window.__ctPredictStats = predict.stats;
   // #endregion
 
   // #region Shift+Enter -> newline
