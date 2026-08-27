@@ -81,10 +81,10 @@
   // and an unreached cell are indistinguishable to positional reconciliation). Bounded and
   // self-healing in every path — but "one RTT" would be an overclaim.
   //
-  // What the stats cover: only characters typed DIRECTLY into xterm. #ct-composer is a real
-  // textarea, so on a phone push() refuses at the activeElement gate and its submissions
-  // arrive as multi-char frames inside the paste window. A low sample count after a day of
-  // phone use is the expected result, not evidence the feature is broken.
+  // What the stats cover: characters typed DIRECTLY into xterm, which since the mobile
+  // composer was removed is every character on every device. That makes this the only thing
+  // standing between the phone and a full round trip per keystroke, so the measured hit rate
+  // now decides something real rather than describing a desktop-only nicety.
   //
   // SHIPS MEASURE-ONLY. With PAINT=false the whole pipeline runs — classify, queue,
   // reconcile, hit/miss, srtt — and paints nothing, so real typing can be judged from
@@ -453,7 +453,6 @@
   // meta+return (Option/Alt+Enter), whose byte sequence is ESC + CR ("\x1b\r").
   // Intercept Shift+Enter and send that instead.
   document.addEventListener("keydown", (e) => {
-    if (e.target && e.target.closest && e.target.closest("#ct-composer")) return;
     if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
       if (sendToTerminal("\x1b\r")) {
         e.preventDefault();
@@ -538,7 +537,7 @@
   const NOTCH = 20; // px of finger travel per wheel notch
   // don't hijack touches inside our own UI (the history dialog + the tab bar) — they
   // need native scrolling.
-  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-connmodal, #ct-drawer, #claude-tabbar, #ct-composer"));
+  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-connmodal, #ct-drawer, #claude-tabbar"));
   let tStartX = 0, tStartY = 0, tLastY = 0, tAccum = 0, tScroll = false;
   document.addEventListener("touchstart", (e) => {
     tScroll = false; tAccum = 0;
@@ -725,6 +724,9 @@
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
   const SVG_HAM =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>';
+  const SVG_MIC =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>';
   const SVG_CHAT =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.38 8.38 0 0 1 3.5 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5z"/></svg>';
   const SVG_NET =
@@ -737,7 +739,7 @@
   const barStyle = document.createElement("style");
   barStyle.textContent = [
     // make room for the fixed bar
-    "#terminal-container{top:calc(" + BAR_H + "px + " + SAT + ") !important;height:calc(100% - " + BAR_H + "px - " + SAT + ") !important}",
+    "#terminal-container{top:calc(" + BAR_H + "px + " + SAT + ") !important;height:calc(100% - " + BAR_H + "px - " + SAT + " - " + SAB + ") !important}",
     // the bar itself (dark defaults; light overrides below via body.theme-light)
     "#claude-tabbar{position:fixed;top:" + SAT + ";left:0;right:0;height:" + BAR_H + "px;z-index:50;display:flex;align-items:stretch;gap:6px;padding:0 calc(8px + " + SAR + ") 0 calc(8px + " + SAL + ");box-sizing:border-box;background:#181818;border-bottom:1px solid #2e2e2e;font:12px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:#cfcfcf;user-select:none;-webkit-user-select:none}",
     // Solid strip filling the status-bar / Dynamic Island region. Always dark, because
@@ -884,6 +886,11 @@
     "body.theme-light #claude-tabbar .ctab-btn{background:#fff;border-color:#d7d7d7;color:#444}",
     "body.theme-light #claude-tabbar .ctab-btn:hover{background:#ececec;color:#000}",
     // tighter on small screens; theme toggle folds into the drawer on mobile
+    "#claude-tabbar .ctab-voice{color:#4ade80}",
+    "#claude-tabbar .ctab-voice:hover{background:rgba(74,222,128,.16)}",
+    // Phones lost the composer, so voice is the main non-typing way in: give it a filled
+    // pill instead of a bare icon so it reads as a button rather than another status glyph.
+    "@media (max-width:600px){#claude-tabbar .ctab-voice{background:rgba(74,222,128,.14);border:1px solid rgba(74,222,128,.45);border-radius:7px;padding:0 9px}}",
     "@media (max-width:600px){#claude-tabbar{gap:4px;padding:0 5px}#claude-tabbar .ctab{max-width:220px}#claude-tabbar .ctab .ctab-label{max-width:170px}#claude-tabbar .ctab-theme,#claude-tabbar .ctab-bell{display:none}}",
     // drawer settings rows (theme + notifications live here on mobile)
     "#ct-drawer .ct-draw-sep{height:1px;margin:6px 10px;background:#333}",
@@ -928,6 +935,16 @@
   chatBtn.href = "/app";
   chatBtn.innerHTML = SVG_CHAT;
   chatBtn.style.display = "none"; // shown only for the owner (guests get 403 on the probe)
+  // Start a voice session in one tap. Deep-links to /app?voice=1, which opens the chat app
+  // with the voice overlay already up, rather than landing on the thread and hunting for
+  // the mic. Hidden until the models probe confirms the STT/TTS services are configured —
+  // without them the overlay would open on a screen that can never hear anything.
+  const voiceBtn = document.createElement("a");
+  voiceBtn.className = "ctab-btn ctab-voice";
+  voiceBtn.title = "Start a voice session";
+  voiceBtn.href = "/app?voice=1";
+  voiceBtn.innerHTML = SVG_MIC;
+  voiceBtn.style.display = "none";
   const hamBtn = document.createElement("div");
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
@@ -949,6 +966,7 @@
   bar.appendChild(spacer);
   bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(netBtn);
+  bar.appendChild(voiceBtn); // one-tap voice session (/app?voice=1)
   bar.appendChild(chatBtn); // link out to the /app chat UI
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
@@ -1659,7 +1677,15 @@
   })();
   // reveal the chat-app button only for the owner (the /app routes are owner-gated)
   (async () => {
-    try { const r = await api("app/api/models"); if (r.ok) chatBtn.style.display = ""; } catch {}
+    try {
+      const r = await api("app/api/models");
+      if (!r.ok) return;
+      chatBtn.style.display = "";
+      // cfg.voice off, or the STT/TTS services unreachable -> no mic. Same rule the app's
+      // own mic button uses, so the two can never disagree about whether voice exists.
+      const d = await r.json();
+      if (d && d.voice) voiceBtn.style.display = "";
+    } catch {}
   })();
   // #endregion
 
@@ -1994,137 +2020,6 @@
   // #endregion
   // #endregion
 
-  // #region local composer
-  // Typing here is local and free. Only the submit crosses the Atlantic.
-  // NOTE: `bar` and `reflow` are already bound in this IIFE (tab bar / layout fixes),
-  // so this region uses compBar/compInput and reuses reflow().
-  // The composer helps on a touch keyboard, where typing into xterm is awkward. On a
-  // desktop it only duplicates Claude Code's own prompt, so it is not mounted there.
-  // Coarse pointer is the standard test: a touchscreen laptop with a mouse reports fine.
-  const isTouchDevice = window.matchMedia
-    ? window.matchMedia("(pointer: coarse)").matches
-    : (navigator.maxTouchPoints || 0) > 0;
-  // With no composer the terminal takes the full height below the tab bar, so the
-  // #terminal-container rule built from COMP_H below reserves nothing.
-  const COMP_H = isTouchDevice ? 46 : 0;
-  const compStyle = document.createElement("style");
-  compStyle.textContent = [
-    "#terminal-container{height:calc(100% - " + (BAR_H + COMP_H) + "px - " + SAT + " - " + SAB + ") !important}",
-    "#ct-composer{position:fixed;left:0;right:0;bottom:0;z-index:60;display:flex;gap:8px;align-items:flex-end;padding:7px calc(8px + " + SAR + ") calc(7px + " + SAB + ") calc(8px + " + SAL + ");box-sizing:border-box;background:#181818;border-top:1px solid #2e2e2e;font:14px/1.35 system-ui,-apple-system,Segoe UI,sans-serif}",
-    "#ct-composer *{box-sizing:border-box}",
-    "#ct-composer #ct-in{flex:1 1 auto;min-width:0;height:32px;resize:none;overflow-y:auto;padding:7px 9px;border-radius:8px;border:1px solid #333;background:#242424;color:#e8e8e8;font:inherit;outline:none}",
-    "#ct-composer #ct-in:focus{border-color:#3d6cc4}",
-    "#ct-composer #ct-send{flex:0 0 auto;height:32px;padding:0 14px;border-radius:8px;border:1px solid #3d6cc4;background:#2b3b55;color:#fff;font:inherit;cursor:pointer}",
-    "#ct-composer #ct-send:hover{background:#345080}",
-    "body.theme-light #ct-composer{background:#f3f3f3;border-top-color:#d8d8d8}",
-    "body.theme-light #ct-composer #ct-in{background:#fff;color:#1a1a1a;border-color:#ccc}",
-    "body.theme-light #ct-composer #ct-send{background:#dbe7fb;color:#12315f;border-color:#9dbdf0}",
-  ].join("");
-  (document.head || document.documentElement).appendChild(compStyle);
-
-  const compBar = document.createElement("div");
-  compBar.id = "ct-composer";
-  compBar.innerHTML =
-    '<textarea id="ct-in" rows="1" autocapitalize="sentences" autocomplete="off" ' +
-    'autocorrect="off" spellcheck="false" ' +
-    'placeholder="Prompt. Enter sends, Shift+Enter is a newline."></textarea>' +
-    '<button id="ct-send" type="button">Send</button>';
-  const compInput = compBar.querySelector("#ct-in");
-
-  // Only reflow xterm when the bar's height actually changes; a reflow per keystroke
-  // would refit the terminal on every character.
-  let compLastH = 0;
-  let compRaf = 0;
-  let compLastValue = null;
-  const compFrame = window.requestAnimationFrame
-    ? (fn) => window.requestAnimationFrame(fn)
-    : (fn) => setTimeout(fn, 16);
-
-  // Reading scrollHeight straight after writing style.height forces the browser to lay
-  // out the whole page synchronously, xterm's canvas included. Doing that once per
-  // keystroke is what made typing lag on a phone. Measuring is now coalesced into one
-  // pass per animation frame, so a burst of characters costs one layout, not one each.
-  function measureComposer() {
-    compRaf = 0;
-    if (compInput.value === compLastValue) return;
-    compLastValue = compInput.value;
-    compInput.style.height = "auto";
-    const cap = Math.round(window.innerHeight * 0.4);
-    const h = Math.max(32, Math.min(compInput.scrollHeight, cap));
-    compInput.style.height = h + "px";
-    const need = Math.max(COMP_H, h + 14);
-    if (need === compLastH) return;
-    compLastH = need;
-    const tc = document.getElementById("terminal-container");
-    // barStyle/compStyle set height with !important, so an inline set must match it.
-    if (tc) tc.style.setProperty("height", "calc(100% - " + (BAR_H + need) + "px - " + SAT + " - " + SAB + ")", "important");
-    reflow();
-  }
-
-  function autoGrow() {
-    if (compRaf) return;
-    compRaf = compFrame(measureComposer);
-  }
-
-  function submitComposer() {
-    const text = compInput.value;
-    if (!text) return;
-    // Ink reads \r and \n as submit and ESC+CR as "insert a newline". Same mechanism the
-    // Shift+Enter handler above relies on, so this keeps a multi-line prompt in one message.
-    if (!sendToTerminal(text.split("\n").join("\x1b\r"))) return;
-    sendToTerminal("\r");
-    compInput.value = "";
-    autoGrow();
-  }
-
-  compInput.addEventListener("input", autoGrow);
-  compInput.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter" || e.ctrlKey || e.altKey || e.metaKey) return;
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.shiftKey) {
-      const i = compInput.selectionStart;
-      compInput.value = compInput.value.slice(0, i) + "\n" + compInput.value.slice(i);
-      compInput.selectionStart = compInput.selectionEnd = i + 1;
-      autoGrow();
-    } else {
-      submitComposer();
-    }
-  });
-  compBar.querySelector("#ct-send").addEventListener("click", submitComposer);
-
-  // Keep the bar above the on-screen keyboard. The terminal-container transform in the
-  // mobile-keyboard region moves the frame; this moves the composer with it.
-  if (window.visualViewport) {
-    const liftComposer = () => {
-      const w = window.visualViewport;
-      const kb = Math.max(0, Math.round(window.innerHeight - w.height - w.offsetTop));
-      compBar.style.bottom = kb > 120 ? kb + "px" : "0px";
-    };
-    window.visualViewport.addEventListener("resize", liftComposer);
-    window.visualViewport.addEventListener("scroll", liftComposer);
-  }
-
-  // Mounted on <html>, not <body>, for the reason spelled out in mountBar(): ttyd renders
-  // Preact into document.body and its reconciler evicts any child it does not own on every
-  // render. The composer is fixed-position chrome like the tab bar, so it belongs outside
-  // the render root — otherwise the first ttyd (re)connect silently takes the keyboard away.
-  function mountComposer() {
-    const root = document.documentElement;
-    if (!root || compBar.parentNode === root) return;
-    root.appendChild(compBar);
-    compLastH = 0;
-    autoGrow();
-    setTimeout(reflow, 320);
-  }
-  if (isTouchDevice) {
-    mountComposer(); // <html> always exists — no DOMContentLoaded wait, same as the bar
-    // Insurance mirroring the tab bar's: re-mount if anything ever detaches it.
-    new MutationObserver(() => {
-      if (!compBar.isConnected) mountComposer();
-    }).observe(document.documentElement, { childList: true });
-  }
-  // #endregion
 
   mountBar(); // <html> always exists, so mount now — no DOMContentLoaded wait (that
               // fired AFTER ttyd's render, which is precisely when the bar got wiped).

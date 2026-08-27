@@ -237,7 +237,13 @@ function App() {
   }, []);
 
   useEffect(() => {
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id); }).catch(() => {});
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setModel(d.models[0].id);
+      // "?voice=1" opens straight into voice mode. The terminal's tab bar links here so a
+      // voice session is one tap from the terminal rather than open-app-then-find-the-mic.
+      // Gated on d.voice for the same reason the mic button is: without the services the
+      // overlay would come up on a screen that can never hear anything.
+      if (d.voice && new URLSearchParams(location.search).has("voice")) setVoiceOpen(true);
+    }).catch(() => {});
     refreshConvs();
     refreshFavs();
     const c = new URLSearchParams(location.search).get("c");
