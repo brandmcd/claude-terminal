@@ -1,0 +1,109 @@
+# claude-tts tuned for THIS box (2 vCPU / 3.7 GB Hetzner CX, no GPU), as opposed to
+# claude-tts.service which is upstream's unit for the author's 5900X workstation.
+#
+# NOTE the --project flag on ExecStart. voice/tts/uv.lock resolves torch from PyPI, which
+# on linux drags in ~2.2 GB of CUDA wheels this box has no GPU for. voice/tts-cpu/ is a
+# CPU-only overlay project that owns the venv; WorkingDirectory stays on voice/tts so
+# `main:app` still resolves to upstream's unmodified main.py. See the runbook.
+#
+# Install: /etc/systemd/system/claude-tts.local.service
+# Setup + smoke tests: /srv/claude-terminal/voice/README-thisbox.md
+[Unit]
+Description=claude-terminal TTS (Kokoro-82M, tuned for this box)
+Documentation=file:///srv/claude-terminal/voice/README-thisbox.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=180
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ctuser
+Group=ctuser
+Slice=claude-voice.slice
+WorkingDirectory=/srv/claude-terminal/voice/tts
+
+# --- voice + threading -------------------------------------------------------
+Environment=TTS_LANG=a
+Environment=TTS_VOICE=af_heart
+# 2 cores. Kokoro is small enough that torch's own thread pool is the thing to cap; 8 on
+# 2 vCPUs costs more in contention than it buys.
+Environment=TTS_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+Environment=OPENBLAS_NUM_THREADS=2
+
+# --- environment -------------------------------------------------------------
+Environment=HOME=/home/ctuser
+Environment=HF_HOME=/home/ctuser/.cache/huggingface
+Environment=UV_CACHE_DIR=/home/ctuser/.cache/uv
+# Kokoro's weights AND spaCy's en_core_web_sm are pre-fetched by the runbook. Without the
+# spaCy model present, misaki calls spacy.cli.download() from inside the first request,
+# which shells out to pip and would hang against the egress block below.
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=PYTHONUNBUFFERED=1
+
+ExecStartPre=/usr/bin/test -x /srv/claude-terminal/voice/tts-cpu/.venv/bin/python
+ExecStart=/home/ctuser/.local/bin/uv run --frozen --no-sync --project /srv/claude-terminal/voice/tts-cpu uvicorn main:app --host 127.0.0.1 --port 7802 --log-level warning
+
+Restart=always
+RestartSec=5
+# Kokoro loads torch, spaCy and 327 MB of weights, then warms the graph. Cold start on 2
+# cores is slow; give the stop path room too.
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# --- resource limits ---------------------------------------------------------
+# UNMEASURED — torch CPU runtime + Kokoro-82M fp32 + spaCy should land near 0.9-1.2 GB.
+# After the first day check the real number and tighten:
+#   systemctl show claude-tts.local.service -p MemoryPeak
+# If it OOM-restarts on startup, raise MemoryMax before assuming anything else is wrong.
+MemoryHigh=1100M
+MemoryMax=1500M
+MemorySwapMax=0
+TasksMax=96
+OOMScoreAdjust=700
+OOMPolicy=stop
+Nice=5
+CPUWeight=50
+
+# --- hardening ---------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# '-' prefixes: none of these exist before the runbook's uv sync / model download,
+# and a missing ReadWritePaths entry fails the unit at 226/NAMESPACE during namespace
+# setup - which happens before ExecStartPre, making the friendly guard below
+# unreachable for the very case it exists to explain.
+ReadWritePaths=-/home/ctuser/.cache/huggingface -/home/ctuser/.cache/uv -/srv/claude-terminal/voice/tts-cpu/.venv
+ProtectProc=invisible
+# ProcSubset=pid is deliberately left off: it hides /proc/cpuinfo, which torch's OpenMP
+# runtime and CTranslate2 read at startup. Thread counts are pinned by env vars here so it
+# would buy nothing, and it is a plausible cause of a silent misconfiguration.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+# MemoryDenyWriteExecute is deliberately NOT set: torch maps executable pages.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

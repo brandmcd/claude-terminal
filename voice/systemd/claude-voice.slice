@@ -1,0 +1,24 @@
+# Aggregate resource envelope for the two voice sidecars on this box.
+#
+# The point of the slice is that STT and TTS can never *together* squeeze the things that
+# actually matter here — ct-ttyd, ct-sidecar, and the live Claude Code sessions — out of
+# a 3.7 GB box. The per-unit MemoryMax values in claude-{stt,tts}.local.service stop one
+# service running away; this stops both doing it at once.
+#
+# Install: /etc/systemd/system/claude-voice.slice
+[Unit]
+Description=claude-terminal voice sidecars (STT + TTS)
+Before=slices.target
+
+[Slice]
+# Measured: STT with base.en/int8 sits at ~270 MB RSS. TTS (torch CPU + Kokoro-82M fp32 +
+# spaCy en_core_web_sm) is the unmeasured one — expect 0.9-1.2 GB. 1800M leaves ~1.8 GB of
+# the box's 3.7 GB for everything else. Re-check with:
+#   systemctl show claude-voice.slice -p MemoryPeak -p MemoryCurrent
+MemoryHigh=1500M
+MemoryMax=1800M
+
+# The terminal wins CPU. Default weight is 100; voice runs at half priority so a synthesis
+# burst never starves an interactive session on 2 vCPUs.
+CPUWeight=50
+IOWeight=50

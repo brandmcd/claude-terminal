@@ -1,0 +1,121 @@
+# claude-stt tuned for THIS box (2 vCPU / 3.7 GB Hetzner CX, no GPU), as opposed to
+# claude-stt.service which is upstream's unit for the author's 5900X workstation.
+#
+# Differences from upstream: User=ctuser, paths under /srv/claude-terminal, threads sized
+# to 2 cores instead of 8, a memory ceiling, and a hardening block. Launched through the
+# absolute uv path so there is no PATH dependency.
+#
+# Install: /etc/systemd/system/claude-stt.local.service
+# Setup + smoke tests: /srv/claude-terminal/voice/README-thisbox.md
+[Unit]
+Description=claude-terminal STT (faster-whisper, tuned for this box)
+Documentation=file:///srv/claude-terminal/voice/README-thisbox.md
+After=network-online.target
+Wants=network-online.target
+# A missing model or a broken venv would otherwise restart-loop forever.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ctuser
+Group=ctuser
+Slice=claude-voice.slice
+WorkingDirectory=/srv/claude-terminal/voice/stt
+
+# --- model + threading -------------------------------------------------------
+# base.en/int8 measured on this box at cpu_threads=2: model load 2.7s cold / 0.6s warm,
+# ~270 MB RSS, and 1.0-1.1s to transcribe a 3.5s utterance (RTF ~0.30). tiny.en is ~0.57s
+# for the same clip at ~190 MB but misheard "And so my fellow Americans" as "And so am I
+# fellow Americans" in that test — the accuracy is worth the half second. Set
+# STT_MODEL=tiny.en if you want the latency back. Do NOT use small.en on 2 cores.
+Environment=STT_MODEL=base.en
+Environment=STT_DEVICE=cpu
+Environment=STT_COMPUTE=int8
+Environment=STT_THREADS=2
+# CTranslate2 honours STT_THREADS, but onnxruntime (the Silero VAD) and any BLAS in the
+# process size their own pools from the host core count. Pin them too.
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+Environment=OPENBLAS_NUM_THREADS=2
+
+# --- environment -------------------------------------------------------------
+Environment=HOME=/home/ctuser
+Environment=HF_HOME=/home/ctuser/.cache/huggingface
+Environment=UV_CACHE_DIR=/home/ctuser/.cache/uv
+# Models are fetched once by hand (see the runbook); after that the service never needs
+# the network. This makes that explicit, and stops huggingface_hub stalling on a revision
+# check against the egress block below.
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=PYTHONUNBUFFERED=1
+
+# Fail immediately with a clear journal line if `uv sync` has not been run yet, rather
+# than letting uv try to build a venv inside a read-only /srv.
+ExecStartPre=/usr/bin/test -x /srv/claude-terminal/voice/stt/.venv/bin/python
+ExecStart=/home/ctuser/.local/bin/uv run --frozen --no-sync uvicorn main:app --host 127.0.0.1 --port 7801 --log-level warning
+
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+# --- resource limits ---------------------------------------------------------
+# Measured steady state is ~270 MB. MemoryHigh throttles and reclaims first; MemoryMax is
+# the hard wall, so a runaway here is cgroup-OOM-killed and restarted instead of the
+# kernel picking off ttyd or a Claude session.
+MemoryHigh=420M
+MemoryMax=600M
+MemorySwapMax=0
+TasksMax=64
+# Belt and braces: if the *host* goes into global OOM anyway, make the kernel prefer this
+# process over the terminal.
+OOMScoreAdjust=600
+OOMPolicy=stop
+Nice=5
+CPUWeight=50
+
+# --- hardening ---------------------------------------------------------------
+# Appropriate for a loopback-only inference sidecar: it needs to read its code and model
+# cache, listen on 127.0.0.1, and nothing else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# '-' prefixes: none of these exist before the runbook's uv sync / model download,
+# and a missing ReadWritePaths entry fails the unit at 226/NAMESPACE during namespace
+# setup - which happens before ExecStartPre, making the friendly guard below
+# unreachable for the very case it exists to explain.
+ReadWritePaths=-/home/ctuser/.cache/huggingface -/home/ctuser/.cache/uv -/srv/claude-terminal/voice/stt/.venv
+ProtectProc=invisible
+# ProcSubset=pid is deliberately left off: it hides /proc/cpuinfo, which torch's OpenMP
+# runtime and CTranslate2 read at startup. Thread counts are pinned by env vars here so it
+# would buy nothing, and it is a plausible cause of a silent misconfiguration.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+# MemoryDenyWriteExecute is deliberately NOT set: CTranslate2 and onnxruntime map
+# executable pages at runtime and will crash on load if you add it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Nothing but loopback. If you ever need to let the service fetch a model itself, comment
+# these two lines and HF_HUB_OFFLINE out together, not one of them.
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

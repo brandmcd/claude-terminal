@@ -1,0 +1,37 @@
+# CPU-only overlay for voice/tts on a box with no GPU.
+#
+# Why this directory exists: voice/tts/pyproject.toml declares
+#     [tool.uv.sources] torch = { index = "pytorch-cpu" }
+# but torch is only ever a *transitive* dependency there (kokoro -> torch), and uv applies
+# tool.uv.sources to the project's own declared dependencies. So the pin is a no-op:
+# voice/tts/uv.lock resolves torch 2.13.0 from PyPI, which on linux pulls
+# nvidia-cublas/cudnn/cusolver/nccl/triton and friends — 2.87 GB of wheels, ~2.2 GB of it
+# CUDA, on a machine with no GPU.
+#
+# Listing torch as a direct dependency makes the source pin bind. Same package versions,
+# same lock discipline, 0 nvidia packages: 146 MB of wheels plus a 192 MB CPU torch.
+#
+# Everything else is byte-identical to voice/tts/pyproject.toml. The service code is NOT
+# duplicated: the systemd unit keeps WorkingDirectory=voice/tts and passes
+# `--project .../voice/tts-cpu`, so upstream's main.py runs against this venv unmodified.
+[project]
+name = "claude-tts-cpu"
+version = "0.1.0"
+description = "CPU-only dependency set for voice/tts (Kokoro-82M) on a GPU-less box."
+requires-python = ">=3.10"
+dependencies = [
+    "kokoro==0.9.4",
+    "soundfile==0.13.1",
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "numpy<2.3",
+    "torch",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
