@@ -191,6 +191,75 @@ runtime user too. PATH is prepended with `~/.local/bin` inside that wrapper so t
 finds its own tools, and `claude` is resolved via PATH so the same script works on a host and
 inside a container. The tmux socket follows `TMUX_TMPDIR` (default `/tmp`, matching the sidecar).
 
+## Chat app (`/app`)
+
+An optional Claude-app-style chat interface that drives Claude Code through the
+[Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) in headless
+streaming mode, sitting alongside the raw terminal. The terminal stays one click away (a chat
+button in the tab bar opens `/app`; the app has a "Terminal" link back). It is owner-only.
+
+What it does: a sidebar of past conversations (read from the same `.jsonl` transcript store the
+terminal history uses), a bubble transcript with markdown and collapsible tool cards, a bottom
+composer with file attach, a per-conversation model picker, and streaming replies over SSE.
+Because the SDK writes to the same `~/.claude/projects/<enc-cwd>/<session-id>.jsonl` store as the
+interactive CLI, a chat you start in the app is resumable in a terminal tab (`claude --resume <id>`)
+and a terminal conversation opens in the app. It authenticates on the box's existing Claude login
+(claude.ai subscription, no `ANTHROPIC_API_KEY`) and runs tools with `permissionMode:
+"bypassPermissions"` — treat it with the same trust as `claude --dangerously-skip-permissions`.
+
+Files: `app-runner.ts` (the SDK conversation manager), `app-server.ts` (the `/app*` routes, hooked
+into `server.ts` in one line), and the React front-end in `app/` built to `public/app/` with
+`bun run build:app`. Config: optional `appModels` (defaults to Opus/Sonnet/Haiku aliases).
+
+Deploy (front door): the sidecar serves `/app*`, but your reverse proxy must route `/app*` to the
+sidecar (the built assets fetch absolute `/app/...` paths). For the claude.filipkin.com setup that
+is a one-time `claude-router` rule sending `/app` and `/app/*` to the sidecar port. Guests never
+get an `/app` route, and the tab-bar chat button hides itself unless the owner-gated
+`/app/api/models` probe returns 200.
+
+Shipping updates (the PWA-doesn't-go-stale part): `bun run app/build.ts` (aka `bun run build:app`)
+builds `main-<hash>.js` + `styles-<hash>.css`, writes `public/app/version.txt` (the JS content
+hash), and regenerates `index.html` pointing at the hashed files. Hashed assets are served
+`immutable` (a new deploy is a new URL, so no cache can serve stale JS); `index.html` and
+`/app/api/version` are `no-store`. `/app/api/version` reads `version.txt` fresh on each request, so
+**a rebuild alone ships the update — no service restart needed**. Any fresh load gets the new
+bundle; an already-open tab or installed PWA polls `/app/api/version` every 60s and shows a "Reload"
+toast (which clears Cache Storage and reloads — it does not touch the shared push service worker).
+This is FTA-Buddy's version-poll + reload-toast pattern, without its cache-first shell precache.
+
+### Hands-free voice mode
+
+The chat app has an optional phone-call-style voice mode: talk to Claude and it talks back,
+listening resumes automatically after each reply, and talking over Claude interrupts it (barge-in).
+Speech is **fully server-side** so it works identically on iOS Safari (which has no Web Speech API)
+and Android: the browser records the mic with `MediaRecorder`, POSTs the clip to a local Whisper
+service (`/app/api/stt` → text); that becomes a normal chat turn; Claude's streamed reply is chunked
+by sentence and each sentence is sent to a local Kokoro TTS service (`/app/api/tts` → audio) and
+played in a queue, so Claude starts speaking before the whole reply is finished.
+
+Two small Python/uv services under `voice/` back this (both bind loopback only; the sidecar proxies
+and owner-gates them):
+
+- `voice/stt` — [faster-whisper](https://github.com/SYSTRAN/faster-whisper), `base.en` by default
+  (~0.4s per short turn on a modern CPU; set `STT_MODEL=small.en` for more accuracy at ~3× latency).
+- `voice/tts` — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), voice `af_heart`
+  (first-audio ~0.37s, ~5× faster than real time on CPU). [Piper](https://github.com/rhasspy/piper)
+  is a lighter alternative if you need one.
+
+Set up and run each with `uv` (models download to `~/.cache/huggingface` on first start):
+
+```bash
+cd voice/stt && uv sync && uv run uvicorn main:app --host 127.0.0.1 --port 7801
+cd voice/tts && uv sync && uv run uvicorn main:app --host 127.0.0.1 --port 7802
+```
+
+Example systemd units are in `voice/systemd/`. Then enable voice in `config.json` — either
+`"voice": true` (uses the default loopback ports 7801/7802) or point at custom URLs with
+`"sttUrl"`/`"ttsUrl"`. When configured, `/app/api/models` reports `voice: true` and the app shows a
+mic button; otherwise the button is hidden and the routes return 503, so a vanilla install and guest
+sidecars are unaffected. `espeak-ng` is needed for Kokoro's out-of-dictionary word fallback
+(`apt install espeak-ng`).
+
 ## Importing from a previous setup
 
 `migrate-state.ts` imports legacy per-user JSON buckets into SQLite (preserving byte-offsets so the

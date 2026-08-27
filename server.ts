@@ -13,6 +13,8 @@ import { watch, readdirSync, statSync, existsSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
+import { Connections } from "./connections.ts";
+import { appRoutes, type AppCtx } from "./app-server.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -111,6 +113,55 @@ const qHours = db?.query("SELECT hour_utc, total, output FROM hourly WHERE user 
 const qCum = db?.query("SELECT * FROM cumulative WHERE user = ?") as any;
 const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 
+// External-peer queries are prepared lazily: the external_* tables only exist once a
+// collector that carries the newer schema has run. A vanilla DB (or a fresh deploy
+// before the first collector tick) simply has no external users. Memoised once the
+// tables appear so we don't re-check sqlite_master on every build.
+let extQ: { users: any; cum: any; hours: any; meta: any } | null = null;
+function ensureExt() {
+  if (extQ || !db) return extQ;
+  try {
+    const t = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='external_cum'").get();
+    if (!t) return null;
+    extQ = {
+      users: db.query("SELECT DISTINCT peer, user FROM external_cum ORDER BY peer, user"),
+      cum: db.query("SELECT * FROM external_cum WHERE peer = ? AND user = ?"),
+      hours: db.query("SELECT hour_utc, total, output FROM external_hourly WHERE peer = ? AND user = ?"),
+      meta: db.query("SELECT * FROM external_meta WHERE peer = ? AND user = ?"),
+    };
+  } catch { extQ = null; }
+  return extQ;
+}
+const extKey = (peer: string, user: string) => "ext_" + `${peer}_${user}`.replace(/[^A-Za-z0-9_]/g, "_");
+
+// A portable snapshot of THIS instance's usage for a trusted peer to pull. Raw hourly
+// buckets (last 45 days) + cumulative + meta per local user, so the puller reconstructs
+// the same gauges against its own clock. Only local users are exported (external users
+// are read from other tables), so peers never chain each other's data.
+function buildExport() {
+  if (!db) return { peer: OWNER, generated_at: new Date().toISOString(), users: [] };
+  const cutoff = hourKeyOf(new Date(Date.now() - 45 * 24 * 3600e3));
+  const users: any[] = [];
+  for (const { user } of qUsers.all() as any[]) {
+    const cum = (qCum.get(user) as any) || { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 };
+    const meta = (qMeta.get(user) as any) || {};
+    const hourly = (qHours.all(user) as any[])
+      .filter((r) => r.hour_utc >= cutoff)
+      .map((r) => ({ hour_utc: r.hour_utc, total: r.total, output: r.output }));
+    users.push({
+      user,
+      name: cfg.names?.[user] || titleCase(user),
+      cumulative: {
+        input: cum.input, output: cum.output,
+        cache_creation: cum.cache_creation, cache_read: cum.cache_read, total: cum.total,
+      },
+      meta: { sessions: meta.sessions || 0, models: meta.models || "[]", last_activity: meta.last_activity || null },
+      hourly,
+    });
+  }
+  return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(), users };
+}
+
 function buildLeaderboard() {
   const now = new Date();
   const monthPrefix = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}`;
@@ -177,6 +228,44 @@ function buildLeaderboard() {
     u.share_usd = curCents[u.user] / 100;
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0;
   }
+
+  // External peers: shown on the board but deliberately NOT in the split above. They
+  // carry an `external` flag (rendered as an "external" chip) and no share_usd, so the
+  // fixed subscription bill stays divided only across the local users.
+  const eq = ensureExt();
+  if (eq) {
+    for (const { peer, user } of eq.users.all() as any[]) {
+      const hours = new Map<string, any>();
+      for (const r of eq.hours.all(peer, user) as any[]) hours.set(r.hour_utc, { total: r.total, output: r.output });
+      const cum = (eq.cum.get(peer, user) as any) || { output: 0, total: 0, name: user };
+      const meta = (eq.meta.get(peer, user) as any) || {};
+      const last = meta.last_activity || null;
+      let active = false;
+      if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
+      let monthOutput = 0;
+      for (const [hk, b] of hours) if (hk.slice(0, 7) === monthPrefix) monthOutput += b.output;
+      users.push({
+        user: extKey(peer, user),
+        name: cum.name || user,
+        host: false,
+        external: true,
+        peer,
+        output_5h: rolling(hours, "output", now),
+        output_total: cum.output,
+        tokens_total: cum.total,
+        sessions: meta.sessions || 0,
+        models: JSON.parse(meta.models || "[]").filter((m: string) => !String(m).startsWith("<")),
+        last_used: last,
+        active,
+        spark: sparkSeries(hours, now, SPARK_HOURS),
+        hourly: sparkSeries(hours, now, HOURLY_HOURS),
+        month_output: monthOutput,
+        share_usd: null,
+        month_pct: null,
+      });
+    }
+  }
+
   users.sort((a, b) => b.month_output - a.month_output || b.output_total - a.output_total);
 
   return {
@@ -280,10 +369,7 @@ async function runTmux(args: string[]): Promise<string> {
   await proc.exited;
   return out;
 }
-async function tmuxSessions(): Promise<SessionRow[]> {
-  let out = "";
-  try { out = await runTmux(["list-sessions", "-F", "#{session_name}\t#{session_created}\t#{session_attached}"]); }
-  catch { return []; }
+function parseTmuxList(out: string): SessionRow[] {
   const rows: SessionRow[] = [];
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
@@ -291,6 +377,21 @@ async function tmuxSessions(): Promise<SessionRow[]> {
     rows.push({ id: name, created: parseInt(created, 10) || 0, attached: attached === "1" });
   }
   return rows;
+}
+async function tmuxSessions(): Promise<SessionRow[]> {
+  // list-sessions can transiently fail or come back empty while the tmux server is
+  // contended (e.g. a pane spawning/attaching as the browser reloads on a tab switch).
+  // A spuriously-empty list, handed to the overlay, used to wipe the whole tab bar. So
+  // retry once on empty/failure before believing there are genuinely no sessions.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let out = "";
+    try { out = await runTmux(["list-sessions", "-F", "#{session_name}\t#{session_created}\t#{session_attached}"]); }
+    catch { out = ""; }
+    const rows = parseTmuxList(out);
+    if (rows.length || attempt === 1) return rows;
+    await new Promise((r) => setTimeout(r, 75)); // brief backoff, then re-query
+  }
+  return [];
 }
 async function lastAiTitle(tp: string): Promise<string | null> {
   try {
@@ -442,11 +543,73 @@ async function spawnWorker(name: string | undefined, cwd: string, prompt: string
 }
 // #endregion
 
+// External network connections (OpenVPN + Tailscale). Inert unless cfg.netApplyHelper
+// is set -> the overlay hides the whole Connections UI on a vanilla install.
+const conns = new Connections(STATE_DIR, cfg.netApplyHelper);
+
+// #region chat-app front-end (the "looks like the Claude app" interface, /app*)
+// Only the owner reaches it (gateTerminal). Guest sidecars set usagePage:false but this
+// is independent of that; guests simply never get an /app route in the router. Model list
+// is config-overridable; the ids are CLI/SDK model aliases resolved at query time.
+// Quick picks (shown in the model menu) — versioned ids so the label shows the version.
+const APP_MODELS: { id: string; label: string }[] = cfg.appModels || [
+  { id: "claude-opus-4-8", label: "Opus 4.8" },
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
+  { id: "claude-haiku-4-5", label: "Haiku 4.5" },
+];
+// "Other…" list (older / more versions) — shown in a dialog behind the Other option.
+const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
+  { id: "claude-opus-5", label: "Opus 5" },
+  { id: "claude-opus-4-7", label: "Opus 4.7" },
+  { id: "claude-opus-4-6", label: "Opus 4.6" },
+  { id: "claude-sonnet-5", label: "Sonnet 5" },
+  { id: "claude-fable-5", label: "Fable 5" },
+  { id: "claude-haiku-4-5", label: "Haiku 4.5" },
+  { id: "opus", label: "Opus (latest)" },
+  { id: "sonnet", label: "Sonnet (latest)" },
+  { id: "haiku", label: "Haiku (latest)" },
+];
+const appCtx: AppCtx = {
+  allowed,
+  cors,
+  publicDir: PUBLIC_DIR,
+  dataDir: cfg.dataDir,
+  historyHide: cfg.historyHide || [],
+  defaultCwd: SPAWN_CWD,
+  models: APP_MODELS,
+  moreModels: APP_MORE_MODELS,
+  favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
+  titlesFile: join(STATE_DIR, "claude-app-titles.json"),
+  // Hands-free voice: loopback Whisper (STT) + Kokoro (TTS) sidecars. Present only when
+  // configured, so a vanilla install (and guest sidecars) simply never show the mic.
+  sttUrl: cfg.sttUrl || (cfg.voice ? "http://127.0.0.1:7801" : undefined),
+  ttsUrl: cfg.ttsUrl || (cfg.voice ? "http://127.0.0.1:7802" : undefined),
+  // Claude asked a question with no client streaming that conversation: push the owner so the
+  // turn doesn't hang unseen. Suppressed when a device is actively watching that session.
+  notifyAsk: (info) => {
+    if (isWatched(info.sessionId)) return;
+    const body = info.question.length > 160 ? info.question.slice(0, 157) + "…" : info.question;
+    void pushAll({
+      title: "Claude has a question",
+      body,
+      url: "/app?c=" + encodeURIComponent(info.sessionId),
+      tag: "ask-" + info.sessionId,
+      sessionId: info.sessionId,
+      requireInteraction: true,
+    });
+  },
+};
+// #endregion
+
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
   async fetch(req) {
     const path = new URL(req.url).pathname;
+
+    // Chat-app front-end (/app*). Returns null for non-app paths so the rest still matches.
+    const appRes = await appRoutes(req, path, appCtx);
+    if (appRes) return appRes;
 
     // Deterministic live push: the collector POSTs here after it commits usage.db.
     // The server binds 127.0.0.1 only, so this is inherently localhost-only.
@@ -461,6 +624,19 @@ const server = Bun.serve({
       if (req.method === "POST" && path === "/internal/tick") { broadcast(); return new Response("ok"); }
       if (req.method === "GET" && path === "/usage/api") {
         return Response.json(buildLeaderboard(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
+      }
+      // Read-only usage export for a trusted peer to pull (another claude-terminal
+      // instance). Disabled (404) unless cfg.exportToken is set; then gated by that
+      // token via Authorization: Bearer <token> or ?token=<token>. Served under the
+      // already-public /usage/ path, so the token is the only thing protecting it.
+      if (req.method === "GET" && path === "/usage/export") {
+        const tok = cfg.exportToken;
+        if (!tok) return new Response("export disabled", { status: 404 });
+        const auth = req.headers.get("authorization") || "";
+        const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+        const qtok = new URL(req.url).searchParams.get("token") || "";
+        if (bearer !== tok && qtok !== tok) return new Response("unauthorized", { status: 401 });
+        return Response.json(buildExport(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
       }
       // Cloud cost split (second dashboard section). Reads cloud_cost.db via its own
       // module; answers { available:false, ... } gracefully until the collector has samples.
@@ -506,7 +682,9 @@ const server = Bun.serve({
     if (req.method === "GET" && path === "/manifest.webmanifest") {
       return Response.json({
         name: APP_NAME, short_name: APP_SHORT, id: "/",
-        start_url: "/", scope: "/",
+        // "?home=1" marks a cold launch so the overlay can reopen the last surface (terminal or
+        // /app) without bouncing normal in-app navigation. Scope/id stay "/" (same installed app).
+        start_url: "/?home=1", scope: "/",
         display: "standalone", display_override: ["standalone", "fullscreen", "minimal-ui"],
         orientation: "any", background_color: BG_COLOR, theme_color: THEME_COLOR,
         icons: [
@@ -713,6 +891,43 @@ const server = Bun.serve({
       if (theme !== "dark" && theme !== "light") return new Response("Bad theme", { status: 400 });
       await writeTheme(theme);
       return Response.json({ ok: true, theme });
+    }
+    // #endregion
+
+    // #region external network connections (OpenVPN + Tailscale) — owner-gated
+    // The overlay only shows the UI when GET /connections reports enabled:true.
+    if (path === "/connections" || path.startsWith("/connections/")) {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      if (!conns.enabled()) return Response.json({ enabled: false }, { headers: cors(req) });
+      try {
+        if (req.method === "GET" && path === "/connections")
+          return Response.json({ enabled: true, ...(await conns.list()) }, { headers: { "Cache-Control": "no-store", ...cors(req) } });
+        if (req.method === "GET" && path === "/connections/status")
+          return Response.json(await conns.status(), { headers: { "Cache-Control": "no-store", ...cors(req) } });
+        if (req.method === "POST" && path === "/connections/openvpn") {
+          const b: any = await req.json();
+          return Response.json(await conns.addOpenvpn({
+            name: String(b.name || ""), ovpn: String(b.ovpn || ""), creds: b.creds ? String(b.creds) : "",
+            subnets: Array.isArray(b.subnets) ? b.subnets.map(String) : [], hosts: Array.isArray(b.hosts) ? b.hosts : [],
+          }), { headers: cors(req) });
+        }
+        if (req.method === "POST" && path === "/connections/tailscale") {
+          const b: any = await req.json().catch(() => ({}));
+          return Response.json(await conns.addTailscale({ name: String(b.name || "") }), { headers: cors(req) });
+        }
+        const m = /^\/connections\/([A-Za-z0-9_]+)(\/enable)?$/.exec(path);
+        if (m) {
+          const id = m[1];
+          if (req.method === "DELETE") return Response.json(await conns.remove(id), { headers: cors(req) });
+          if (req.method === "POST" && m[2]) {
+            const b: any = await req.json().catch(() => ({}));
+            return Response.json(await conns.setEnabled(id, !!b.on), { headers: cors(req) });
+          }
+        }
+        return new Response("Not Found", { status: 404 });
+      } catch (e: any) {
+        return new Response(String(e?.message || e), { status: 400 });
+      }
     }
     // #endregion
 

@@ -2,6 +2,21 @@
   const log = (...a) => console.log("[claude-paste]", ...a);
   log("overlay loaded");
 
+  // #region PWA launch routing — reopen the surface you left off on (terminal vs app).
+  // The manifest start_url is "/?home=1"; that marker only appears on a cold PWA launch, so a
+  // normal in-app navigation to the terminal never bounces. If the app ("/app") was the last
+  // surface, jump there (its default view, NOT a specific conversation). Otherwise stay here.
+  try {
+    var _sp = new URLSearchParams(location.search);
+    if (_sp.get("home") === "1") {
+      var _last = null; try { _last = localStorage.getItem("ct-last-surface"); } catch (e) {}
+      if (_last === "/app") { location.replace("/app"); return; }
+      try { history.replaceState(null, "", location.pathname); } catch (e) {} // drop the marker
+    }
+    try { localStorage.setItem("ct-last-surface", "/"); } catch (e) {} // we're on the terminal now
+  } catch (e) {}
+  // #endregion
+
   // #region ttyd WebSocket capture
   // ttyd negotiates with the 'tty' subprotocol. Patch WebSocket so we can
   // grab the live connection and inject input directly (ttyd input frame =
@@ -126,7 +141,7 @@
   const NOTCH = 20; // px of finger travel per wheel notch
   // don't hijack touches inside our own UI (the history dialog + the tab bar) — they
   // need native scrolling.
-  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-drawer, #claude-tabbar, #ct-composer"));
+  const inOverlayUi = (el) => !!(el && el.closest && el.closest("#ct-histmodal, #ct-connmodal, #ct-drawer, #claude-tabbar, #ct-composer"));
   let tStartX = 0, tStartY = 0, tLastY = 0, tAccum = 0, tScroll = false;
   document.addEventListener("touchstart", (e) => {
     tScroll = false; tAccum = 0;
@@ -176,7 +191,7 @@
         "box-shadow:0 2px 8px rgba(0,0,0,.3)", "pointer-events:none",
         "transition:opacity .2s", "opacity:0", "max-width:60vw",
       ].join(";");
-      document.body.appendChild(toastEl);
+      (document.documentElement || document.body).appendChild(toastEl);
     }
     const colors = { info: "#3b82f6", success: "#16a34a", error: "#dc2626" };
     toastEl.style.background = colors[kind] || colors.info;
@@ -313,6 +328,10 @@
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
   const SVG_HAM =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>';
+  const SVG_CHAT =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.38 8.38 0 0 1 3.5 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5z"/></svg>';
+  const SVG_NET =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z"/></svg>';
   const SVG_BELL =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>';
   const SVG_BELL_OFF =
@@ -387,6 +406,54 @@
     "body.theme-light #ct-histmodal .ct-hist-head{border-color:#ececec}",
     "body.theme-light #ct-histmodal .ct-hist-row:hover{background:#f0f0f0}",
     "body.theme-light #ct-histmodal .ct-hist-sub{color:#777}",
+    // external-networks modal (shares the histmodal card look)
+    "#ct-connmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px)}",
+    // applying overlay: covers the dialog with a spinner while a change is being applied
+    // (the terminal reconnects behind it, so the list would otherwise flicker/empty out)
+    "#ct-connmodal .ct-conn{position:relative}",
+    "#ct-connmodal .ct-applying{position:absolute;inset:0;z-index:2;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(30,30,30,.82);backdrop-filter:blur(2px);border-radius:10px;text-align:center;padding:20px}",
+    "#ct-connmodal.applying .ct-applying{display:flex}",
+    "#ct-connmodal .ct-applying .sp{width:34px;height:34px;border-radius:50%;border:3px solid #4a4a4a;border-top-color:#7C3AED;animation:ct-spin .8s linear infinite}",
+    "#ct-connmodal .ct-applying .msg{font-size:13px;color:#d6d6d6;max-width:80%}",
+    "@keyframes ct-spin{to{transform:rotate(360deg)}}",
+    "@media (prefers-reduced-motion: reduce){#ct-connmodal .ct-applying .sp{animation-duration:2s}}",
+    "body.theme-light #ct-connmodal .ct-applying{background:rgba(255,255,255,.85)}",
+    "body.theme-light #ct-connmodal .ct-applying .msg{color:#333}",
+    "#ct-connmodal .ct-conn{margin-top:" + (BAR_H + 12) + "px;width:min(640px,94vw);max-height:82vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-connmodal .ct-conn-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-connmodal .ct-conn-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
+    "#ct-connmodal .ct-conn-close:hover{opacity:1}",
+    "#ct-connmodal .ct-conn-body{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 12px}",
+    "#ct-connmodal .ct-conn-note{font-size:11px;color:#9a9a9a;margin:0 0 8px}",
+    "#ct-connmodal .ct-tun{border:1px solid #333;border-radius:8px;padding:9px 10px;margin-bottom:8px}",
+    "#ct-connmodal .ct-tun-top{display:flex;align-items:center;gap:8px}",
+    "#ct-connmodal .ct-tun-name{font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    "#ct-connmodal .ct-badge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:2px 6px;border-radius:5px;background:#2b2b2b;color:#bbb}",
+    "#ct-connmodal .ct-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:#6b7280}",
+    "#ct-connmodal .ct-dot.up{background:#22c55e}",
+    "#ct-connmodal .ct-dot.down{background:#ef4444}",
+    "#ct-connmodal .ct-dot.wait{background:#f59e0b}",
+    "#ct-connmodal .ct-tun-sub{font-size:11px;color:#9a9a9a;margin-top:5px;word-break:break-word}",
+    "#ct-connmodal .ct-tun-sub code{color:#cfcfcf}",
+    "#ct-connmodal .ct-ic{cursor:pointer;opacity:.6;padding:3px 6px;border-radius:5px;font-size:12px}",
+    "#ct-connmodal .ct-ic:hover{opacity:1;background:rgba(255,255,255,.12)}",
+    "#ct-connmodal .ct-login{display:inline-block;margin-top:6px;padding:5px 10px;border-radius:6px;background:#7C3AED;color:#fff;text-decoration:none;font-weight:600}",
+    "#ct-connmodal .ct-add-row{display:flex;gap:8px;margin:6px 0 12px}",
+    "#ct-connmodal .ct-btn{cursor:pointer;padding:7px 11px;border-radius:7px;border:1px solid #3a3a3a;background:#262626;color:#e6e6e6;font:13px system-ui,sans-serif;font-weight:600}",
+    "#ct-connmodal .ct-btn:hover{background:#2f2f2f}",
+    "#ct-connmodal .ct-btn.primary{background:#7C3AED;border-color:#7C3AED;color:#fff}",
+    "#ct-connmodal .ct-form{border:1px dashed #3a3a3a;border-radius:8px;padding:10px;margin-bottom:12px;display:none}",
+    "#ct-connmodal .ct-form.open{display:block}",
+    "#ct-connmodal .ct-form label{display:block;font-size:11px;color:#9a9a9a;margin:8px 0 3px}",
+    "#ct-connmodal .ct-form input,#ct-connmodal .ct-form textarea{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:6px;border:1px solid #3a3a3a;background:#161616;color:#e6e6e6;font:12px ui-monospace,Menlo,Consolas,monospace;outline:none}",
+    "#ct-connmodal .ct-form input:focus,#ct-connmodal .ct-form textarea:focus{border-color:#7C3AED}",
+    "#ct-connmodal .ct-form textarea{resize:vertical;min-height:90px}",
+    "body.theme-light #ct-connmodal .ct-conn{background:#fff;color:#1f1f1f;border-color:#dcdcdc}",
+    "body.theme-light #ct-connmodal .ct-conn-head{border-color:#ececec}",
+    "body.theme-light #ct-connmodal .ct-tun{border-color:#e2e2e2}",
+    "body.theme-light #ct-connmodal .ct-badge{background:#eee;color:#555}",
+    "body.theme-light #ct-connmodal .ct-btn{background:#f2f2f2;border-color:#dcdcdc;color:#1f1f1f}",
+    "body.theme-light #ct-connmodal .ct-form input,body.theme-light #ct-connmodal .ct-form textarea{background:#f6f6f6;border-color:#dcdcdc;color:#1f1f1f}",
     // hamburger (mobile only) + left drawer with the full tab list
     "#claude-tabbar .ctab-ham{display:none}",
     "@media (max-width:600px){#claude-tabbar .ctab-ham{display:flex}#claude-tabbar .ctab-list .ctab:not(.active){display:none}#claude-tabbar .ctab{max-width:60vw}#claude-tabbar .ctab .ctab-label{max-width:44vw}}",
@@ -456,10 +523,21 @@
   historyBtn.className = "ctab-btn ctab-history";
   historyBtn.title = "Conversation history (resume a past chat)";
   historyBtn.innerHTML = SVG_HISTORY;
+  const chatBtn = document.createElement("a"); // open the Claude-app-style chat UI (/app)
+  chatBtn.className = "ctab-btn ctab-chat";
+  chatBtn.title = "Open chat app";
+  chatBtn.href = "/app";
+  chatBtn.innerHTML = SVG_CHAT;
+  chatBtn.style.display = "none"; // shown only for the owner (guests get 403 on the probe)
   const hamBtn = document.createElement("div");
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
   hamBtn.innerHTML = SVG_HAM;
+  const netBtn = document.createElement("div"); // external networks (VPN / Tailscale)
+  netBtn.className = "ctab-btn ctab-net";
+  netBtn.title = "External networks (VPN / Tailscale)";
+  netBtn.innerHTML = SVG_NET;
+  netBtn.style.display = "none"; // shown only if the server reports the feature enabled
   const bellBtn = document.createElement("div"); // desktop only (mobile uses the drawer)
   bellBtn.className = "ctab-btn ctab-bell";
   bellBtn.title = "Enable notifications";
@@ -471,6 +549,8 @@
   bar.appendChild(newBtn);
   bar.appendChild(spacer);
   bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
+  bar.appendChild(netBtn);
+  bar.appendChild(chatBtn); // link out to the /app chat UI
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
@@ -510,12 +590,32 @@
   }
 
   function mountBar() {
-    if (!document.body) return;
-    if (!safeTop.isConnected) document.body.appendChild(safeTop);
+    // Mount the bar OUTSIDE <body>, as a direct child of <html>. This is THE fix for
+    // "the tab bar disappears once ttyd loads": ttyd's client calls
+    // render(h(App), document.body), and Preact's reconciler removes any DOM in <body>
+    // it doesn't own as "excess" on EVERY (re)render — initial connect, reconnect,
+    // title change, resize-overlay toggle. So the bar painted on load was silently
+    // evicted the moment ttyd finished mounting, taking the keyboard-shift target with
+    // it. document.documentElement is never a Preact render root here, so a
+    // fixed-position bar parked there survives every ttyd render. (Both injected <style>
+    // blocks already live in <head> for exactly this reason.)
+    const root = document.documentElement;
+    if (!root) return;
+    // #ct-safetop is fixed chrome for the same reason the bar is, so it has to live
+    // outside <body> too. Parked on <body> it was evicted by the very same Preact pass,
+    // which left the status-bar strip missing while the bar itself survived.
+    if (safeTop.parentNode !== root) root.appendChild(safeTop);
     applyInsetFallback();
-    if (!bar.isConnected) document.body.appendChild(bar);
+    if (bar.parentNode !== root) root.appendChild(bar);
     setTimeout(reflow, 50);
   }
+  // Insurance: if the bar is ever detached from <html> (a future full-document rewrite,
+  // some other script), re-mount it on the next tick. childList on documentElement only
+  // (no subtree), so this fires on the rare add/remove of a direct child of <html> —
+  // never on ttyd's terminal output — keeping it effectively free.
+  new MutationObserver(() => {
+    if (!bar.isConnected) mountBar();
+  }).observe(document.documentElement, { childList: true });
 
   function switchTo(id) {
     const p = new URLSearchParams(location.search);
@@ -652,13 +752,25 @@
     let sessions;
     try {
       const r = await api("sessions");
-      // A real 403 means "no sidecar for you" (guest) -> hide the bar for good.
-      // ANY other failure (transient network blip on a mobile wake, a 5xx, or an
-      // expired auth cookie that 302s us to an HTML login page so .json() throws)
-      // is temporary: keep the last-known tabs on screen rather than wiping the bar.
-      // Rebuilding the bar from every poll used to make it vanish on mobile whenever
-      // a single poll failed, which on a long-lived PWA is constant.
-      if (r.status === 403) { hideBar(); return; }
+      // A 403 = the server's allowed() said "you're not the owner". Two very
+      // different things produce it: a genuine guest with no sidecar (hide the bar
+      // for good), OR — on a long-idle mobile PWA — a transient moment where the
+      // Authelia session is renewing and a single poll reaches the sidecar without
+      // the owner's Remote-User header. A genuine guest NEVER gets a successful
+      // poll, so their tab cache stays empty; the owner always has cached tabs. So
+      // only hide when we've never seen owner tabs in this browser; otherwise treat
+      // the 403 as a transient blip and keep the bar (it self-heals on the next OK
+      // poll). This was the residual "tabs still disappear on mobile" cause: an
+      // owner session hiccup was being misread as "guest" and the bar hidden until
+      // a full reload + reauth.
+      // ANY other failure (network blip on a mobile wake, a 5xx, or an expired auth
+      // cookie that 302s us to an HTML login page so .json() throws) is likewise
+      // temporary: keep the last-known tabs rather than wiping the bar.
+      if (r.status === 403) {
+        if (!localStorage.getItem(CACHE_KEY)) { hideBar(); return; }
+        log("sessions 403 but owner tabs are cached -> transient auth blip, keeping bar");
+        return;
+      }
       if (!r.ok) throw new Error(String(r.status));
       sessions = await r.json();
     } catch (e) {
@@ -668,6 +780,20 @@
       log("sessions poll failed, keeping last bar", e);
       return;
     }
+    // A 200 is not enough to trust the body. Two transient shapes must NOT be allowed
+    // to wipe the bar or poison the cache:
+    //   1. A non-array (an auth 302 to a login page that still parsed, a proxy hiccup).
+    //   2. An EMPTY list. The page you're viewing is itself backed by a live tmux
+    //      session, so a real steady state is never zero sessions — an empty list means
+    //      tmux was momentarily unqueryable, which is exactly what happens while the
+    //      ttyd websocket re-attaches during the reload a tab switch triggers. This was
+    //      the residual "tabs disappear when I switch tabs" cause: one contended poll
+    //      returned [], we cached [] and repainted to just the main chip, and every
+    //      later reload then seeded from that poisoned empty cache.
+    // In both cases: keep the last-known bar and the last-known cache; self-heals on
+    // the next good poll.
+    if (!Array.isArray(sessions)) { log("sessions poll gave non-array -> transient, keeping bar"); return; }
+    if (sessions.length === 0) { log("sessions poll empty -> transient tmux blip, keeping bar"); return; }
     // Persist the live tab set so the NEXT page load (every tab switch is a full
     // reload) can paint the bar instantly from cache, before this poll's replacement
     // returns. Without this the bar flashes empty on every switch — the "tabs
@@ -686,9 +812,25 @@
     if (!sessions.some((s) => s.id === MAIN_ID)) {
       sessions.unshift({ id: MAIN_ID, title: "New Tab", created: 0, attached: false, state: "seen" });
     }
+    // Never let the tab you're actually on vanish. If the current ?arg isn't in this
+    // list yet — a just-switched-to or just-spawned tab a slow first poll hasn't caught
+    // up to, or a stale cache seed — synthesize a chip for it, reusing the last-known
+    // title if we have one. Critical on mobile, where CSS shows ONLY the active chip:
+    // without this you'd switch to a tab and see the main chip instead until the poll
+    // lands. The next poll replaces this with the authoritative row.
+    const curArg = curId();
+    if (curArg !== MAIN_ID && !sessions.some((s) => s.id === curArg)) {
+      const prev = lastSessions.find((s) => s.id === curArg);
+      sessions.push(prev || { id: curArg, title: /^\d+$/.test(curArg) ? "New Tab" : curArg, created: 0, attached: true, state: "seen" });
+    }
     mountBar();
     lastSessions = sessions;
-    const cur = curId();
+    // On mobile the CSS hides every non-active chip (only the current tab shows,
+    // the rest live in the drawer). If the current ?arg session isn't in this list
+    // — a just-spawned tab not yet in the poll, or a stale cache seed — nothing
+    // matches and the whole list blanks on phones. Fall back to the always-present
+    // main chip so the bar never looks empty; the next poll corrects the highlight.
+    const cur = sessions.some((s) => s.id === curId()) ? curId() : MAIN_ID;
     // You're looking at this tab, so a finished-and-unseen "done" (green) becomes
     // "seen" (gray) — you've laid eyes on it. A real "waiting" ask stays purple even
     // while viewed (cleared only when it's answered). Only affects the current tab.
@@ -895,12 +1037,231 @@
     panel.appendChild(list);
     histEl.appendChild(panel);
     histEl.addEventListener("click", (e) => { if (e.target === histEl) closeHistory(); });
-    document.body.appendChild(histEl);
+    (document.documentElement || document.body).appendChild(histEl);
     search.focus();
     histEsc = (e) => { if (e.key === "Escape") closeHistory(); };
     document.addEventListener("keydown", histEsc, true);
   }
   historyBtn.addEventListener("click", openHistory);
+  // #endregion
+
+  // #region external networks (VPN / Tailscale) modal
+  let connEl = null, connEsc = null, connPoll = null;
+  let connData = { tunnels: [] };   // latest /connections payload
+  let connApply = null;             // {msg, check(data), started} while a change applies
+  let connMsgEl = null;             // spinner message element
+  function closeConn() {
+    if (connPoll) { clearInterval(connPoll); connPoll = null; }
+    if (connEl) { connEl.remove(); connEl = null; }
+    if (connEsc) { document.removeEventListener("keydown", connEsc, true); connEsc = null; }
+    connApply = null;
+  }
+  // A change (add / toggle / remove) recouples the guest onto the network hub, which
+  // restarts the terminal + this sidecar — so the request's response is unreliable and
+  // the list would momentarily empty out. Cover the dialog with a spinner and hold it
+  // until the polled state actually reflects the change (or a safety timeout).
+  function beginApply(msg, check) {
+    connApply = { msg, check, started: Date.now() };
+    if (connEl) connEl.classList.add("applying");
+    if (connMsgEl) connMsgEl.textContent = msg;
+  }
+  function resolveApply() {
+    if (!connApply) return;
+    const done = connApply.check(connData) || (Date.now() - connApply.started > 60000);
+    if (done) { connApply = null; if (connEl) connEl.classList.remove("applying"); }
+  }
+  // fire a mutating request but tolerate a dropped response (the recouple kills us mid-flight)
+  function fireMutation(method, path, body) {
+    api(path, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    }).catch(() => {});
+  }
+  function dotFor(t) {
+    if (t.type === "tailscale") {
+      if (t.needsLogin) return ["wait", "needs login"];
+      if (t.up) return ["up", "connected" + (t.ip ? " · " + t.ip : "")];
+      return ["down", t.state || "off"];
+    }
+    if (t.enabled === false) return ["down", "disabled"];
+    return t.up ? ["up", "up"] : ["down", t.error || "down"];
+  }
+  function renderTunnels(listEl, data) {
+    const st = {};
+    for (const s of (data.status && data.status.tunnels) || []) st[s.id] = s;
+    listEl.innerHTML = "";
+    const tuns = data.tunnels || [];
+    if (!tuns.length) {
+      const e = document.createElement("div");
+      e.className = "ct-conn-note";
+      e.textContent = "No connections yet. Add an OpenVPN config or connect Tailscale below.";
+      listEl.appendChild(e);
+      return;
+    }
+    for (const t of tuns) {
+      const s = st[t.id] || {};
+      const merged = Object.assign({}, t, s);
+      const [cls, txt] = dotFor(merged);
+      const row = document.createElement("div");
+      row.className = "ct-tun";
+      const top = document.createElement("div");
+      top.className = "ct-tun-top";
+      const dot = document.createElement("span"); dot.className = "ct-dot " + cls;
+      const name = document.createElement("span"); name.className = "ct-tun-name"; name.textContent = t.name;
+      const badge = document.createElement("span"); badge.className = "ct-badge"; badge.textContent = t.type === "tailscale" ? "tailscale" : "openvpn";
+      const status = document.createElement("span"); status.style.cssText = "font-size:11px;color:#9a9a9a"; status.textContent = txt;
+      top.appendChild(dot); top.appendChild(name); top.appendChild(badge); top.appendChild(status);
+      if (t.type === "openvpn") {
+        const tog = document.createElement("span"); tog.className = "ct-ic";
+        tog.textContent = t.enabled ? "disable" : "enable";
+        tog.addEventListener("click", () => { beginApply("Updating " + t.name + "…", (d) => { const x = d.tunnels.find((y) => y.id === t.id); return x && x.enabled === !t.enabled; }); fireMutation("POST", "connections/" + t.id + "/enable", { on: !t.enabled }); });
+        top.appendChild(tog);
+      }
+      const del = document.createElement("span"); del.className = "ct-ic"; del.textContent = "×"; del.style.fontSize = "16px";
+      del.title = "Remove";
+      del.addEventListener("click", () => { if (confirm("Remove " + t.name + "?")) { beginApply("Removing " + t.name + "…", (d) => !d.tunnels.some((y) => y.id === t.id)); fireMutation("DELETE", "connections/" + t.id); } });
+      top.appendChild(del);
+      row.appendChild(top);
+      // detail line: remaps for openvpn, login link for tailscale
+      if (merged.needsLogin && merged.loginUrl) {
+        const a = document.createElement("a");
+        a.className = "ct-login"; a.href = merged.loginUrl; a.target = "_blank"; a.rel = "noopener";
+        a.textContent = "Log in to Tailscale ↗";
+        row.appendChild(a);
+      } else if (t.type === "openvpn") {
+        // prefer live remaps from status (auto-detected ones are allocated at connect time)
+        const rm = (merged.remaps && merged.remaps.length ? merged.remaps : t.remaps) || [];
+        if (rm.length) {
+          const sub = document.createElement("div");
+          sub.className = "ct-tun-sub";
+          sub.innerHTML = "reach via " + rm.map((r) => "<code>" + r.fake + "</code> → " + r.real).join(", ");
+          row.appendChild(sub);
+        } else if (merged.detected && merged.detected.length) {
+          const sub = document.createElement("div"); sub.className = "ct-tun-sub";
+          sub.textContent = "detected " + merged.detected.join(", ") + " — mapping…";
+          row.appendChild(sub);
+        } else if (merged.up) {
+          const sub = document.createElement("div"); sub.className = "ct-tun-sub";
+          sub.textContent = "up — detecting reachable subnets…";
+          row.appendChild(sub);
+        }
+      }
+      listEl.appendChild(row);
+    }
+  }
+  let connListEl = null;
+  async function openConnections() {
+    if (connEl) { closeConn(); return; }
+    try {
+      const r = await api("connections");
+      connData = await r.json();
+      if (!connData.enabled) { showToast("Network connections are not enabled here", "error"); return; }
+    } catch (e) { showToast("Could not load connections", "error"); return; }
+
+    connEl = document.createElement("div"); connEl.id = "ct-connmodal";
+    const panel = document.createElement("div"); panel.className = "ct-conn";
+    const head = document.createElement("div"); head.className = "ct-conn-head";
+    const h = document.createElement("span"); h.textContent = "External networks";
+    const x = document.createElement("span"); x.className = "ct-conn-close"; x.textContent = "×"; x.addEventListener("click", closeConn);
+    head.appendChild(h); head.appendChild(x);
+    // spinner overlay shown while a change applies (terminal reconnects behind the blur)
+    const applying = document.createElement("div"); applying.className = "ct-applying";
+    const sp = document.createElement("div"); sp.className = "sp";
+    connMsgEl = document.createElement("div"); connMsgEl.className = "msg"; connMsgEl.textContent = "Applying…";
+    applying.appendChild(sp); applying.appendChild(connMsgEl);
+    const body = document.createElement("div"); body.className = "ct-conn-body";
+    const note = document.createElement("div"); note.className = "ct-conn-note";
+    note.textContent = "Reach a remote LAN over your own VPN or Tailscale. Overlapping subnets get a unique local range automatically.";
+    connListEl = document.createElement("div");
+    renderTunnels(connListEl, connData);
+
+    // add buttons
+    const addRow = document.createElement("div"); addRow.className = "ct-add-row";
+    const addVpn = document.createElement("button"); addVpn.className = "ct-btn"; addVpn.textContent = "+ OpenVPN";
+    const addTs = document.createElement("button"); addTs.className = "ct-btn"; addTs.textContent = "+ Tailscale";
+    addRow.appendChild(addVpn); addRow.appendChild(addTs);
+
+    // OpenVPN form. Subnets optional: blank -> auto-detect the routes the server pushes.
+    const vf = document.createElement("div"); vf.className = "ct-form";
+    vf.innerHTML =
+      '<label>Name</label><input class="c-name" placeholder="work vpn">' +
+      '<label>Target subnet(s) to reach — comma separated, or leave blank to auto-detect</label><input class="c-subnets" placeholder="auto-detect (or e.g. 192.168.2.0/24, 10.10.0.0/24)">' +
+      '<label>.ovpn config (paste, or load a file)</label><input type="file" class="c-file" accept=".ovpn,.conf,text/plain"><textarea class="c-ovpn" placeholder="dev tun\\nremote vpn.example.com 1194\\n..."></textarea>' +
+      '<label>Username (if the VPN needs one)</label><input class="c-user" placeholder="optional">' +
+      '<label>Password</label><input class="c-pass" type="password" placeholder="optional">';
+    const vfAdd = document.createElement("button"); vfAdd.className = "ct-btn primary"; vfAdd.textContent = "Add & connect"; vfAdd.style.marginTop = "10px";
+    vf.appendChild(vfAdd);
+    vf.querySelector(".c-file").addEventListener("change", (e) => {
+      const f = e.target.files && e.target.files[0]; if (!f) return;
+      const rd = new FileReader(); rd.onload = () => { vf.querySelector(".c-ovpn").value = rd.result; }; rd.readAsText(f);
+    });
+    vfAdd.addEventListener("click", () => {
+      const name = vf.querySelector(".c-name").value.trim();
+      const subnets = vf.querySelector(".c-subnets").value.split(",").map((s) => s.trim()).filter(Boolean);
+      const ovpn = vf.querySelector(".c-ovpn").value;
+      const user = vf.querySelector(".c-user").value.trim();
+      const pass = vf.querySelector(".c-pass").value;
+      const creds = user ? user + "\n" + pass : "";
+      if (!ovpn.trim()) { showToast("Paste or load a .ovpn config", "error"); return; }
+      const pre = connData.tunnels.length;
+      vf.classList.remove("open"); vf.querySelectorAll("input,textarea").forEach((el) => (el.value = ""));
+      beginApply("Connecting " + (name || "VPN") + "… the terminal will reconnect.", (d) => d.tunnels.length > pre);
+      fireMutation("POST", "connections/openvpn", { name, subnets, ovpn, creds });
+    });
+
+    // Tailscale form. Single "name" = how THIS Claude server appears on your tailnet;
+    // the tailnet hostname is auto-generated from it (ct-<slug>).
+    const tf = document.createElement("div"); tf.className = "ct-form";
+    tf.innerHTML =
+      '<label>Name for this Claude sandbox on YOUR Tailscale</label>' +
+      '<input class="c-tsname" placeholder="claude-sandbox">' +
+      '<div class="ct-tun-sub">This names the Claude server as a device in your own Tailscale account (it appears as <code>ct-&lt;name&gt;</code>). It is not one of your existing devices — you are adding this sandbox to your tailnet.</div>';
+    const tfAdd = document.createElement("button"); tfAdd.className = "ct-btn primary"; tfAdd.textContent = "Connect Tailscale"; tfAdd.style.marginTop = "10px";
+    tf.appendChild(tfAdd);
+    tfAdd.addEventListener("click", () => {
+      const name = tf.querySelector(".c-tsname").value.trim();
+      const pre = connData.tunnels.length;
+      tf.classList.remove("open"); tf.querySelector(".c-tsname").value = "";
+      beginApply("Starting Tailscale… a login link will appear once it's up.", (d) => d.tunnels.length > pre);
+      fireMutation("POST", "connections/tailscale", { name });
+    });
+
+    addVpn.addEventListener("click", () => { tf.classList.remove("open"); vf.classList.toggle("open"); });
+    addTs.addEventListener("click", () => { vf.classList.remove("open"); tf.classList.toggle("open"); });
+
+    body.appendChild(note);
+    body.appendChild(connListEl);
+    body.appendChild(addRow);
+    body.appendChild(vf);
+    body.appendChild(tf);
+    panel.appendChild(head); panel.appendChild(applying); panel.appendChild(body); connEl.appendChild(panel);
+    connEl.addEventListener("click", (e) => { if (e.target === connEl && !connApply) closeConn(); });
+    (document.documentElement || document.body).appendChild(connEl);
+    connEsc = (e) => { if (e.key === "Escape" && !connApply) closeConn(); };
+    document.addEventListener("keydown", connEsc, true);
+
+    // live refresh: pull the full state (list + embedded status), re-render, and clear
+    // the applying spinner once the change is reflected. Failures (mid-reconnect) are
+    // ignored so the spinner holds instead of flashing an empty list.
+    async function refresh() {
+      try {
+        const r = await api("connections");
+        const d = await r.json();
+        if (d && d.enabled) { connData = d; renderTunnels(connListEl, connData); resolveApply(); }
+      } catch {}
+    }
+    connPoll = setInterval(refresh, 2000);
+  }
+  netBtn.addEventListener("click", openConnections);
+  // reveal the button only when the server reports the feature is enabled
+  (async () => {
+    try { const r = await api("connections"); const d = await r.json(); if (d && d.enabled) netBtn.style.display = ""; } catch {}
+  })();
+  // reveal the chat-app button only for the owner (the /app routes are owner-gated)
+  (async () => {
+    try { const r = await api("app/api/models"); if (r.ok) chatBtn.style.display = ""; } catch {}
+  })();
   // #endregion
 
   // #region mobile tab drawer (hamburger)
@@ -974,7 +1335,7 @@
 
     panel.appendChild(head); panel.appendChild(list); drawerEl.appendChild(panel);
     drawerEl.addEventListener("click", (e) => { if (e.target === drawerEl) closeDrawer(); });
-    document.body.appendChild(drawerEl);
+    (document.documentElement || document.body).appendChild(drawerEl);
     drawerEsc = (e) => { if (e.key === "Escape") closeDrawer(); };
     document.addEventListener("keydown", drawerEsc, true);
   }
@@ -1180,7 +1541,7 @@
     x.title = "Dismiss";
     x.addEventListener("click", dismissInstall);
     installBanner.appendChild(x);
-    document.body.appendChild(installBanner);
+    (document.documentElement || document.body).appendChild(installBanner);
   }
   // Android/Chromium: the browser offers a real install prompt we can trigger.
   window.addEventListener("beforeinstallprompt", (e) => {
@@ -1345,21 +1706,29 @@
     window.visualViewport.addEventListener("scroll", liftComposer);
   }
 
+  // Mounted on <html>, not <body>, for the reason spelled out in mountBar(): ttyd renders
+  // Preact into document.body and its reconciler evicts any child it does not own on every
+  // render. The composer is fixed-position chrome like the tab bar, so it belongs outside
+  // the render root — otherwise the first ttyd (re)connect silently takes the keyboard away.
   function mountComposer() {
-    if (!document.body || document.getElementById("ct-composer")) return;
-    document.body.appendChild(compBar);
+    const root = document.documentElement;
+    if (!root || compBar.parentNode === root) return;
+    root.appendChild(compBar);
     compLastH = 0;
     autoGrow();
     setTimeout(reflow, 320);
   }
   if (isTouchDevice) {
-    if (document.body) mountComposer();
-    else document.addEventListener("DOMContentLoaded", mountComposer);
+    mountComposer(); // <html> always exists — no DOMContentLoaded wait, same as the bar
+    // Insurance mirroring the tab bar's: re-mount if anything ever detaches it.
+    new MutationObserver(() => {
+      if (!compBar.isConnected) mountComposer();
+    }).observe(document.documentElement, { childList: true });
   }
   // #endregion
 
-  if (document.body) mountBar();
-  else document.addEventListener("DOMContentLoaded", mountBar);
+  mountBar(); // <html> always exists, so mount now — no DOMContentLoaded wait (that
+              // fired AFTER ttyd's render, which is precisely when the bar got wiped).
   seedFromCache(); // show cached tabs immediately so a switch never blanks the bar
   refresh();
   setInterval(refresh, 3000);
