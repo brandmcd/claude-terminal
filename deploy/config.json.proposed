@@ -32,6 +32,10 @@
       "label": "Sonnet 5"
     },
     {
+      "id": "claude-fable-5-1",
+      "label": "Fable 5.1"
+    },
+    {
       "id": "claude-fable-5",
       "label": "Fable 5"
     }
@@ -48,5 +52,15 @@
   ],
   "voice": true,
   "sttUrl": "http://127.0.0.1:7801",
-  "ttsUrl": "http://127.0.0.1:7802"
+  "ttsUrl": "http://127.0.0.1:7802",
+  "externalPeers": [
+    {
+      "name": "laptop",
+      "url": "http://100.83.49.61:7683/usage/export",
+      "tokenFile": "/etc/claude-terminal/peer-laptop.token"
+    }
+  ],
+  "exportName": "brandon",
+  "exportTokenFile": "/etc/claude-terminal/export.token",
+  "exportCombinePeers": true
 }
