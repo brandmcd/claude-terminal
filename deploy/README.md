@@ -93,7 +93,7 @@ What each addition does:
 | `usagePage: true` | was `false`, which made the sidecar skip the dashboard and never open usage.db |
 | `names` / `hosts` / `colors` | single-user roster; `colors` now actually drives the chart colours |
 | `collectSeconds: 60` | matches the collector timer below |
-| `appModels` / `appMoreModels` | the built-in defaults still lead with Opus 4.8 / Sonnet 4.6; this puts Opus 5, Sonnet 5 and Fable 5.1 up front, with Fable 5 behind "Other…" |
+| `appModels` / `appMoreModels` | fallback only since the upstream merge: `/app/api/models` now prefers the CLI's live `supportedModels()` menu (same list as `/model` in a tab) and only falls back to these if that probe fails |
 | `voice`, `sttUrl`, `ttsUrl` | enables the mic button; the routes 503 until the two services are up |
 
 Not changed, but worth a thought: `themeColor` is still `#c8102e` (red) while the new icon
