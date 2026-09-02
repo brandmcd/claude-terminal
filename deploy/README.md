@@ -1,34 +1,39 @@
 # Deploying this fork on claude.brandmcd.com
 
-Everything in this directory needs **root**, which is why it is a runbook rather than
-something already applied. `ctuser` is in groups `ctuser` and `users` only — not `sudo`,
-and there is no `/etc/sudoers.d` entry for it, so `sudo` fails for this account whether
-or not a password is supplied. Every command below has to run as root.
+Everything in this directory needs **root**. As of 2026-08-27, `ctuser` has it:
+`/etc/sudoers.d/91-ctuser` grants `ctuser ALL=(ALL) NOPASSWD:ALL`, so the agent in this
+terminal can run every command below itself. Check before assuming otherwise:
 
-> **On "this box should be passwordless":** it currently is not, and this is not something
-> that can be fixed from inside the box by `ctuser` — granting sudo requires already having
-> it. Note also that Claude Code's *bypass-permissions* mode (which is on) and *OS-level
-> sudo* are unrelated: bypass mode only stops Claude Code asking you to approve each tool
-> call, it grants no Unix privilege. To make this account passwordless, as root:
+```bash
+sudo -n true && echo "sudo works"
+```
+
+> **This section used to say the opposite.** Until 2026-08-28 it stated that `ctuser` was
+> "not in `sudo`, and there is no `/etc/sudoers.d` entry for it", and that the situation
+> "is not something that can be fixed from inside the box." That was true when written and
+> false after the grant, and an agent reading it reported having no sudo while holding
+> passwordless root. Test the permission; do not trust this file's memory of it.
+>
+> Note that Claude Code's *bypass-permissions* mode and *OS-level sudo* remain unrelated:
+> bypass mode only stops Claude Code asking you to approve each tool call, it grants no
+> Unix privilege. Both happen to be on here.
+>
+> The grant is deliberately broad, and the consequence is worth stating plainly: anyone
+> who clears Cloudflare Access, and any instruction that reaches the agent in this
+> terminal, reaches root. A narrower alternative, if that ever stops being acceptable:
 >
 > ```bash
-> usermod -aG sudo ctuser
-> echo 'ctuser ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ctuser
-> chmod 440 /etc/sudoers.d/ctuser
-> visudo -c            # verify before logging out
-> ```
->
-> That grants full root to whatever runs as `ctuser` — including agents in this terminal.
-> A narrower alternative that unblocks everything in this runbook without a blank cheque:
->
-> ```bash
-> cat > /etc/sudoers.d/ctuser <<'EOF'
+> cat > /etc/sudoers.d/91-ctuser <<'EOF'
 > ctuser ALL=(root) NOPASSWD: /bin/systemctl restart ct-sidecar.service, \
 >   /bin/systemctl restart ct-ttyd.service, /bin/systemctl reload nginx, \
 >   /usr/sbin/nginx -t
 > EOF
-> chmod 440 /etc/sudoers.d/ctuser && visudo -c
+> chmod 440 /etc/sudoers.d/91-ctuser && visudo -c
 > ```
+
+**There is no Cloudflare API token on this box, by decision.** Access, DNS and tunnel
+changes are made from Brandon's laptop or by Brandon. A step that needs one is a step to
+hand back, not a reason to abandon the rest of the task.
 
 ---
 
@@ -53,13 +58,21 @@ before reloading.
 **`/usage/` is deliberately ungated** (`auth_request off`) because you asked for it to be
 public. Two things follow:
 
-- nginx is not the only gate. **Cloudflare Access still fronts this hostname**, so the
-  dashboard stays behind the CF login until you add a *Bypass* policy for
-  `claude.brandmcd.com/usage*` in the Zero Trust dashboard. Removing `auth_request` is
-  necessary but not sufficient.
+- nginx is not the only gate. **Cloudflare Access also fronts this hostname.** Removing
+  `auth_request` is necessary but not sufficient. Done 2026-08-28: a second Access
+  application, `Claude Usage Dashboard (public)`, covers `claude.brandmcd.com/usage` and
+  `claude.brandmcd.com/usage/*` with a single bypass-everyone policy. Access matches the
+  most specific path, so the `Claude Terminal` app still gates everything else.
+- The vhost carries `absolute_redirect off;`. Without it, `location = /usage` builds its
+  `Location` from the internal listener and 301s the browser to
+  `http://claude.brandmcd.com:8080/usage/`, which does not resolve publicly.
 - What that exposes is aggregate token counts, model names, session counts and last-active
-  times — no transcripts, no prompts. `/usage/export` stays 404 unless `exportToken` is set
-  in config.json, so leaving the prefix open does not expose the export.
+  times — no transcripts, no prompts. `/usage/export` is now enabled (2026-08-28) so a peer
+  can pull this instance's figures, and it sits on the public prefix with the bearer token
+  as its only gate. The secret lives in `/etc/claude-terminal/export.token` (640
+  root:ctuser) and is named from `exportTokenFile`, never inline — `config.json.proposed`
+  is tracked in a public repo. `exportCombinePeers: true` folds the external peers into the
+  owner's row, so a puller sees one figure for the VPS and the laptop together.
 
 ## 2. config.json
 
@@ -80,7 +93,7 @@ What each addition does:
 | `usagePage: true` | was `false`, which made the sidecar skip the dashboard and never open usage.db |
 | `names` / `hosts` / `colors` | single-user roster; `colors` now actually drives the chart colours |
 | `collectSeconds: 60` | matches the collector timer below |
-| `appModels` / `appMoreModels` | the built-in defaults still lead with Opus 4.8 / Sonnet 4.6; this puts Opus 5, Sonnet 5 and Fable 5 up front |
+| `appModels` / `appMoreModels` | the built-in defaults still lead with Opus 4.8 / Sonnet 4.6; this puts Opus 5, Sonnet 5 and Fable 5.1 up front, with Fable 5 behind "Other…" |
 | `voice`, `sttUrl`, `ttsUrl` | enables the mic button; the routes 503 until the two services are up |
 
 Not changed, but worth a thought: `themeColor` is still `#c8102e` (red) while the new icon

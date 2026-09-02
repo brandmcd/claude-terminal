@@ -462,6 +462,122 @@
   }, true);
   // #endregion
 
+  // #region dictation
+  // iOS keyboard dictation into xterm arrives as "thisthis isthis is anthis is an example"
+  // — every interim transcript concatenated instead of replacing the one before it. The
+  // cause is in xterm's composition handling, and it is worth naming exactly, because the
+  // fix below is shaped by it:
+  //
+  //   compositionstart() anchors _compositionPosition.start at textarea.value.length.
+  //   compositionend() sends textarea.value.substring(start).
+  //   The helper textarea is cleared on CR, on Ctrl+C and on blur — nowhere else.
+  //
+  // Dictation fires ONE compositionstart and then a compositionend per recognised chunk,
+  // so `start` is anchored once at 0 and never advances while the textarea accumulates the
+  // whole running transcript. Chunk 2 therefore re-sends chunk 1, chunk 3 re-sends both,
+  // and the terminal receives every prefix. A second sender piles on: _inputEvent forwards
+  // an insertText `input` when !_keyDownSeen, and dictation produces no keydown at all.
+  //
+  // So take the whole path over. A document-level CAPTURE listener runs before xterm's own
+  // listeners on the textarea (they are registered ON the target, so their capture flag
+  // buys them nothing against an ancestor), and stopPropagation() means xterm never sees
+  // the event — no double send, and _isComposing is never left stuck true. We then mirror
+  // the textarea into the terminal ourselves: send only what changed since the last flush,
+  // backspacing whatever the new transcript no longer agrees with.
+  //
+  // Armed ONLY when a composition starts with no real keydown just before it, so ordinary
+  // typing never reaches any of this. A desktop IME can arm it: its keydowns are keyCode
+  // 229, which is skipped here precisely because dictation may emit them too, so an IME
+  // composition opened more than DICT_KEY_GRACE_MS after the last real keystroke gets
+  // mirrored rather than handled natively. That is the deliberate trade — the mirror
+  // converges on the same final text, at the cost of xterm's preview overlay and of
+  // echoing the interim candidates instead of hiding them. Known rough edge: the DEL count
+  // is in UTF-16 code units, so an astral character (dictating "heart emoji") costs two
+  // backspaces for one grapheme.
+  //
+  // It stays armed across compositionends — repeated ends with no new start ARE the bug —
+  // and disarms on the next real keystroke, on blur, or when the textarea is cleared.
+  const DICT_KEY_GRACE_MS = 100; // a keydown this recent means a keyboard, not a mic
+  let dictArmed = false;
+  let dictLastKeyDown = 0;
+  let dictAnchor = 0;   // textarea offset where the dictated run begins
+  let dictEmitted = ""; // what we have already sent from that run
+  // Ring buffer behind localStorage["ct-dictlog"]="1". This code cannot be tested from the
+  // server, so if a device ever dictates and nothing here fires, window.__ctDictLog() is
+  // the raw event trace that says which assumption above was wrong.
+  const DICT_LOG = (() => { try { return localStorage.getItem("ct-dictlog") === "1"; } catch { return false; } })();
+  const dictLog = [];
+  window.__ctDictLog = () => dictLog.slice();
+
+  const dictTarget = (el) =>
+    el && el.classList && el.classList.contains("xterm-helper-textarea") ? el : null;
+
+  function dictNote(kind, e, ta) {
+    if (!DICT_LOG) return;
+    dictLog.push({
+      at: Date.now(), kind, armed: dictArmed,
+      inputType: e && e.inputType, data: e && e.data, keyCode: e && e.keyCode,
+      value: ta ? ta.value : null,
+    });
+    if (dictLog.length > 300) dictLog.shift();
+  }
+
+  // Mirror ta.value's dictated tail into the terminal. Diffing against what we last sent
+  // (rather than appending) is what makes a revised transcript — dictation rewrites words
+  // it has already shown — cost a few backspaces instead of a duplicate.
+  function dictFlush(ta) {
+    if (!ta || !dictArmed) return;
+    const cur = ta.value;
+    // Cleared or truncated underneath us (CR, Ctrl+C, blur): re-anchor, send nothing. The
+    // terminal already handled whatever did the clearing.
+    if (cur.length < dictAnchor) { dictAnchor = cur.length; dictEmitted = ""; return; }
+    const tail = cur.slice(dictAnchor);
+    let n = 0;
+    while (n < tail.length && n < dictEmitted.length && tail[n] === dictEmitted[n]) n++;
+    let out = "";
+    if (dictEmitted.length > n) out += "\x7f".repeat(dictEmitted.length - n); // DEL, what a terminal takes for backspace
+    out += tail.slice(n);
+    dictEmitted = tail;
+    if (out) sendToTerminal(out);
+  }
+  // The textarea's value lags the event that changed it — xterm defers on the same grounds.
+  const dictFlushSoon = (ta) => setTimeout(() => dictFlush(ta), 0);
+
+  document.addEventListener("keydown", (e) => {
+    dictNote("keydown", e, dictTarget(e.target));
+    if (e.keyCode === 229) return; // the synthetic "composition in progress" keydown, not a key
+    dictLastKeyDown = Date.now();
+    dictArmed = false; // a real keystroke ends the dictated run
+  }, true);
+
+  document.addEventListener("compositionstart", (e) => {
+    const ta = dictTarget(e.target);
+    dictNote("compositionstart", e, ta);
+    if (!ta) return;
+    if (Date.now() - dictLastKeyDown < DICT_KEY_GRACE_MS) return; // keyboard-driven IME: leave it to xterm
+    dictArmed = true;
+    dictAnchor = ta.value.length; // everything before this was already sent by the normal path
+    dictEmitted = "";
+    e.stopPropagation();
+  }, true);
+
+  for (const kind of ["compositionupdate", "compositionend", "input"]) {
+    document.addEventListener(kind, (e) => {
+      const ta = dictTarget(e.target);
+      dictNote(kind, e, ta);
+      if (!ta || !dictArmed) return;
+      e.stopPropagation(); // keep it away from _inputEvent and _finalizeComposition
+      dictFlushSoon(ta);   // NB: stays armed — dictation ends a composition per chunk
+    }, true);
+  }
+
+  document.addEventListener("blur", (e) => {
+    if (!dictTarget(e.target)) return;
+    dictNote("blur", e, e.target);
+    dictArmed = false; // xterm empties the textarea here, so the anchor is meaningless now
+  }, true);
+  // #endregion
+
   // #region auto-reconnect
   // ttyd only auto-reconnects when the socket closes abnormally AND no WebSocket
   // 'error' fired first — but it disables its own reconnect on ANY error, which is
@@ -698,7 +814,7 @@
   const SAB = "var(--ct-sab)";
   const SAL = "env(safe-area-inset-left, 0px)";
   const SAR = "env(safe-area-inset-right, 0px)";
-  const MAIN_ID = "1"; // main session is always first; closing it just restarts it
+  const MAIN_ID = "1"; // the session the bare URL (no ?arg) attaches to; otherwise an ordinary tab
   const curId = () => new URLSearchParams(location.search).get("arg") || MAIN_ID;
 
   // ttyd installs a beforeunload "are you sure you want to leave this page" prompt.
@@ -718,8 +834,6 @@
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
   const SVG_USAGE =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="12" y="8" width="3" height="10"/><rect x="17" y="4" width="3" height="14"/></svg>';
-  const SVG_REFRESH =
-    '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>';
   const SVG_HISTORY =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>';
   const SVG_HAM =
@@ -727,6 +841,9 @@
   const SVG_MIC =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>';
+  const SVG_PASTE =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>';
   const SVG_CHAT =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.38 8.38 0 0 1 3.5 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5z"/></svg>';
   const SVG_NET =
@@ -945,6 +1062,26 @@
   voiceBtn.href = "/app?voice=1";
   voiceBtn.innerHTML = SVG_MIC;
   voiceBtn.style.display = "none";
+  // Paste, for phones. iOS offers its Paste callout only over a visible selection, and
+  // xterm's input is a 1px offscreen textarea that can never show one — so on a phone
+  // there is no gesture that pastes into the terminal at all. The async clipboard read
+  // needs no selection, only a user gesture: readText() is called straight out of the tap,
+  // and iOS shows its own "Paste" confirmation. Hidden where the API is missing (it needs
+  // a secure context) and on desktops, where Ctrl/Cmd+V already reaches xterm.
+  const pasteBtn = document.createElement("div");
+  pasteBtn.className = "ctab-btn ctab-paste";
+  pasteBtn.title = "Paste from clipboard";
+  pasteBtn.innerHTML = SVG_PASTE;
+  pasteBtn.style.display = "none";
+  pasteBtn.addEventListener("click", () => {
+    if (!navigator.clipboard || !navigator.clipboard.readText) return;
+    navigator.clipboard.readText().then((text) => {
+      if (!text) return;
+      // Ink reads a bare \n as submit, so a multi-line paste would fire one prompt per
+      // line. ESC+CR is its "insert a newline" — the same swap the Shift+Enter handler makes.
+      sendToTerminal(text.split("\r\n").join("\n").split("\n").join("\x1b\r"));
+    }).catch((err) => log("paste: clipboard read refused", err));
+  });
   const hamBtn = document.createElement("div");
   hamBtn.className = "ctab-btn ctab-ham";
   hamBtn.title = "All tabs";
@@ -966,11 +1103,17 @@
   bar.appendChild(spacer);
   bar.appendChild(bellBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(netBtn);
+  bar.appendChild(pasteBtn); // touch only — the phone's only way into the terminal's stdin
   bar.appendChild(voiceBtn); // one-tap voice session (/app?voice=1)
   bar.appendChild(chatBtn); // link out to the /app chat UI
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
   bar.appendChild(usageBtn);
+
+  if (navigator.clipboard && navigator.clipboard.readText &&
+      (window.matchMedia ? window.matchMedia("(pointer: coarse)").matches : (navigator.maxTouchPoints || 0) > 0)) {
+    pasteBtn.style.display = "";
+  }
 
   const safeTop = document.createElement("div");
   safeTop.id = "ct-safetop";
@@ -1049,7 +1192,9 @@
   const CACHE_KEY = "ct-last-sessions";
   async function closeSession(id) {
     const wasCurrent = id === curId();
-    // pick where to land: the previous tab in order, else the next, else main
+    // pick where to land: the previous tab in order, else the next, else main.
+    // Main is in this list like anything else, so closing it lands you on a real
+    // neighbour instead of reopening itself.
     const order = lastSessions.map((s) => s.id);
     const idx = order.indexOf(id);
     let target = MAIN_ID;
@@ -1064,11 +1209,7 @@
     } catch (e) {
       log("close failed", e);
     }
-    if (id === MAIN_ID) {
-      // closing main just restarts it (reattaching to ?arg=1 recreates the session)
-      if (wasCurrent) switchTo(MAIN_ID);
-      else refresh();
-    } else if (wasCurrent) {
+    if (wasCurrent) {
       switchTo(target);
     } else {
       refresh();
@@ -1116,17 +1257,13 @@
     });
     chip.appendChild(open);
 
+    // Every chip closes the same way, main included: the X kills the tmux session and
+    // the chip goes with it. Main comes back only when something attaches to ?arg=1
+    // again — the bare URL does — not on its own.
     const close = document.createElement("span");
-    if (s.id === MAIN_ID) {
-      // main can't really be closed; its button restarts it, so show a refresh icon
-      close.className = "ctab-icon ctab-restart";
-      close.innerHTML = SVG_REFRESH;
-      close.title = "Restart main session";
-    } else {
-      close.className = "ctab-close";
-      close.textContent = "×";
-      close.title = "Close session";
-    }
+    close.className = "ctab-close";
+    close.textContent = "×";
+    close.title = "Close session";
     close.addEventListener("click", (e) => {
       e.stopPropagation();
       closeSession(s.id);
@@ -1225,29 +1362,31 @@
   // is a cache seed painted on load and must not send any state-changing request.
   function paintBar(sessions, live) {
     bar.style.display = "";
-    // guarantee a pinned main chip even if no one is attached to it yet
-    if (!sessions.some((s) => s.id === MAIN_ID)) {
-      sessions.unshift({ id: MAIN_ID, title: "New Tab", created: 0, attached: false, state: "seen" });
-    }
     // Never let the tab you're actually on vanish. If the current ?arg isn't in this
     // list yet — a just-switched-to or just-spawned tab a slow first poll hasn't caught
     // up to, or a stale cache seed — synthesize a chip for it, reusing the last-known
     // title if we have one. Critical on mobile, where CSS shows ONLY the active chip:
-    // without this you'd switch to a tab and see the main chip instead until the poll
-    // lands. The next poll replaces this with the authoritative row.
+    // without this you'd switch to a tab and see nothing until the poll lands. The next
+    // poll replaces this with the authoritative row.
+    //
+    // Main ("1") gets no special treatment: it is synthesized here only when it is the
+    // tab you are on (the bare URL attaches to ?arg=1), never pinned to the front of
+    // everyone else's list. An empty "New Tab" chip you never asked for is what the "+"
+    // is for.
     const curArg = curId();
-    if (curArg !== MAIN_ID && !sessions.some((s) => s.id === curArg)) {
+    if (!sessions.some((s) => s.id === curArg)) {
       const prev = lastSessions.find((s) => s.id === curArg);
       sessions.push(prev || { id: curArg, title: /^\d+$/.test(curArg) ? "New Tab" : curArg, created: 0, attached: true, state: "seen" });
     }
     mountBar();
     lastSessions = sessions;
     // On mobile the CSS hides every non-active chip (only the current tab shows,
-    // the rest live in the drawer). If the current ?arg session isn't in this list
-    // — a just-spawned tab not yet in the poll, or a stale cache seed — nothing
-    // matches and the whole list blanks on phones. Fall back to the always-present
-    // main chip so the bar never looks empty; the next poll corrects the highlight.
-    const cur = sessions.some((s) => s.id === curId()) ? curId() : MAIN_ID;
+    // the rest live in the drawer). The synth above guarantees the current ?arg has a
+    // chip, so this normally just picks it; the first-chip fallback only covers an
+    // empty list, so the bar never looks blank on phones.
+    const cur = sessions.some((s) => s.id === curId())
+      ? curId()
+      : (sessions[0] ? sessions[0].id : MAIN_ID);
     // You're looking at this tab, so a finished-and-unseen "done" (green) becomes
     // "seen" (gray) — you've laid eyes on it. A real "waiting" ask stays purple even
     // while viewed (cleared only when it's answered). Only affects the current tab.
@@ -1716,8 +1855,8 @@
       const open = document.createElement("span"); open.className = "ic"; open.innerHTML = SVG_OPEN; open.title = "Open in new tab";
       open.addEventListener("click", (e) => { e.stopPropagation(); window.open("/?arg=" + encodeURIComponent(s.id), "_blank"); });
       const close = document.createElement("span");
-      if (s.id === MAIN_ID) { close.className = "ic"; close.innerHTML = SVG_REFRESH; close.title = "Restart main"; }
-      else { close.className = "ic x"; close.textContent = "×"; close.title = "Close"; }
+      close.className = "ic x"; close.textContent = "×";
+      close.title = "Close";
       close.addEventListener("click", (e) => { e.stopPropagation(); closeSession(s.id); closeDrawer(); });
       row.appendChild(dot); row.appendChild(lbl); row.appendChild(open); row.appendChild(close);
       row.addEventListener("click", () => { if (s.id !== cur) switchTo(s.id); else closeDrawer(); });

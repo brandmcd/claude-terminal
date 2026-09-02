@@ -9,7 +9,7 @@
 import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
-import { watch, readdirSync, statSync, existsSync } from "node:fs";
+import { watch, readdirSync, statSync, existsSync, readFileSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
@@ -28,6 +28,17 @@ const HOST = cfg.host || "127.0.0.1";
 // Terminal-only mode (no usage tracking) = per-guest sidecars: they serve the tab bar
 // + paste for one isolated container and don't open a usage DB or serve the dashboard.
 const USAGE_PAGE = cfg.usagePage !== false;
+
+// The /usage/export secret. deploy/config.json.proposed is tracked in a PUBLIC repo and
+// has to stay byte-identical to the live config, so an inline `exportToken` would leak.
+// `exportTokenFile` points at a root:ctuser file instead; inline still works for guests.
+const EXPORT_TOKEN: string = (() => {
+  if (cfg.exportTokenFile) {
+    try { return readFileSync(cfg.exportTokenFile, "utf8").trim(); }
+    catch (e) { console.error(`exportTokenFile ${cfg.exportTokenFile} unreadable:`, e); return ""; }
+  }
+  return cfg.exportToken || "";
+})();
 const GATE = cfg.gateTerminal !== false; // guests are per-container isolated -> can disable
 const HOME = process.env.HOME || `/home/${OWNER}`;
 const REG_DIR = join(HOME, ".claude", "tab-registry");
@@ -88,13 +99,34 @@ function rolling(hours: Map<string, any>, metric: string, now: Date, n = ROLLING
   }
   return t;
 }
-function sparkSeries(hours: Map<string, any>, now: Date, n: number): number[] {
+// The four categories every token total is made of, in the order the dashboard lists
+// them. `total` is their sum, which is what the charts plot: output alone hid the cache
+// traffic that dominates real usage.
+const PART_KEYS = ["input", "output", "cache_creation", "cache_read"] as const;
+const zeroParts = () => ({ input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 });
+function addParts(acc: Record<string, number>, r: any): void {
+  for (const k of PART_KEYS) acc[k] += r[k] || 0;
+  acc.total += r.total || 0;
+}
+const partsOf = (r: any) => ({
+  input: r.input || 0, output: r.output || 0,
+  cache_creation: r.cache_creation || 0, cache_read: r.cache_read || 0,
+});
+
+function sparkSeries(hours: Map<string, any>, now: Date, n: number, metric = "total"): number[] {
   const vals: number[] = [];
   for (let i = n - 1; i >= 0; i--) {
     const b = hours.get(hourKeyOf(new Date(now.getTime() - i * 3600e3)));
-    vals.push(b ? b.output || 0 : 0);
+    vals.push(b ? b[metric] || 0 : 0);
   }
   return vals;
+}
+// One series per category over the same hour axis, so a tooltip can break a point down
+// into the numbers that add up to it.
+function partsSeries(hours: Map<string, any>, now: Date, n: number): Record<string, number[]> {
+  const out: Record<string, number[]> = {};
+  for (const k of PART_KEYS) out[k] = sparkSeries(hours, now, n, k);
+  return out;
 }
 function splitCents(amounts: Record<string, number>, pot: number): Record<string, number> {
   const total = Object.values(amounts).reduce((a, b) => a + b, 0);
@@ -109,7 +141,7 @@ function splitCents(amounts: Record<string, number>, pot: number): Record<string
 }
 
 const qUsers = db?.query("SELECT user FROM cumulative ORDER BY user") as any;
-const qHours = db?.query("SELECT hour_utc, total, output FROM hourly WHERE user = ?") as any;
+const qHours = db?.query("SELECT * FROM hourly WHERE user = ?") as any;   // * : the per-category columns too
 const qCum = db?.query("SELECT * FROM cumulative WHERE user = ?") as any;
 const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 
@@ -126,7 +158,7 @@ function ensureExt() {
     extQ = {
       users: db.query("SELECT DISTINCT peer, user FROM external_cum ORDER BY peer, user"),
       cum: db.query("SELECT * FROM external_cum WHERE peer = ? AND user = ?"),
-      hours: db.query("SELECT hour_utc, total, output FROM external_hourly WHERE peer = ? AND user = ?"),
+      hours: db.query("SELECT * FROM external_hourly WHERE peer = ? AND user = ?"),
       meta: db.query("SELECT * FROM external_meta WHERE peer = ? AND user = ?"),
     };
   } catch { extQ = null; }
@@ -147,7 +179,7 @@ function buildExport() {
     const meta = (qMeta.get(user) as any) || {};
     const hourly = (qHours.all(user) as any[])
       .filter((r) => r.hour_utc >= cutoff)
-      .map((r) => ({ hour_utc: r.hour_utc, total: r.total, output: r.output }));
+      .map((r) => ({ hour_utc: r.hour_utc, total: r.total, ...partsOf(r) }));
     users.push({
       user,
       name: cfg.names?.[user] || titleCase(user),
@@ -159,7 +191,50 @@ function buildExport() {
       hourly,
     });
   }
+  // exportCombinePeers: fold this instance's external peers into the owner's row, so a
+  // puller sees one figure covering every machine the owner runs instead of one row per
+  // machine. Off by default -- the no-chaining rule above still holds for ordinary peers.
+  if (cfg.exportCombinePeers) mergePeersIntoOwner(users, cutoff);
   return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(), users };
+}
+
+// Sums external peer rows into the owner's export row: cumulative parts, hourly buckets
+// keyed by hour_utc, session counts, the union of model ids, and the latest activity
+// stamp. The peers track different machines, so no transcript is counted twice.
+function mergePeersIntoOwner(users: any[], cutoff: string): void {
+  const eq = ensureExt();
+  if (!eq) return;
+  let row = users.find((u) => u.user === OWNER);
+  if (!row) {
+    row = {
+      user: OWNER,
+      name: cfg.names?.[OWNER] || titleCase(OWNER),
+      cumulative: zeroParts(),
+      meta: { sessions: 0, models: "[]", last_activity: null },
+      hourly: [],
+    };
+    users.push(row);
+  }
+  const byHour = new Map<string, any>();
+  for (const h of row.hourly) byHour.set(h.hour_utc, h);
+  const models = new Set<string>(JSON.parse(row.meta.models || "[]"));
+  for (const { peer, user } of eq.users.all() as any[]) {
+    const cum = (eq.cum.get(peer, user) as any) || {};
+    addParts(row.cumulative, cum);
+    for (const r of eq.hours.all(peer, user) as any[]) {
+      if (r.hour_utc < cutoff) continue;
+      let b = byHour.get(r.hour_utc);
+      if (!b) { b = { hour_utc: r.hour_utc, ...zeroParts() }; byHour.set(r.hour_utc, b); }
+      addParts(b, r);
+    }
+    const meta = (eq.meta.get(peer, user) as any) || {};
+    row.meta.sessions += meta.sessions || 0;
+    for (const m of JSON.parse(meta.models || "[]")) models.add(m);
+    if (meta.last_activity && (!row.meta.last_activity || meta.last_activity > row.meta.last_activity))
+      row.meta.last_activity = meta.last_activity;
+  }
+  row.meta.models = JSON.stringify([...models].sort());
+  row.hourly = [...byHour.values()].sort((a, b) => a.hour_utc.localeCompare(b.hour_utc));
 }
 
 function buildLeaderboard() {
@@ -169,22 +244,21 @@ function buildLeaderboard() {
   const hour_ms: number[] = [];
   for (let i = 0; i < HOURLY_HOURS; i++) hour_ms.push(hour0.getTime() - (HOURLY_HOURS - 1 - i) * 3600e3);
 
-  const byMonth: Record<string, Record<string, number>> = {};
+  const byMonth: Record<string, Record<string, Record<string, number>>> = {};
   const users: any[] = [];
   for (const { user } of qUsers.all() as any[]) {
     const hours = new Map<string, any>();
     for (const r of qHours.all(user) as any[]) {
-      hours.set(r.hour_utc, { total: r.total, output: r.output });
+      hours.set(r.hour_utc, r);
       const mk = r.hour_utc.slice(0, 7);
-      (byMonth[mk] ??= {})[user] = (byMonth[mk][user] || 0) + r.output;
+      addParts(((byMonth[mk] ??= {})[user] ??= zeroParts()), r);
     }
     const cum = (qCum.get(user) as any) || { output: 0, total: 0 };
     const meta = (qMeta.get(user) as any) || {};
     const last = meta.last_activity || null;
     let active = false;
     if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
-    let monthOutput = 0;
-    for (const [hk, b] of hours) if (hk.slice(0, 7) === monthPrefix) monthOutput += b.output;
+    const month = byMonth[monthPrefix]?.[user] || zeroParts();
     users.push({
       user,
       name: cfg.names?.[user] || titleCase(user),
@@ -194,6 +268,7 @@ function buildLeaderboard() {
       color: cfg.colors?.[user] || null,
       host: (cfg.hosts || []).includes(user),
       output_5h: rolling(hours, "output", now),
+      tokens_5h: rolling(hours, "total", now),
       output_total: cum.output,
       tokens_total: cum.total,
       sessions: meta.sessions || 0,
@@ -202,7 +277,11 @@ function buildLeaderboard() {
       active,
       spark: sparkSeries(hours, now, SPARK_HOURS),
       hourly: sparkSeries(hours, now, HOURLY_HOURS),
-      month_output: monthOutput,
+      hourly_parts: partsSeries(hours, now, HOURLY_HOURS),
+      month_output: month.output,
+      month_total: month.total,
+      month_parts: partsOf(month),
+      total_parts: partsOf(cum),
     });
   }
 
@@ -211,21 +290,23 @@ function buildLeaderboard() {
   const pot = SUBSCRIPTION_USD * 100;
   const months: any[] = [];
   for (const mk of Object.keys(byMonth).sort()) {
+    const parts: Record<string, Record<string, number>> = {};
     const outs: Record<string, number> = {};
-    for (const u of allUsers) outs[u] = byMonth[mk][u] || 0;
+    for (const u of allUsers) { parts[u] = byMonth[mk][u] || zeroParts(); outs[u] = parts[u].total; }
     const total = Object.values(outs).reduce((a, b) => a + b, 0);
     const cents = splitCents(outs, pot);
     const rows = allUsers.map((u) => ({
-      user: u, name: nameOf[u], output: outs[u],
+      user: u, name: nameOf[u],
+      total: outs[u], output: parts[u].output, parts: partsOf(parts[u]),
       pct: total ? Math.round((1000 * outs[u]) / total) / 10 : 0,
       share_usd: cents[u] / 100,
     }));
-    rows.sort((a, b) => b.output - a.output);
+    rows.sort((a, b) => b.total - a.total);
     months.push({ key: mk, label: monthLabel(mk), total, rows });
   }
 
   const cur: Record<string, number> = {};
-  for (const u of allUsers) cur[u] = byMonth[monthPrefix]?.[u] || 0;
+  for (const u of allUsers) cur[u] = byMonth[monthPrefix]?.[u]?.total || 0;
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
   const curCents = splitCents(cur, pot);
   for (const u of users) {
@@ -240,14 +321,16 @@ function buildLeaderboard() {
   if (eq) {
     for (const { peer, user } of eq.users.all() as any[]) {
       const hours = new Map<string, any>();
-      for (const r of eq.hours.all(peer, user) as any[]) hours.set(r.hour_utc, { total: r.total, output: r.output });
+      for (const r of eq.hours.all(peer, user) as any[]) hours.set(r.hour_utc, r);
       const cum = (eq.cum.get(peer, user) as any) || { output: 0, total: 0, name: user };
       const meta = (eq.meta.get(peer, user) as any) || {};
       const last = meta.last_activity || null;
       let active = false;
       if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
-      let monthOutput = 0;
-      for (const [hk, b] of hours) if (hk.slice(0, 7) === monthPrefix) monthOutput += b.output;
+      // Peers are outside the split, so their month figure is summed here rather than
+      // coming from byMonth (which only holds local users).
+      const month = zeroParts();
+      for (const [hk, b] of hours) if (hk.slice(0, 7) === monthPrefix) addParts(month, b);
       users.push({
         user: extKey(peer, user),
         name: cum.name || user,
@@ -255,6 +338,7 @@ function buildLeaderboard() {
         external: true,
         peer,
         output_5h: rolling(hours, "output", now),
+        tokens_5h: rolling(hours, "total", now),
         output_total: cum.output,
         tokens_total: cum.total,
         sessions: meta.sessions || 0,
@@ -263,14 +347,19 @@ function buildLeaderboard() {
         active,
         spark: sparkSeries(hours, now, SPARK_HOURS),
         hourly: sparkSeries(hours, now, HOURLY_HOURS),
-        month_output: monthOutput,
+        hourly_parts: partsSeries(hours, now, HOURLY_HOURS),
+        month_output: month.output,
+        month_total: month.total,
+        month_parts: partsOf(month),
+        total_parts: partsOf(cum),
         share_usd: null,
         month_pct: null,
       });
     }
   }
 
-  users.sort((a, b) => b.month_output - a.month_output || b.output_total - a.output_total);
+  // Ranked on the full token count now, not output alone.
+  users.sort((a, b) => b.month_total - a.month_total || b.tokens_total - a.tokens_total);
 
   return {
     generated_at: now.toISOString().replace(/\.\d+Z$/, "+00:00"),
@@ -634,7 +723,7 @@ const server = Bun.serve({
       // token via Authorization: Bearer <token> or ?token=<token>. Served under the
       // already-public /usage/ path, so the token is the only thing protecting it.
       if (req.method === "GET" && path === "/usage/export") {
-        const tok = cfg.exportToken;
+        const tok = EXPORT_TOKEN;
         if (!tok) return new Response("export disabled", { status: 404 });
         const auth = req.headers.get("authorization") || "";
         const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -821,8 +910,10 @@ const server = Bun.serve({
         const title = ai || (/^\d+$/.test(r.id) ? "New Tab" : r.id);
         return { id: r.id, title, state: await stateForSession(r.id), created: r.created, attached: r.attached };
       }));
+      // Creation order, and nothing else. Session "1" used to be pinned to the front,
+      // which meant a bare-URL visit put an untouched "New Tab" ahead of every real
+      // session and kept it there. New tabs belong at the end, next to the "+".
       withTitles.sort((a, b) => a.created - b.created);
-      withTitles.sort((a, b) => (a.id === "1" ? -1 : b.id === "1" ? 1 : 0));
       return Response.json(withTitles, { headers: cors(req) });
     }
     if (req.method === "GET" && path === "/history") {

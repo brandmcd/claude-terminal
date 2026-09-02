@@ -13,7 +13,22 @@
 // list is absent or empty, so a vanilla install is unaffected.
 import { openDb } from "./db.ts";
 
-type Peer = { name?: string; url?: string; token?: string };
+type Peer = { name?: string; url?: string; token?: string; tokenFile?: string };
+
+// A peer's shared token may be given inline as `token`, or out of line as `tokenFile`
+// pointing at a file that holds it. deploy/config.json.proposed is tracked in a public
+// repo, so an inline token in the config gets committed; tokenFile keeps the secret in
+// /etc where it belongs and leaves the tracked file safe to push.
+async function peerToken(p: Peer): Promise<string> {
+  if (p.token) return p.token;
+  if (!p.tokenFile) return "";
+  try {
+    return (await Bun.file(p.tokenFile).text()).trim();
+  } catch (e) {
+    console.error(`external peer ${p.name || p.url}: cannot read tokenFile ${p.tokenFile}:`, e);
+    return "";
+  }
+}
 
 export async function sampleExternalPeers(configPath: string): Promise<void> {
   const cfg = JSON.parse(await Bun.file(configPath).text());
@@ -29,7 +44,9 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insHours = db.prepare(
-    "INSERT OR REPLACE INTO external_hourly (peer, user, hour_utc, total, output) VALUES (?, ?, ?, ?, ?)",
+    `INSERT OR REPLACE INTO external_hourly
+       (peer, user, hour_utc, total, output, input, cache_creation, cache_read)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insMeta = db.prepare(
     `INSERT INTO external_meta (peer, user, sessions, models, last_activity, fetched_at)
@@ -42,7 +59,8 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
     if (!p?.url) continue;
     try {
       const headers: Record<string, string> = { Accept: "application/json" };
-      if (p.token) headers.Authorization = `Bearer ${p.token}`;
+      const token = await peerToken(p);
+      if (token) headers.Authorization = `Bearer ${token}`;
       const res = await fetch(p.url, { headers, signal: AbortSignal.timeout(15000) });
       if (!res.ok) {
         console.error(`external peer ${p.name || p.url}: HTTP ${res.status}`);
@@ -71,7 +89,10 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
           insMeta.run(peerName, user, num(m.sessions), models, m.last_activity || null, fetchedAt);
           for (const h of Array.isArray(u.hourly) ? u.hourly : []) {
             if (!h?.hour_utc) continue;
-            insHours.run(peerName, user, String(h.hour_utc), num(h.total), num(h.output));
+            // a peer on the older export shape sends no parts; num() makes those 0,
+            // which keeps the row loadable rather than dropping the hour entirely
+            insHours.run(peerName, user, String(h.hour_utc), num(h.total), num(h.output),
+                         num(h.input), num(h.cache_creation), num(h.cache_read));
           }
         }
       });

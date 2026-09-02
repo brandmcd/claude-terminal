@@ -64,8 +64,12 @@ const db = openDb(DB_PATH);
 const getOffsets = db.prepare("SELECT path, offset FROM offsets WHERE user = ?");
 const getMeta = db.prepare("SELECT models FROM meta WHERE user = ?");
 const upHour = db.prepare(
-  `INSERT INTO hourly (user, hour_utc, total, output) VALUES (?, ?, ?, ?)
-   ON CONFLICT(user, hour_utc) DO UPDATE SET total = total + excluded.total, output = output + excluded.output`,
+  `INSERT INTO hourly (user, hour_utc, total, output, input, cache_creation, cache_read)
+   VALUES (?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(user, hour_utc) DO UPDATE SET
+     total = total + excluded.total, output = output + excluded.output,
+     input = input + excluded.input, cache_creation = cache_creation + excluded.cache_creation,
+     cache_read = cache_read + excluded.cache_read`,
 );
 const upCum = db.prepare(
   `INSERT INTO cumulative (user, input, output, cache_creation, cache_read, total) VALUES (?, ?, ?, ?, ?, ?)
@@ -87,7 +91,7 @@ function collectUser(user: string): void {
   const models = new Set<string>(metaRow ? JSON.parse(metaRow.models || "[]") : []);
 
   const cumDelta = { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 };
-  const hourDelta = new Map<string, { total: number; output: number }>();
+  const hourDelta = new Map<string, Record<string, number>>();
   const offsetUpdates = new Map<string, number>();
   const changed = new Set<string>();
   let sessions = 0;
@@ -143,14 +147,14 @@ function collectUser(user: string): void {
           const usage = rec.message?.usage;
           if (!usage || typeof usage !== "object") continue;
           const hk = hourKey(rec.timestamp || "");
-          const b = hourDelta.get(hk) || { total: 0, output: 0 };
+          const b = hourDelta.get(hk) || { total: 0, output: 0, input: 0, cache_creation: 0, cache_read: 0 };
           let lineTotal = 0;
           for (const [name, src] of Object.entries(TOKEN_KEYS)) {
             const v = usage[src];
             if (typeof v !== "number") continue;
             (cumDelta as any)[name] += v;
             lineTotal += v;
-            if (name === "output") b.output += v;
+            b[name] += v;   // every category, not just output, so the hour can be split
           }
           cumDelta.total += lineTotal;
           b.total += lineTotal;
@@ -168,7 +172,9 @@ function collectUser(user: string): void {
 
   const nowIso = new Date().toISOString().replace(/\.\d+Z$/, "+00:00");
   const tx = db.transaction(() => {
-    for (const [hk, b] of hourDelta) if (b.total || b.output) upHour.run(user, hk, b.total, b.output);
+    for (const [hk, b] of hourDelta)
+      if (b.total || b.output)
+        upHour.run(user, hk, b.total, b.output, b.input, b.cache_creation, b.cache_read);
     if (cumDelta.total)
       upCum.run(user, cumDelta.input, cumDelta.output, cumDelta.cache_creation, cumDelta.cache_read, cumDelta.total);
     for (const [p, off] of offsetUpdates) setOffset.run(user, p, off);

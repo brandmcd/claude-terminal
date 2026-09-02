@@ -58,8 +58,24 @@
   .big { grid-column:3; grid-row:1/3; text-align:right; }
   .big b { font-size:24px; font-weight:750; font-variant-numeric:tabular-nums; letter-spacing:-.02em; display:block; line-height:1.1; }
   .big span { color:var(--muted); font-size:11px; }
-  .spark { grid-column:2; grid-row:2; height:46px; margin:-2px -4px; min-width:0; overflow:hidden; }
+  /* No overflow clip here. ApexCharts renders .apexcharts-tooltip as an absolutely
+     positioned child of the chart container, so a 46px-tall clip box cut the two-line
+     tooltip in half — you got the date or the token count, never both. The chart
+     graphics stay clipped by the <svg> root, which clips its own content anyway. */
+  .spark { grid-column:2; grid-row:2; height:46px; margin:-2px -4px; min-width:0; }
   .meta { grid-column:1/4; grid-row:3; display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:12.5px; padding-top:4px; border-top:1px dashed var(--line); margin-top:4px; }
+  /* Hover breakdown. ApexCharts owns the .apexcharts-tooltip shell, so its palette is
+     overridden here to the card palette; everything inside is ours via tooltip.custom. */
+  .apexcharts-tooltip { background:var(--card)!important; color:var(--ink)!important;
+    border:1px solid var(--line)!important; border-radius:10px!important; box-shadow:var(--shadow)!important; }
+  .ttwrap { min-width:170px; }
+  .ttw { padding:8px 10px 2px; color:var(--muted); font-size:11px; letter-spacing:.01em; }
+  .tt { padding:6px 10px 8px; }
+  .tt + .tt { border-top:1px solid var(--line); }
+  .tth { display:flex; align-items:center; gap:6px; font-weight:650; font-size:12.5px; }
+  .ttt { font-size:15px; font-weight:750; font-variant-numeric:tabular-nums; margin:2px 0 5px; letter-spacing:-.01em; }
+  .ttrow { display:flex; justify-content:space-between; gap:16px; font-size:11.5px; color:var(--muted); line-height:1.55; }
+  .ttrow b { color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums; }
   .meta b { color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums; }
 
   .panel { margin-top:26px; background:var(--card); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); padding:18px 16px 8px; }
@@ -81,6 +97,16 @@
   .billfoot { margin:14px 4px 4px; padding-top:12px; border-top:1px dashed var(--line); font-size:13.5px; color:var(--muted); }
   .billfoot b { color:var(--ink); font-size:19px; font-weight:750; }
   footer { margin-top:26px; color:var(--muted); font-size:12px; }
+
+  /* Which-tokens toggle. Sits in the header next to the live tag and wraps under it
+     on narrow screens rather than squeezing the heading. */
+  .headright { display:flex; align-items:center; gap:14px; flex-wrap:wrap; justify-content:flex-end; }
+  .modes { display:inline-flex; background:var(--track); border:1px solid var(--line); border-radius:999px; padding:3px; gap:2px; }
+  .modes button { font:inherit; font-size:12.5px; font-weight:650; line-height:1.2; color:var(--muted);
+    background:transparent; border:0; border-radius:999px; padding:5px 12px; cursor:pointer; }
+  .modes button:hover { color:var(--ink); }
+  .modes button[aria-pressed="true"] { background:var(--card); color:var(--ink); box-shadow:0 1px 2px rgba(20,22,27,.14); }
+  .modes button:focus-visible { outline:2px solid var(--grad-a); outline-offset:2px; }
   .err { background:var(--card); border:1px solid #ef4444; border-radius:14px; padding:16px; color:#ef4444; }
 
   /* cloud cost split (second section) */
@@ -119,35 +145,27 @@
   <header>
     <div>
       <h1>Claude usage leaderboard</h1>
-      <p class="sub">Ranked by output tokens used this calendar month. Output is what actually counts
-      against the subscription limit; cache reads make the raw total huge but barely move the needle.
-      Numbers come straight off each session's transcript and refresh on their own.</p>
+      <p class="sub" id="sub">loading</p>
     </div>
-    <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="updated">loading</span></span></div>
+    <div class="headright">
+      <div class="modes" id="modes" role="group" aria-label="Which tokens to count">
+        <button type="button" data-mode="all" aria-pressed="true">All tokens</button>
+        <button type="button" data-mode="output" aria-pressed="false">Output only</button>
+      </div>
+      <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="updated">loading</span></span></div>
+    </div>
   </header>
 
   <div class="cards" id="cards"></div>
 
-  <div class="panel bill" id="billPanel">
-    <div class="billhead">
-      <h2>Monthly split</h2>
-      <select id="monthSel" class="msel" aria-label="Choose month"></select>
-    </div>
-    <p id="billIntro">The subscription divided by output tokens used that calendar month. Not a bill, just a
-    rough sense of what each person's usage is worth.</p>
-    <div class="billbar" id="billBar"></div>
-    <div class="billrows" id="billRows"></div>
-    <div class="billfoot" id="billFoot"></div>
-  </div>
-
   <div class="panel" id="monthlyPanel">
-    <h2>Output by month</h2>
-    <p>Total output tokens each person used, month by month.</p>
+    <h2 id="monthlyTitle">Output by month</h2>
+    <p id="monthlySub">Total output tokens each person used, month by month.</p>
     <div id="monthlyChart" style="height:300px"></div>
   </div>
 
   <div class="panel" id="panel">
-    <h2>Output per hour, last 7 days</h2>
+    <h2 id="hourlyTitle">Output per hour, last 7 days</h2>
     <p>Hover any point for the exact hour and token count.</p>
     <div id="mainChart" style="height:320px"></div>
   </div>
@@ -194,7 +212,23 @@ const colorFor = u => COLORS[u] || POOL[hashIdx(u, POOL.length)];
 // Called on every payload before anything renders; rows without a color are left alone.
 function learnColors(d){ for(const u of (d && d.users) || []) if(u.color) COLORS[u.user] = u.color; }
 
-const fmt = n => n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
+// ---- which tokens count ----------------------------------------------------
+// "all" counts every token type, which cache reads dominate; "output" counts only output
+// tokens, the ones that actually eat into the subscription limit. The payload already
+// carries both shapes (month_output / month_total, output_5h / tokens_5h,
+// hourly_parts.output / hourly), so the toggle is pure presentation and costs no fetch.
+let MODE = "all";
+try { const m = localStorage.getItem("ct-usage-mode"); if(m === "all" || m === "output") MODE = m; } catch(e) {}
+const outputOnly = () => MODE === "output";
+// hourly_parts is always present today; the fallback keeps a card rendering rather than
+// throwing if a peer ever exports the older shape.
+const hourlyOut = u => (u.hourly_parts && u.hourly_parts.output) || u.hourly.map(()=>0);
+const hourlyOf = u => outputOnly() ? hourlyOut(u) : u.hourly;
+const monthOf  = u => outputOnly() ? u.month_output : u.month_total;
+const fiveOf   = u => outputOnly() ? u.output_5h : u.tokens_5h;
+const rowOf    = r => outputOnly() ? r.output : r.total;
+
+const fmt = n => n>=1e9 ? (n/1e9).toFixed(n>=1e10?1:2)+"B" : n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
 const money = v => "$"+Number(v).toFixed(2);
 const medal = i => ["\u{1F947}","\u{1F948}","\u{1F949}"][i] || ("#"+(i+1));
 function ago(iso){ if(!iso) return "never"; const s=(Date.now()-new Date(iso).getTime())/1000;
@@ -215,7 +249,45 @@ function countUp(el, to){
 }
 
 // [timestamp, value] pairs for a user's 48h sparkline from the shared hour axis.
-const sparkData = (d,u) => { const ms=d.hour_ms.slice(-u.spark.length); return u.spark.map((y,j)=>[ms[j], y]); };
+const sparkData = (d,u) => {
+  const n = u.spark.length, ms = d.hour_ms.slice(-n);
+  // u.spark is the precomputed all-token tail; output mode takes the same tail off the
+  // 168-hour output series so both modes share one x axis.
+  const src = outputOnly() ? hourlyOut(u).slice(-n) : u.spark;
+  return src.map((y,j)=>[ms[j], y]);
+};
+
+// ---- hover breakdown -------------------------------------------------------
+// Every chart plots the full token count, which is dominated by cache reads. The split
+// is what makes that number readable, so it goes in the tooltip.
+const PART_LABELS = [["output","output"],["input","input"],["cache_creation","cache write"],["cache_read","cache read"]];
+const whenText = ms => new Date(ms).toLocaleString(undefined,{weekday:"short",month:"short",day:"numeric",hour:"numeric"});
+
+// Read the live DATA rather than a captured payload: refresh() swaps series into the
+// existing charts without rebuilding them, so a closure over an old payload would keep
+// serving the breakdown from whichever poll happened to build the chart.
+const userByKey = k => (DATA && DATA.users.find(u => u.user === k)) || null;
+
+// The four numbers at one hour of a user's 168-hour series.
+function partsAt(u, hIdx){
+  const p = u && u.hourly_parts; if(!p || hIdx < 0) return null;
+  const o = {}; let sum = 0;
+  for(const [k] of PART_LABELS){ const v = (p[k] && p[k][hIdx]) || 0; o[k] = v; sum += v; }
+  o.total = sum; return o;
+}
+
+function ttBody(name, color, parts){
+  if(!parts) return "";
+  const rows = PART_LABELS.map(([k,label]) =>
+    `<div class="ttrow"><span>${label}</span><b>${(parts[k]||0).toLocaleString()}</b></div>`).join("");
+  // The headline is whatever the chart actually plotted; the four rows stay either way,
+  // because the split is the whole point of the hover.
+  const head = outputOnly() ? (parts.output||0) : (parts.total||0);
+  return `<div class="tt">`
+    + `<div class="tth"><span class="swatch" style="background:${color}"></span>${name}</div>`
+    + `<div class="ttt">${head.toLocaleString()} ${outputOnly()?"output tokens":"tokens"}</div>${rows}</div>`;
+}
+const ttWrap = (when, body) => `<div class="ttwrap"><div class="ttw">${when}</div>${body}</div>`;
 
 function sparkOpts(user, data){
   const c = colorFor(user);
@@ -224,16 +296,21 @@ function sparkOpts(user, data){
     stroke:{ curve:"smooth", width:2 },
     fill:{ type:"gradient", gradient:{ shadeIntensity:1, opacityFrom:.45, opacityTo:0, stops:[0,100] } },
     colors:[c],
-    series:[{ name:"output", data }],
+    series:[{ name:"tokens", data }],
     xaxis:{ type:"datetime" },
     markers:{ size:0, hover:{size:4} },
     tooltip:{ enabled:true, theme:isDark()?"dark":"light",
-      x:{ format:"ddd MMM d, h:mm TT" },
-      y:{ formatter:v=>(v||0).toLocaleString()+" output tokens", title:{formatter:()=>""} } }
+      custom: ({dataPointIndex, w}) => {
+        const u = userByKey(user); if(!u) return "";
+        // the sparkline is the tail of the 168h series, so shift the index onto it
+        const off = (u.hourly ? u.hourly.length : 0) - (u.spark ? u.spark.length : 0);
+        const ms = (w.globals.seriesX[0] || [])[dataPointIndex];
+        return ttWrap(ms ? whenText(ms) : "", ttBody(u.name, colorFor(user), partsAt(u, dataPointIndex + off)));
+      } }
   };
 }
 
-const mainSeries = (d) => d.users.map(u => ({ name:u.name, data:u.hourly.map((y,j)=>[d.hour_ms[j], y]) }));
+const mainSeries = (d) => d.users.map(u => ({ name:u.name, data:hourlyOf(u).map((y,j)=>[d.hour_ms[j], y]) }));
 function mainOpts(d){
   return {
     chart:{ type:"area", height:320, fontFamily:"inherit", background:"transparent",
@@ -250,17 +327,22 @@ function mainOpts(d){
       axisBorder:{show:false}, axisTicks:{show:false}, tooltip:{enabled:false} },
     yaxis:{ labels:{ style:{colors:muted()}, formatter:v=>fmt(v) } },
     legend:{ position:"top", horizontalAlign:"left", labels:{colors:ink()}, markers:{radius:4}, fontWeight:600 },
-    tooltip:{ shared:true, theme:isDark()?"dark":"light", x:{ format:"ddd MMM d, h:mm TT" },
-      y:{ formatter:v=> (v||0).toLocaleString()+" output tokens" } },
+    tooltip:{ shared:true, theme:isDark()?"dark":"light",
+      custom: ({dataPointIndex}) => {
+        if(!DATA) return "";
+        const body = DATA.users.map(u => ttBody(u.name, colorFor(u.user), partsAt(u, dataPointIndex))).join("");
+        return ttWrap(whenText(DATA.hour_ms[dataPointIndex]), body);
+      } },
     markers:{ size:0, hover:{size:5} }
   };
 }
 
-// External peers are excluded here: this chart pairs with the money split, and peers
-// are not in the split. Their activity still shows on the hourly chart and their card.
+// External peers are excluded here because they carry no per-month rows in the payload
+// (months[].rows is built from local transcripts only), so they would plot as a flat
+// zero series. Their activity still shows on the hourly chart and on their own card.
 const splitUsers = (d) => d.users.filter(u => !u.external);
 const monthlySeries = (d) => splitUsers(d).map(u => ({ name:u.name,
-  data: d.months.map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? r.output : 0; }) }));
+  data: d.months.map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? rowOf(r) : 0; }) }));
 function monthlyOpts(d){
   return {
     chart:{ type:"bar", height:300, stacked:true, fontFamily:"inherit", background:"transparent",
@@ -277,45 +359,15 @@ function monthlyOpts(d){
     yaxis:{ labels:{ style:{colors:muted()}, formatter:v=>fmt(v) } },
     legend:{ position:"top", horizontalAlign:"left", labels:{colors:ink()}, markers:{radius:4}, fontWeight:600 },
     tooltip:{ shared:true, intersect:false, theme:isDark()?"dark":"light",
-      y:{ formatter:v=>(v||0).toLocaleString()+" output tokens" } }
+      custom: ({dataPointIndex}) => {
+        const m = DATA && DATA.months[dataPointIndex]; if(!m) return "";
+        const body = splitUsers(DATA).map(u => {
+          const r = m.rows.find(x => x.user === u.user);
+          return r ? ttBody(u.name, colorFor(u.user), {...r.parts, total:r.total, output:r.output}) : "";
+        }).join("");
+        return ttWrap(m.label, body);
+      } }
   };
-}
-
-function populateMonths(d){
-  const sel = document.getElementById("monthSel");
-  const prev = sel.value;
-  sel.innerHTML = "";
-  [...d.months].reverse().forEach(m => {   // newest first
-    const o = document.createElement("option"); o.value=m.key; o.textContent=m.label; sel.appendChild(o);
-  });
-  const keys = d.months.map(m=>m.key);
-  sel.value = keys.includes(prev) ? prev
-            : (keys.includes(d.current_month) ? d.current_month : keys[keys.length-1]);
-}
-
-function renderSplit(d, key){
-  const m = d.months.find(x=>x.key===key) || d.months[d.months.length-1];
-  if(!m) return;
-  const bar = document.getElementById("billBar"); bar.innerHTML="";
-  m.rows.forEach(r => {
-    if(!r.pct) return;
-    const s = document.createElement("span");
-    s.style.background = colorFor(r.user); s.style.width = r.pct+"%";
-    s.title = `${r.name}: ${money(r.share_usd)} (${r.pct}%)`;
-    bar.appendChild(s);
-  });
-  const rows = document.getElementById("billRows"); rows.innerHTML="";
-  m.rows.forEach(r => {
-    const row = document.createElement("div"); row.className="billrow";
-    row.innerHTML = `
-      <span class="bn"><span class="swatch" style="background:${colorFor(r.user)}"></span>${r.name}</span>
-      <span class="bp">${fmt(r.output)} output</span>
-      <span class="bd">${money(r.share_usd)}</span>`;
-    rows.appendChild(row);
-  });
-  document.getElementById("billFoot").innerHTML =
-    `<b>${fmt(m.total)}</b> output tokens in ${m.label}, split into the ${money(d.subscription_usd)} above. `
-    + `A rough gauge of the value each person got.`;
 }
 
 let DATA=null, mainChart=null, monthlyChart=null; const sparks={}; let lastSig="";
@@ -336,7 +388,7 @@ function build(d){
         ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>
       <div class="spark" id="spark-${u.user}"></div>
-      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>output this month</span></div>
+      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>${outputOnly()?"output tokens":"tokens"} this month</span></div>
       <div class="meta">
         <span>last 5h <b class="num" id="fivh-${u.user}">0</b></span>
         <span>total output <b class="num" id="tot-${u.user}">0</b></span>
@@ -350,15 +402,13 @@ function build(d){
   d.users.forEach(u => {
     const s = new ApexCharts(document.getElementById("spark-"+u.user), sparkOpts(u.user, sparkData(d,u)));
     s.render(); sparks[u.user]=s;
-    countUp(document.getElementById("mo-"+u.user), u.month_output);
-    countUp(document.getElementById("fivh-"+u.user), u.output_5h);
+    countUp(document.getElementById("mo-"+u.user), monthOf(u));
+    countUp(document.getElementById("fivh-"+u.user), fiveOf(u));
     countUp(document.getElementById("tot-"+u.user), u.output_total);
     countUp(document.getElementById("all-"+u.user), u.tokens_total);
   });
 
-  populateMonths(d);
-  document.getElementById("monthSel").onchange = e => renderSplit(DATA, e.target.value);
-  renderSplit(d, document.getElementById("monthSel").value);
+  applyModeText();
 
   if(monthlyChart) monthlyChart.destroy();
   monthlyChart = new ApexCharts(document.getElementById("monthlyChart"), monthlyOpts(d));
@@ -370,17 +420,18 @@ function build(d){
 
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
   document.getElementById("foot").textContent =
-    "Ranked by output this calendar month. Sparklines cover the last "+d.spark_hours+" hours. This page refreshes every 30 seconds.";
+    (outputOnly()
+      ? "Ranked by output tokens this calendar month; input and cache are left out of every number and chart above. "
+      : "Ranked by total tokens this calendar month: input, output and cache. Hover any chart for the split. ")
+    + "Sparklines cover the last "+d.spark_hours+" hours. This page refreshes every 30 seconds.";
 }
 
 function refresh(d){
   d.users.forEach(u => {
-    if(sparks[u.user]) sparks[u.user].updateSeries([{name:"output", data:sparkData(d,u)}]);
-    const vals = { mo:u.month_output, fivh:u.output_5h, tot:u.output_total, all:u.tokens_total };
+    if(sparks[u.user]) sparks[u.user].updateSeries([{name:"tokens", data:sparkData(d,u)}]);
+    const vals = { mo:monthOf(u), fivh:fiveOf(u), tot:u.output_total, all:u.tokens_total };
     for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
   });
-  populateMonths(d);
-  renderSplit(d, document.getElementById("monthSel").value);
   if(monthlyChart) monthlyChart.updateSeries(monthlySeries(d));
   if(mainChart) mainChart.updateSeries(mainSeries(d));
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
@@ -392,6 +443,7 @@ async function load(first){
     if(!r.ok) throw new Error("HTTP "+r.status);
     const d = await r.json(); DATA = d;
     learnColors(d); // must precede build/refresh — every chart reads colorFor() as it renders
+    rank(d);        // and precede sig(): a reorder has to come out as a rebuild, not a refresh
     const s = sig(d);
     if(first || s !== lastSig){ lastSig = s; build(d); }
     else refresh(d);
@@ -401,6 +453,43 @@ async function load(first){
   }
 }
 
+// Rank by whichever metric is on screen. sig() is order-sensitive and mainChart's colors
+// are positional, so this has to run before sig() on every payload and before any rebuild.
+function rank(d){ d.users.sort((a,b) => monthOf(b) - monthOf(a)); }
+
+// Every bit of prose that names a token type lives here, so the headings can never drift
+// out of step with what the charts are actually plotting.
+function applyModeText(){
+  for(const b of document.querySelectorAll("#modes button"))
+    b.setAttribute("aria-pressed", String(b.dataset.mode === MODE));
+  document.getElementById("sub").textContent = outputOnly()
+    ? "Ranked by output tokens used this calendar month. Output is what actually counts against the "
+      + "subscription limit, so input and cache traffic are left out of every figure below. "
+      + "Numbers come straight off each session's transcript and refresh on their own."
+    : "Ranked by every token used this calendar month: input, output and cache. Cache reads make the "
+      + "raw total huge but barely move the needle against the subscription limit \u2014 switch to "
+      + "output only for that. Numbers come straight off each session's transcript and refresh on their own.";
+  document.getElementById("monthlyTitle").textContent = outputOnly() ? "Output by month" : "Tokens by month";
+  document.getElementById("monthlySub").textContent = outputOnly()
+    ? "Output tokens each person used, month by month."
+    : "Every token each person used, month by month: input, output and cache.";
+  document.getElementById("hourlyTitle").textContent =
+    outputOnly() ? "Output per hour, last 7 days" : "Tokens per hour, last 7 days";
+}
+
+document.getElementById("modes").addEventListener("click", e => {
+  const b = e.target.closest("button[data-mode]");
+  if(!b || b.dataset.mode === MODE) return;
+  MODE = b.dataset.mode;
+  try { localStorage.setItem("ct-usage-mode", MODE); } catch(err) {}
+  applyModeText();
+  if(!DATA) return;
+  rank(DATA);
+  lastSig = sig(DATA);   // the rebuild happens here; the next poll must not repeat it
+  build(DATA);
+});
+
+applyModeText();
 load(true);
 setInterval(()=>load(false), 30000);        // fallback poll
 // Live push: the server emits an SSE tick whenever the collector updates usage.db.
