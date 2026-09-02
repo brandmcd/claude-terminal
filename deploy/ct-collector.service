@@ -3,6 +3,10 @@ Description=claude-terminal usage collector (transcripts -> usage.db)
 After=ct-sidecar.service
 
 [Service]
+# The subscription sampler reads the 5h/weekly limit windows off an API response header, so this
+# process needs the same OAuth token the sidecar and the terminal run on. Without it the limit
+# timers on /usage silently stay empty.
+EnvironmentFile=/etc/claude-terminal/claude.env
 Type=oneshot
 User=ctuser
 WorkingDirectory=/srv/claude-terminal
