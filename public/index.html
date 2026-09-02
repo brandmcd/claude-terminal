@@ -244,12 +244,15 @@ const wOr = (w, raw) => (typeof w === "number" ? w : raw);
 // hourly_parts is always present today; the fallback keeps a card rendering rather than
 // throwing if a peer ever exports the older shape.
 const hourlyOut = u => (u.hourly_parts && u.hourly_parts.output) || u.hourly.map(()=>0);
-const hourlyOf = u => outputOnly() ? hourlyOut(u) : u.hourly;
-const monthOf  = u => weighted() ? wOr(u.weighted_month_total, u.month_total) : outputOnly() ? u.month_output : u.month_total;
-const fiveOf   = u => outputOnly() ? u.output_5h : u.tokens_5h;   // the 5h window has no per-model split
-const rowOf    = r => outputOnly() ? r.output : r.total;
+const hourlyOf = u => outputOnly() || weighted() ? hourlyOut(u) : u.hourly;
+// Weighted mode counts OUTPUT ONLY, each token scaled by its model's output price relative to
+// Sonnet 5. Input and cache traffic are left out entirely — the same rule Output-only follows,
+// for the same reason: they barely move the limit, and mixing them in buried the signal.
+const monthOf  = u => weighted() ? wOr(u.weighted_month_output, u.month_output) : outputOnly() ? u.month_output : u.month_total;
+const fiveOf   = u => outputOnly() || weighted() ? u.output_5h : u.tokens_5h;   // the 5h window has no per-model split
+const rowOf    = r => outputOnly() || weighted() ? r.output : r.total;
 const totOf    = u => weighted() ? wOr(u.weighted_output, u.output_total) : u.output_total;
-const allOf    = u => weighted() ? wOr(u.weighted_total, u.tokens_total) : u.tokens_total;
+const allOf    = u => u.tokens_total;
 
 const fmt = n => n>=1e9 ? (n/1e9).toFixed(n>=1e10?1:2)+"B" : n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
 const money = v => "$"+Number(v).toFixed(2);
@@ -411,11 +414,11 @@ function build(d){
         ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>
       <div class="spark" id="spark-${u.user}"></div>
-      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>${outputOnly()?"output tokens":"tokens"} this month</span></div>
+      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>${weighted()?"weighted output tokens":outputOnly()?"output tokens":"tokens"} this month</span></div>
       <div class="meta">
         <span>last 5h <b class="num" id="fivh-${u.user}">0</b></span>
-        <span>total output <b class="num" id="tot-${u.user}">0</b></span>
-        <span>all tokens <b class="num" id="all-${u.user}">0</b></span>
+        <span>${weighted()?"weighted output":"total output"} <b class="num" id="tot-${u.user}">0</b></span>
+        ${weighted()?"":`<span>all tokens <b class="num" id="all-${u.user}">0</b></span>`}
         <span>sessions <b>${u.sessions}</b></span>
         <span>last used <b>${ago(u.last_used)}</b></span>
       </div>`;
@@ -428,7 +431,8 @@ function build(d){
     countUp(document.getElementById("mo-"+u.user), monthOf(u));
     countUp(document.getElementById("fivh-"+u.user), fiveOf(u));
     countUp(document.getElementById("tot-"+u.user), totOf(u));
-    countUp(document.getElementById("all-"+u.user), allOf(u));
+    const allEl = document.getElementById("all-"+u.user);   // absent in weighted mode
+    if(allEl) countUp(allEl, allOf(u));
   });
 
   applyModeText();
@@ -522,10 +526,11 @@ function applyModeText(){
   for(const b of document.querySelectorAll("#modes button"))
     b.setAttribute("aria-pressed", String(b.dataset.mode === MODE));
   document.getElementById("sub").textContent = weighted()
-    ? "Ranked by WEIGHTED tokens this calendar month: every token multiplied by what its model costs "
-      + "relative to Sonnet 5 \u2014 Fable 5\u00d7, Opus 2.5\u00d7, Sonnet 4.6 1.5\u00d7, Sonnet 5 1\u00d7, Haiku 0.5\u00d7. "
-      + "An hour on Fable therefore reads five times heavier than the same hour on Sonnet, which is "
-      + "roughly what it does to the limit. Switch to All tokens for the raw counts."
+    ? "Ranked by WEIGHTED OUTPUT tokens this calendar month: output only, each token scaled by what "
+      + "its model costs relative to Sonnet 5 \u2014 Fable 5\u00d7, Opus 2.5\u00d7, Sonnet 4.6 1.5\u00d7, "
+      + "Sonnet 5 1\u00d7, Haiku 0.5\u00d7. So an hour of Fable output reads five times heavier than the "
+      + "same hour of Sonnet, which is about what it does to the limit. Input and cache traffic are "
+      + "excluded here, as in Output only. Switch to All tokens for raw counts."
     : outputOnly()
     ? "Ranked by output tokens used this calendar month. Output is what actually counts against the "
       + "subscription limit, so input and cache traffic are left out of every figure below. "
@@ -533,16 +538,16 @@ function applyModeText(){
     : "Ranked by every token used this calendar month: input, output and cache. Cache reads make the "
       + "raw total huge but barely move the needle against the subscription limit \u2014 switch to "
       + "output only for that. Numbers come straight off each session's transcript and refresh on their own.";
-  document.getElementById("monthlyTitle").textContent = weighted() ? "Weighted tokens by month" : outputOnly() ? "Output by month" : "Tokens by month";
+  document.getElementById("monthlyTitle").textContent = weighted() ? "Weighted output by month" : outputOnly() ? "Output by month" : "Tokens by month";
   document.getElementById("monthlySub").textContent = outputOnly()
     ? "Output tokens each person used, month by month."
     : "Every token each person used, month by month: input, output and cache.";
   document.getElementById("hourlyTitle").textContent =
-    outputOnly() ? "Output per hour, last 7 days" : "Tokens per hour, last 7 days";
+    outputOnly() || weighted() ? "Output per hour, last 7 days" : "Tokens per hour, last 7 days";
   // The hourly/monthly series have no per-model split, so they stay raw even in weighted mode.
   // Say so rather than letting the cards and the charts silently disagree.
   const ms = document.getElementById("monthlySub");
-  if(weighted()) ms.textContent = "Weighted by model cost, month by month (Fable 5\u00d7, Opus 2.5\u00d7, Haiku 0.5\u00d7).";
+  if(weighted()) ms.textContent = "Output tokens weighted by model cost, month by month (Fable 5\u00d7, Opus 2.5\u00d7, Haiku 0.5\u00d7).";
 }
 
 document.getElementById("modes").addEventListener("click", e => {

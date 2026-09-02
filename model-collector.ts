@@ -28,7 +28,13 @@ CREATE TABLE IF NOT EXISTS model_usage (
   model          TEXT NOT NULL,
   input          INTEGER NOT NULL DEFAULT 0,
   output         INTEGER NOT NULL DEFAULT 0,
-  cache_creation INTEGER NOT NULL DEFAULT 0,
+  cache_creation INTEGER NOT NULL DEFAULT 0,   -- total cache writes (5m + 1h)
+  -- A 5-minute cache write costs 1.25x base input; a 1-hour write costs 2x. Recording only the
+  -- sum makes an accurate cost impossible, and this box uses both, so keep the split. The
+  -- breakdown is in usage.cache_creation.ephemeral_{5m,1h}_input_tokens; older records that
+  -- predate it leave both at 0 and fall back to the 5m rate when weighted.
+  cache_creation_5m INTEGER NOT NULL DEFAULT 0,
+  cache_creation_1h INTEGER NOT NULL DEFAULT 0,
   cache_read     INTEGER NOT NULL DEFAULT 0,
   total          INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (user, minute_utc, model)
@@ -50,8 +56,8 @@ const TOKEN_KEYS: Record<string, string> = {
   cache_read: "cache_read_input_tokens",
 };
 
-type Bucket = { input: number; output: number; cache_creation: number; cache_read: number; total: number };
-const zero = (): Bucket => ({ input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 });
+type Bucket = { input: number; output: number; cache_creation: number; cache_creation_5m: number; cache_creation_1h: number; cache_read: number; total: number };
+const zero = (): Bucket => ({ input: 0, output: 0, cache_creation: 0, cache_creation_5m: 0, cache_creation_1h: 0, cache_read: 0, total: 0 });
 
 export async function sampleModelUsage(configPath: string): Promise<void> {
   const cfg: CollectorConfig & { db: string } = JSON.parse(await Bun.file(configPath).text());
@@ -62,11 +68,14 @@ export async function sampleModelUsage(configPath: string): Promise<void> {
     const getOffsets = db.prepare("SELECT path, offset FROM model_offsets WHERE user = ?");
     const setOffset = db.prepare("INSERT OR REPLACE INTO model_offsets (user, path, offset) VALUES (?, ?, ?)");
     const upBucket = db.prepare(
-      `INSERT INTO model_usage (user, minute_utc, model, input, output, cache_creation, cache_read, total)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO model_usage (user, minute_utc, model, input, output, cache_creation,
+                                cache_creation_5m, cache_creation_1h, cache_read, total)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(user, minute_utc, model) DO UPDATE SET
          input=input+excluded.input, output=output+excluded.output,
          cache_creation=cache_creation+excluded.cache_creation,
+         cache_creation_5m=cache_creation_5m+excluded.cache_creation_5m,
+         cache_creation_1h=cache_creation_1h+excluded.cache_creation_1h,
          cache_read=cache_read+excluded.cache_read, total=total+excluded.total`,
     );
 
@@ -116,6 +125,13 @@ export async function sampleModelUsage(configPath: string): Promise<void> {
               (b as any)[name] += v;
               lineTotal += v;
             }
+            // The 5m/1h split lives in a sub-object and must NOT be added to lineTotal: it is a
+            // breakdown of cache_creation_input_tokens, already counted above.
+            const cc = usage.cache_creation;
+            if (cc && typeof cc === "object") {
+              if (typeof cc.ephemeral_5m_input_tokens === "number") b.cache_creation_5m += cc.ephemeral_5m_input_tokens;
+              if (typeof cc.ephemeral_1h_input_tokens === "number") b.cache_creation_1h += cc.ephemeral_1h_input_tokens;
+            }
             b.total += lineTotal;
             delta.set(key, b);
           }
@@ -130,7 +146,7 @@ export async function sampleModelUsage(configPath: string): Promise<void> {
           const tab = key.indexOf("\t");
           const mk = key.slice(0, tab);
           const model = key.slice(tab + 1);
-          if (b.total) upBucket.run(user, mk, model, b.input, b.output, b.cache_creation, b.cache_read, b.total);
+          if (b.total) upBucket.run(user, mk, model, b.input, b.output, b.cache_creation, b.cache_creation_5m, b.cache_creation_1h, b.cache_read, b.total);
         }
         for (const [p, off] of offsetUpdates) setOffset.run(user, p, off);
       });

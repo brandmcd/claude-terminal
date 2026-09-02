@@ -148,51 +148,86 @@ const qHours = db?.query("SELECT * FROM hourly WHERE user = ?") as any;   // * :
 const qCum = db?.query("SELECT * FROM cumulative WHERE user = ?") as any;
 const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 
-// #region model weighting — "what did this actually cost against the limit"
-// A raw token count treats a Fable token and a Haiku token as the same thing, which flatters
-// whoever ran the cheap model. These weights are each model's OUTPUT price relative to Sonnet 5
-// ($10/MTok = 1.0), so Fable's $50 lands at 5x and Opus 5's $25 at 2.5x. Unknown/new model ids
-// fall back to 1.0 rather than vanishing from the total.
-const MODEL_WEIGHTS: Record<string, number> = {
-  "claude-fable-5-1": 5, "claude-fable-5": 5, "claude-mythos-5-1": 5, "claude-mythos-5": 5,
-  "claude-opus-5": 2.5, "claude-opus-4-8": 2.5, "claude-opus-4-7": 2.5, "claude-opus-4-6": 2.5,
-  "claude-sonnet-5": 1, "claude-sonnet-4-6": 1.5,
-  "claude-haiku-4-5": 0.5,
+// #region model weighting — "what did this usage actually cost"
+// Every rate below is Anthropic's published list price, read off
+// https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-02), not inferred:
+//
+//   model              input   5m write   1h write   cache read   output    ($/MTok)
+//   Fable 5.1 / Mythos 5.1   10    12.50      20         0.25        50     <- 0.025x read, not 0.1x
+//   Fable 5   / Mythos 5     10    12.50      20         1.00        50
+//   Opus 5 / 4.8 / 4.7 / 4.6  5     6.25      10         0.50        25
+//   Sonnet 5                  2     2.50       4         0.20        10     <- $2/$10 is now the standard price
+//   Sonnet 4.6                3     3.75       6         0.30        15
+//   Haiku 4.5                 1     1.25       2         0.10         5
+//
+// Two things the first cut of this got wrong, both of which mattered here:
+//   1. It multiplied EVERY category by the OUTPUT price. A cache read is not priced like an output
+//      token, and this box's raw total is ~99% cache reads, so the number was inflated ~14x.
+//   2. It charged all cache writes at 1.25x input. A 1-HOUR write costs 2x, and this box writes
+//      more 1h than 5m (26.0M vs 20.3M on Opus 5 alone), so model_usage now records the split.
+//
+// Normalised so one Sonnet 5 OUTPUT token = 1 weighted token: a "weighted token" is one Sonnet-5-
+// output-token's worth of spend. Ratios land where you would expect — a Fable output token is 5.
+interface Price { input: number; output: number; write5m: number; write1h: number; read: number }
+const MODEL_PRICES: Record<string, Price> = {
+  "claude-fable-5-1":  { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 0.25 },
+  "claude-mythos-5-1": { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 0.25 },
+  "claude-fable-5":    { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 1 },
+  "claude-mythos-5":   { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 1 },
+  "claude-opus-5":     { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
+  "claude-opus-4-8":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
+  "claude-opus-4-7":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
+  "claude-opus-4-6":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
+  "claude-opus-4-5":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
+  "claude-sonnet-5":   { input: 2, output: 10, write5m: 2.5, write1h: 4, read: 0.2 },
+  "claude-sonnet-4-6": { input: 3, output: 15, write5m: 3.75, write1h: 6, read: 0.3 },
+  "claude-sonnet-4-5": { input: 3, output: 15, write5m: 3.75, write1h: 6, read: 0.3 },
+  "claude-haiku-4-5":  { input: 1, output: 5, write5m: 1.25, write1h: 2, read: 0.1 },
 };
-const DEFAULT_WEIGHT = 1;
-// The model id in a transcript can carry a suffix (e.g. "claude-opus-5[1m]") or a date.
-function weightFor(model: string): number {
-  if (!model) return DEFAULT_WEIGHT;
+const BASELINE = MODEL_PRICES["claude-sonnet-5"].output; // $10/MTok = 1 weighted token
+const FALLBACK_PRICE = MODEL_PRICES["claude-sonnet-5"];
+
+// The model id in a transcript can carry a suffix ("claude-opus-5[1m]") or a date.
+function priceFor(model: string): Price {
+  if (!model) return FALLBACK_PRICE;
   const bare = String(model).replace(/\[1m\]$/, "");
-  if (MODEL_WEIGHTS[bare] != null) return MODEL_WEIGHTS[bare];
-  const undated = bare.replace(/-\d{8}$/, "");
-  if (MODEL_WEIGHTS[undated] != null) return MODEL_WEIGHTS[undated];
-  return DEFAULT_WEIGHT;
+  return MODEL_PRICES[bare] || MODEL_PRICES[bare.replace(/-\d{8}$/, "")] || FALLBACK_PRICE;
 }
 
-// model_usage arrives with the upstream merge and carries its own byte cursors, so it covers the
-// same history as `hourly`. Prepared lazily: an older DB simply reports no weighting.
 let qWeighted: any = null;
 let qWeightedChecked = false;
-function weightedTotals(): Record<string, { output: number; total: number; month_output: number; month_total: number }> {
+function weightedTotals(): Record<string, { output: number; month_output: number; effective_total: number; month_effective_total: number }> {
   const out: Record<string, any> = {};
   if (!db) return out;
   if (!qWeightedChecked) {
     qWeightedChecked = true;
     try {
       const t = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get();
-      if (t) qWeighted = db.query("SELECT user, model, substr(minute_utc,1,7) AS ym, SUM(output) AS output, SUM(total) AS total FROM model_usage GROUP BY user, model, ym");
+      if (t) qWeighted = db.query(`SELECT user, model, substr(minute_utc,1,7) AS ym,
+        SUM(input) AS input, SUM(output) AS output, SUM(cache_creation) AS cw,
+        SUM(cache_creation_5m) AS cw5m, SUM(cache_creation_1h) AS cw1h, SUM(cache_read) AS cr
+        FROM model_usage GROUP BY user, model, ym`);
     } catch { qWeighted = null; }
   }
   if (!qWeighted) return out;
   const ym = new Date().toISOString().slice(0, 7);
   try {
     for (const r of qWeighted.all() as any[]) {
-      const w = weightFor(r.model);
-      const b = (out[r.user] ||= { output: 0, total: 0, month_output: 0, month_total: 0 });
-      b.output += (r.output || 0) * w;
-      b.total += (r.total || 0) * w;
-      if (r.ym === ym) { b.month_output += (r.output || 0) * w; b.month_total += (r.total || 0) * w; }
+      const p = priceFor(r.model);
+      const b = (out[r.user] ||= { output: 0, month_output: 0, effective_total: 0, month_effective_total: 0 });
+      const wOut = ((r.output || 0) * p.output) / BASELINE;
+      // Records predating the 5m/1h split leave both at 0; charge that remainder at the 5m rate.
+      const w5 = r.cw5m || 0;
+      const w1 = r.cw1h || 0;
+      const wRest = Math.max(0, (r.cw || 0) - w5 - w1);
+      const wAll = wOut
+        + ((r.input || 0) * p.input) / BASELINE
+        + ((w5 + wRest) * p.write5m) / BASELINE
+        + (w1 * p.write1h) / BASELINE
+        + ((r.cr || 0) * p.read) / BASELINE;
+      b.output += wOut;
+      b.effective_total += wAll;
+      if (r.ym === ym) { b.month_output += wOut; b.month_effective_total += wAll; }
     }
     for (const u of Object.keys(out)) for (const k of Object.keys(out[u])) out[u][k] = Math.round(out[u][k]);
   } catch { /* weighting is a nicety; never break the board over it */ }
@@ -404,9 +439,11 @@ function buildLeaderboard() {
   for (const u of users as any[]) {
     const w = wt[u.user];
     u.weighted_output = w ? w.output : null;
-    u.weighted_total = w ? w.total : null;
     u.weighted_month_output = w ? w.month_output : null;
-    u.weighted_month_total = w ? w.month_total : null;
+    // Every category at its own price. Not shown on the board (Weighted mode is output-only),
+    // but it is the number to quote for "what did this cost".
+    u.weighted_effective_total = w ? w.effective_total : null;
+    u.weighted_month_effective_total = w ? w.month_effective_total : null;
   }
 
   // External peers: shown on the board but deliberately NOT in the split above. They
@@ -459,7 +496,8 @@ function buildLeaderboard() {
   return {
     generated_at: now.toISOString().replace(/\.\d+Z$/, "+00:00"),
     window_hours: ROLLING_HOURS, gauge_max: GAUGE_MAX, subscription_usd: SUBSCRIPTION_USD,
-    model_weights: MODEL_WEIGHTS, weight_baseline: "claude-sonnet-5",
+    model_weights: Object.fromEntries(Object.entries(MODEL_PRICES).map(([m, pr]) => [m, pr.output / BASELINE])),
+    weight_baseline: "claude-sonnet-5 output ($10/MTok) = 1 weighted token",
     month_label: monthLabel(monthPrefix), current_month: monthPrefix,
     months, hour_ms, spark_hours: SPARK_HOURS, users,
     subscription: latestSubscription(),
