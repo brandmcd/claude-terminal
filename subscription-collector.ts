@@ -14,6 +14,7 @@
 // Non-fatal by contract: a stopped service / missing subscription data must never disturb token
 // collection. No-ops quietly when the snapshot is unavailable.
 import { openDb } from "./db.ts";
+import { getLimitsFromHeaders } from "./subscription-headers.ts";
 
 // Kept in a sibling table inside usage.db. IF NOT EXISTS so the collector creates it on its
 // next tick with no migration and no service restart.
@@ -117,11 +118,24 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
     return;
   }
 
-  // Nothing to record until the service has a real rate-limit reading (null on the very first
-  // poll after a restart, or for a non-subscriber session). Skip quietly; the next tick retries.
-  if (!sub || sub.available === false) return;
-  const five = sub.fiveHour || null;
-  const seven = sub.sevenDay || null;
+  // The SDK snapshot is preferred (free — it rides a control query that already exists), but on
+  // this box it reports rate_limits_available:false: that query never sends a turn, so it never
+  // sees a response header to read the windows off. Fall back to sampling the headers directly.
+  // Only then is there nothing to record — skip quietly and let the next tick retry.
+  let five = sub && sub.available !== false ? sub.fiveHour || null : null;
+  let seven = sub && sub.available !== false ? sub.sevenDay || null : null;
+  let subType = sub && sub.available !== false ? sub.subscription : null;
+  if (!five && !seven) {
+    const h = await getLimitsFromHeaders();
+    if (!h || !h.available) return;
+    // The SDK snapshot speaks {utilization, resetsAt}; the headers speak {utilization, resets_at}.
+    // Normalise onto the SDK shape so everything below this point stays source-agnostic.
+    const norm = (w: { utilization: number | null; resets_at: string | null } | null) =>
+      w ? { utilization: w.utilization, resetsAt: w.resets_at } : null;
+    five = norm(h.five_hour);
+    seven = norm(h.seven_day);
+    subType = h.subscription;
+  }
   if (!five && !seven) return;
 
   const db = openDb(cfg.db); // also ensures the base schema; writable root handle
@@ -179,8 +193,8 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       Date.now(),
-      typeof sub.fetchedAt === "number" ? sub.fetchedAt : null,
-      sub.subscription ?? null,
+      typeof sub?.fetchedAt === "number" ? sub.fetchedAt : Date.now(),
+      subType ?? null,
       five?.utilization ?? null,
       five?.resetsAt ?? null,
       seven?.utilization ?? null,
@@ -193,7 +207,7 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
       JSON.stringify(perModelTotal),
       windowId(five?.resetsAt),
       windowId(seven?.resetsAt),
-      sub.available === false ? 0 : 1,
+      five || seven ? 1 : 0,
       totals.input,
       totals.cacheCreation,
       totals.cacheRead,

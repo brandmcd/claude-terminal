@@ -148,6 +148,58 @@ const qHours = db?.query("SELECT * FROM hourly WHERE user = ?") as any;   // * :
 const qCum = db?.query("SELECT * FROM cumulative WHERE user = ?") as any;
 const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 
+// #region model weighting — "what did this actually cost against the limit"
+// A raw token count treats a Fable token and a Haiku token as the same thing, which flatters
+// whoever ran the cheap model. These weights are each model's OUTPUT price relative to Sonnet 5
+// ($10/MTok = 1.0), so Fable's $50 lands at 5x and Opus 5's $25 at 2.5x. Unknown/new model ids
+// fall back to 1.0 rather than vanishing from the total.
+const MODEL_WEIGHTS: Record<string, number> = {
+  "claude-fable-5-1": 5, "claude-fable-5": 5, "claude-mythos-5-1": 5, "claude-mythos-5": 5,
+  "claude-opus-5": 2.5, "claude-opus-4-8": 2.5, "claude-opus-4-7": 2.5, "claude-opus-4-6": 2.5,
+  "claude-sonnet-5": 1, "claude-sonnet-4-6": 1.5,
+  "claude-haiku-4-5": 0.5,
+};
+const DEFAULT_WEIGHT = 1;
+// The model id in a transcript can carry a suffix (e.g. "claude-opus-5[1m]") or a date.
+function weightFor(model: string): number {
+  if (!model) return DEFAULT_WEIGHT;
+  const bare = String(model).replace(/\[1m\]$/, "");
+  if (MODEL_WEIGHTS[bare] != null) return MODEL_WEIGHTS[bare];
+  const undated = bare.replace(/-\d{8}$/, "");
+  if (MODEL_WEIGHTS[undated] != null) return MODEL_WEIGHTS[undated];
+  return DEFAULT_WEIGHT;
+}
+
+// model_usage arrives with the upstream merge and carries its own byte cursors, so it covers the
+// same history as `hourly`. Prepared lazily: an older DB simply reports no weighting.
+let qWeighted: any = null;
+let qWeightedChecked = false;
+function weightedTotals(): Record<string, { output: number; total: number; month_output: number; month_total: number }> {
+  const out: Record<string, any> = {};
+  if (!db) return out;
+  if (!qWeightedChecked) {
+    qWeightedChecked = true;
+    try {
+      const t = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get();
+      if (t) qWeighted = db.query("SELECT user, model, substr(minute_utc,1,7) AS ym, SUM(output) AS output, SUM(total) AS total FROM model_usage GROUP BY user, model, ym");
+    } catch { qWeighted = null; }
+  }
+  if (!qWeighted) return out;
+  const ym = new Date().toISOString().slice(0, 7);
+  try {
+    for (const r of qWeighted.all() as any[]) {
+      const w = weightFor(r.model);
+      const b = (out[r.user] ||= { output: 0, total: 0, month_output: 0, month_total: 0 });
+      b.output += (r.output || 0) * w;
+      b.total += (r.total || 0) * w;
+      if (r.ym === ym) { b.month_output += (r.output || 0) * w; b.month_total += (r.total || 0) * w; }
+    }
+    for (const u of Object.keys(out)) for (const k of Object.keys(out[u])) out[u][k] = Math.round(out[u][k]);
+  } catch { /* weighting is a nicety; never break the board over it */ }
+  return out;
+}
+// #endregion
+
 // External-peer queries are prepared lazily: the external_* tables only exist once a
 // collector that carries the newer schema has run. A vanilla DB (or a fresh deploy
 // before the first collector tick) simply has no external users. Memoised once the
@@ -346,6 +398,17 @@ function buildLeaderboard() {
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0;
   }
 
+  // Weighted ("effective") figures alongside the raw ones, so the board can show what the usage
+  // actually cost against the limit rather than treating every model's token as equal.
+  const wt = weightedTotals();
+  for (const u of users as any[]) {
+    const w = wt[u.user];
+    u.weighted_output = w ? w.output : null;
+    u.weighted_total = w ? w.total : null;
+    u.weighted_month_output = w ? w.month_output : null;
+    u.weighted_month_total = w ? w.month_total : null;
+  }
+
   // External peers: shown on the board but deliberately NOT in the split above. They
   // carry an `external` flag (rendered as an "external" chip) and no share_usd, so the
   // fixed subscription bill stays divided only across the local users.
@@ -396,6 +459,7 @@ function buildLeaderboard() {
   return {
     generated_at: now.toISOString().replace(/\.\d+Z$/, "+00:00"),
     window_hours: ROLLING_HOURS, gauge_max: GAUGE_MAX, subscription_usd: SUBSCRIPTION_USD,
+    model_weights: MODEL_WEIGHTS, weight_baseline: "claude-sonnet-5",
     month_label: monthLabel(monthPrefix), current_month: monthPrefix,
     months, hour_ms, spark_hours: SPARK_HOURS, users,
     subscription: latestSubscription(),

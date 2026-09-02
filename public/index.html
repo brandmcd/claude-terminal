@@ -32,6 +32,19 @@
     -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
   }
   .sub { color:var(--muted); font-size:13px; margin:8px 0 0; max-width:64ch; }
+  /* Limit timers. Two windows, side by side, above everything else: the shared 5-hour session
+     limit and the 7-day weekly one. These are the numbers that actually stop work, so they sit
+     at the top rather than under the token board. */
+  .limits { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; margin:0 0 18px; }
+  .limit { background:var(--card); border:1px solid var(--line); border-radius:14px;
+           box-shadow:var(--shadow); padding:14px 16px; }
+  .limit .lh { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .limit .lh span { color:var(--muted); font-size:12px; letter-spacing:.02em; text-transform:uppercase; }
+  .limit .lh b { font-size:22px; font-variant-numeric:tabular-nums; }
+  .limit .track { height:8px; border-radius:6px; background:var(--track); overflow:hidden; margin:10px 0 0; }
+  .limit .track > i { display:block; height:100%; border-radius:6px; transition:width .6s cubic-bezier(.2,.7,.2,1); }
+  .limit .lf { display:flex; justify-content:space-between; gap:10px; margin:8px 0 0;
+               color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
   .updated { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; }
   .live-tag { display:inline-flex; align-items:center; gap:6px; }
   .pulse { width:7px; height:7px; border-radius:50%; background:#22c55e; animation:pulse 1.8s infinite; }
@@ -151,10 +164,13 @@
       <div class="modes" id="modes" role="group" aria-label="Which tokens to count">
         <button type="button" data-mode="all" aria-pressed="true">All tokens</button>
         <button type="button" data-mode="output" aria-pressed="false">Output only</button>
+        <button type="button" data-mode="weighted" aria-pressed="false">Weighted</button>
       </div>
       <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="updated">loading</span></span></div>
     </div>
   </header>
+
+  <div class="limits" id="limits" style="display:none"></div>
 
   <div class="cards" id="cards"></div>
 
@@ -218,15 +234,22 @@ function learnColors(d){ for(const u of (d && d.users) || []) if(u.color) COLORS
 // carries both shapes (month_output / month_total, output_5h / tokens_5h,
 // hourly_parts.output / hourly), so the toggle is pure presentation and costs no fetch.
 let MODE = "all";
-try { const m = localStorage.getItem("ct-usage-mode"); if(m === "all" || m === "output") MODE = m; } catch(e) {}
+try { const m = localStorage.getItem("ct-usage-mode"); if(m === "all" || m === "output" || m === "weighted") MODE = m; } catch(e) {}
 const outputOnly = () => MODE === "output";
+// "weighted" counts every token, but each one multiplied by its model's cost relative to
+// Sonnet 5 (Fable 5x, Opus 2.5x, Haiku 0.5x). Falls back to the raw total for a peer that
+// exports the older shape, so a mixed board never shows a blank column.
+const weighted = () => MODE === "weighted";
+const wOr = (w, raw) => (typeof w === "number" ? w : raw);
 // hourly_parts is always present today; the fallback keeps a card rendering rather than
 // throwing if a peer ever exports the older shape.
 const hourlyOut = u => (u.hourly_parts && u.hourly_parts.output) || u.hourly.map(()=>0);
 const hourlyOf = u => outputOnly() ? hourlyOut(u) : u.hourly;
-const monthOf  = u => outputOnly() ? u.month_output : u.month_total;
-const fiveOf   = u => outputOnly() ? u.output_5h : u.tokens_5h;
+const monthOf  = u => weighted() ? wOr(u.weighted_month_total, u.month_total) : outputOnly() ? u.month_output : u.month_total;
+const fiveOf   = u => outputOnly() ? u.output_5h : u.tokens_5h;   // the 5h window has no per-model split
 const rowOf    = r => outputOnly() ? r.output : r.total;
+const totOf    = u => weighted() ? wOr(u.weighted_output, u.output_total) : u.output_total;
+const allOf    = u => weighted() ? wOr(u.weighted_total, u.tokens_total) : u.tokens_total;
 
 const fmt = n => n>=1e9 ? (n/1e9).toFixed(n>=1e10?1:2)+"B" : n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
 const money = v => "$"+Number(v).toFixed(2);
@@ -404,8 +427,8 @@ function build(d){
     s.render(); sparks[u.user]=s;
     countUp(document.getElementById("mo-"+u.user), monthOf(u));
     countUp(document.getElementById("fivh-"+u.user), fiveOf(u));
-    countUp(document.getElementById("tot-"+u.user), u.output_total);
-    countUp(document.getElementById("all-"+u.user), u.tokens_total);
+    countUp(document.getElementById("tot-"+u.user), totOf(u));
+    countUp(document.getElementById("all-"+u.user), allOf(u));
   });
 
   applyModeText();
@@ -429,7 +452,7 @@ function build(d){
 function refresh(d){
   d.users.forEach(u => {
     if(sparks[u.user]) sparks[u.user].updateSeries([{name:"tokens", data:sparkData(d,u)}]);
-    const vals = { mo:monthOf(u), fivh:fiveOf(u), tot:u.output_total, all:u.tokens_total };
+    const vals = { mo:monthOf(u), fivh:fiveOf(u), tot:totOf(u), all:allOf(u) };
     for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
   });
   if(monthlyChart) monthlyChart.updateSeries(monthlySeries(d));
@@ -437,11 +460,47 @@ function refresh(d){
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
 }
 
+// #region limit timers (the shared 5h session window + the 7d weekly one)
+// Utilisation comes off the API's own anthropic-ratelimit-unified-* headers, sampled by the
+// collector every 60s. The countdown re-renders on a 1s tick from the stored reset timestamp,
+// so the clock stays honest between samples instead of freezing until the next poll.
+function limitColor(u){ if(u==null) return "var(--muted)"; if(u>=85) return "#ef4444"; if(u>=60) return "#f59e0b"; return "#22c55e"; }
+function untilStr(iso){
+  if(!iso) return "";
+  const t = Date.parse(iso); if(isNaN(t)) return "";
+  let sec = Math.round((t - Date.now())/1000);
+  if(sec<=0) return "resetting now";
+  const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), ss=sec%60;
+  if(h>=1) return "resets in "+h+"h "+m+"m";
+  if(m>=1) return "resets in "+m+"m "+ss+"s";
+  return "resets in "+ss+"s";
+}
+function limitCell(label, win){
+  const u = win && typeof win.utilization==="number" ? win.utilization : null;
+  const pct = u==null ? 0 : Math.max(0,Math.min(100,u));
+  return '<div class="limit">'
+    + '<div class="lh"><span>'+label+'</span><b>'+(u==null?"–":Math.round(u)+"%")+'</b></div>'
+    + '<div class="track"><i style="width:'+pct+'%;background:'+limitColor(u)+'"></i></div>'
+    + '<div class="lf"><span>'+(u==null?"":Math.max(0,100-Math.round(u))+"% left")+'</span>'
+    + '<span>'+untilStr(win&&win.resets_at)+'</span></div>'
+    + '</div>';
+}
+function renderLimits(d){
+  const p = d && d.subscription, el = document.getElementById("limits");
+  if(!el) return;
+  if(!p || (!p.five_hour && !p.seven_day)){ el.style.display="none"; return; }
+  el.style.display="";
+  el.innerHTML = limitCell("Session limit (5h)", p.five_hour) + limitCell("Weekly limit (7d)", p.seven_day);
+}
+setInterval(() => { if(DATA) renderLimits(DATA); }, 1000);
+// #endregion
+
 async function load(first){
   try {
     const r = await fetch("api?t="+Date.now(), {cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const d = await r.json(); DATA = d;
+    renderLimits(d);
     learnColors(d); // must precede build/refresh — every chart reads colorFor() as it renders
     rank(d);        // and precede sig(): a reorder has to come out as a rebuild, not a refresh
     const s = sig(d);
@@ -462,19 +521,28 @@ function rank(d){ d.users.sort((a,b) => monthOf(b) - monthOf(a)); }
 function applyModeText(){
   for(const b of document.querySelectorAll("#modes button"))
     b.setAttribute("aria-pressed", String(b.dataset.mode === MODE));
-  document.getElementById("sub").textContent = outputOnly()
+  document.getElementById("sub").textContent = weighted()
+    ? "Ranked by WEIGHTED tokens this calendar month: every token multiplied by what its model costs "
+      + "relative to Sonnet 5 \u2014 Fable 5\u00d7, Opus 2.5\u00d7, Sonnet 4.6 1.5\u00d7, Sonnet 5 1\u00d7, Haiku 0.5\u00d7. "
+      + "An hour on Fable therefore reads five times heavier than the same hour on Sonnet, which is "
+      + "roughly what it does to the limit. Switch to All tokens for the raw counts."
+    : outputOnly()
     ? "Ranked by output tokens used this calendar month. Output is what actually counts against the "
       + "subscription limit, so input and cache traffic are left out of every figure below. "
       + "Numbers come straight off each session's transcript and refresh on their own."
     : "Ranked by every token used this calendar month: input, output and cache. Cache reads make the "
       + "raw total huge but barely move the needle against the subscription limit \u2014 switch to "
       + "output only for that. Numbers come straight off each session's transcript and refresh on their own.";
-  document.getElementById("monthlyTitle").textContent = outputOnly() ? "Output by month" : "Tokens by month";
+  document.getElementById("monthlyTitle").textContent = weighted() ? "Weighted tokens by month" : outputOnly() ? "Output by month" : "Tokens by month";
   document.getElementById("monthlySub").textContent = outputOnly()
     ? "Output tokens each person used, month by month."
     : "Every token each person used, month by month: input, output and cache.";
   document.getElementById("hourlyTitle").textContent =
     outputOnly() ? "Output per hour, last 7 days" : "Tokens per hour, last 7 days";
+  // The hourly/monthly series have no per-model split, so they stay raw even in weighted mode.
+  // Say so rather than letting the cards and the charts silently disagree.
+  const ms = document.getElementById("monthlySub");
+  if(weighted()) ms.textContent = "Weighted by model cost, month by month (Fable 5\u00d7, Opus 2.5\u00d7, Haiku 0.5\u00d7).";
 }
 
 document.getElementById("modes").addEventListener("click", e => {
