@@ -71,12 +71,12 @@ self.addEventListener("fetch", (event) => {
   try { url = new URL(req.url); } catch { return; }
   if (url.origin !== self.location.origin) return;
   const p = url.pathname;
-  // The app owns "/" as of 2026-08-31 and the terminal moved to /terminal. "/" is served from the
-  // SAME cached shell as "/app" (the router rewrites it to /app, so it is byte-identical), which is
-  // what makes a cold PWA launch at the root instant and offline-proof. /terminal is deliberately
-  // NOT handled here: its assets, /token and its WebSocket must always go straight to the network.
-  if (p === "/terminal" || p.startsWith("/terminal/")) return;
-  if (p === "/app" || p === "/app/" || p === "/") {
+  // THIS FORK KEEPS THE UPSTREAM LAYOUT REVERSED: the terminal owns "/" (nginx sends it to ttyd)
+  // and the app lives at "/app". Upstream moved the terminal to /terminal and let the app shell
+  // answer "/", which here meant the cached app shell was served over the terminal — the browser
+  // flipped between the two at random. "/" must always go to the network; only /app is cached.
+  if (p === "/" || p === "/terminal" || p.startsWith("/terminal/")) return;
+  if (p === "/app" || p === "/app/") {
     // shell: STALE-WHILE-REVALIDATE. Serve the cached shell instantly (so it opens the same on 5G, on
     // one bar, or fully offline — never "loads and loads"), and refresh the cache in the background.
     // A new build is picked up by the app's own version poll -> reload toast, so serving a slightly

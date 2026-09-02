@@ -27,7 +27,7 @@
     // install whose baked start_url still points at a terminal URL.
     if (_cold && _last === "/app") { location.replace("/app"); return; }
     if (_sp.get("home") === "1") { try { history.replaceState(null, "", location.pathname); } catch (e) {} } // drop the marker
-    try { localStorage.setItem("ct-last-surface", "/terminal"); } catch (e) {} // we're on the terminal now
+    try { localStorage.setItem("ct-last-surface", "/"); } catch (e) {} // we're on the terminal now
   } catch (e) {}
   // #endregion
 

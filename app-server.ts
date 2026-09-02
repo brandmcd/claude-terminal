@@ -329,10 +329,21 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
 
   // --- API ---
   if (req.method === "GET" && path === "/app/api/models") {
-    // Prefer the CLI's live supported-models menu; fall back to the config list if the probe fails.
-    // A dynamic list is already the curated menu, so there's no separate "Other…" list.
+    // Prefer the CLI's live supported-models menu, then ADD anything this box is configured to
+    // offer that the menu left out. Upstream replaced the config list outright, but the CLI menu
+    // only lists Default/Sonnet/Opus/Haiku plus whichever model happens to be selected right now —
+    // so a configured model (Fable) vanished from the app the moment it stopped being the default.
+    // Config entries are the operator saying "offer this here", so they always survive.
+    const bare = (v?: string) => String(v || "").replace(/\[1m\]$/, "");
     let models = ctx.models, moreModels = ctx.moreModels;
-    try { const dyn = await getSupportedModels(); if (dyn.length) { models = dyn; moreModels = []; } } catch { /* keep config fallback */ }
+    try {
+      const dyn = await getSupportedModels();
+      if (dyn.length) {
+        const seen = new Set(dyn.flatMap((m) => [bare(m.id), bare(m.resolvedModel)]));
+        models = [...dyn, ...[...ctx.models, ...ctx.moreModels].filter((m) => !seen.has(bare(m.id)))];
+        moreModels = [];
+      }
+    } catch { /* keep config fallback */ }
     return jsonRes({ models, moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
   }
 

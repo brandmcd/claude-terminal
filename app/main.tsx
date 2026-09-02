@@ -1644,7 +1644,7 @@ function App() {
       const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || (navigator as any).standalone === true;
       const navType = (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.type || "";
       const cold = sp.get("home") === "1" || (standalone && !document.referrer && navType !== "reload");
-      if (cold && localStorage.getItem("ct-last-surface") === "/terminal") { location.replace("/terminal"); return; }
+      if (cold && localStorage.getItem("ct-last-surface") === "/") { location.replace("/"); return; }
       if (sp.get("home") === "1") history.replaceState(null, "", location.pathname);
       localStorage.setItem("ct-last-surface", "/app");
     } catch { /* */ }
@@ -2547,7 +2547,7 @@ function App() {
           )}
         </div>
         <div className="sb-foot">
-          <a className="term-link" href="/terminal">
+          <a className="term-link" href="/">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.6" /><path d="M8 10l2.5 2L8 14M12.5 14H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
             Terminal
           </a>
