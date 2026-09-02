@@ -15,6 +15,9 @@ import webpush from "web-push";
 import { buildCostReport } from "./cost.ts";
 import { Connections } from "./connections.ts";
 import { appRoutes, type AppCtx } from "./app-server.ts";
+import { initSubscriptionResume } from "./subscription-resume.ts";
+import { startStatusPush, type StatusPayload } from "./status-push.ts";
+import { liveActivity } from "./app-runner.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -165,6 +168,35 @@ function ensureExt() {
   return extQ;
 }
 const extKey = (peer: string, user: string) => "ext_" + `${peer}_${user}`.replace(/[^A-Za-z0-9_]/g, "_");
+
+// Latest claude.ai subscription rate-limit snapshot (the SHARED session + weekly limit everyone
+// on this box draws down, written by subscription-collector.ts). Prepared lazily because
+// subscription_samples only exists once a collector carrying that schema has run; a vanilla/old
+// DB simply reports nothing. Returns the most recent sample, or null when unavailable.
+let qSub: any = null;
+let qSubChecked = false;
+function latestSubscription() {
+  if (!db) return null;
+  if (!qSubChecked) {
+    qSubChecked = true;
+    try {
+      const t = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='subscription_samples'").get();
+      if (t) qSub = db.query("SELECT * FROM subscription_samples ORDER BY ts DESC LIMIT 1");
+    } catch { qSub = null; }
+  }
+  if (!qSub) return null;
+  try {
+    const r = qSub.get() as any;
+    if (!r) return null;
+    return {
+      subscription: r.subscription ?? null,
+      five_hour: { utilization: r.five_hour_util ?? null, resets_at: r.five_hour_reset ?? null },
+      seven_day: { utilization: r.seven_day_util ?? null, resets_at: r.seven_day_reset ?? null },
+      active_users: r.active_users ?? null,
+      sampled_at: r.ts ?? null,
+    };
+  } catch { return null; }
+}
 
 // A portable snapshot of THIS instance's usage for a trusted peer to pull. Raw hourly
 // buckets (last 45 days) + cumulative + meta per local user, so the puller reconstructs
@@ -366,6 +398,7 @@ function buildLeaderboard() {
     window_hours: ROLLING_HOURS, gauge_max: GAUGE_MAX, subscription_usd: SUBSCRIPTION_USD,
     month_label: monthLabel(monthPrefix), current_month: monthPrefix,
     months, hour_ms, spark_hours: SPARK_HOURS, users,
+    subscription: latestSubscription(),
   };
 }
 
@@ -383,11 +416,27 @@ function broadcast() {
   const enc = new TextEncoder();
   for (const c of sseClients) { try { c.enqueue(enc.encode("data: tick\n\n")); } catch {} }
 }
+// At most one push every BROADCAST_MIN_MS. usage.db is in WAL mode and the WAL is written
+// continuously while any session is running, so the old 300ms debounce pushed about three times a
+// second: every open dashboard reloaded and re-rendered every chart at that rate, which burns CPU on
+// every tab and rebuilt the SVG under the cursor, taking any open tooltip with it.
+//
+// A THROTTLE, not a longer debounce. clearTimeout on each write means a bigger debounce window would
+// simply never elapse under a steady write load, and the dashboard would stop updating until the box
+// went quiet. This fires on the leading edge after a lull (so an idle board is still immediate) and
+// at most once per window during a burst.
+const BROADCAST_MIN_MS = 3000;
 let watchTimer: any = null;
+let lastBroadcast = 0;
+function scheduleBroadcast() {
+  if (watchTimer) return; // a push is already pending; it will carry this write too
+  const wait = Math.max(0, BROADCAST_MIN_MS - (Date.now() - lastBroadcast));
+  watchTimer = setTimeout(() => { watchTimer = null; lastBroadcast = Date.now(); broadcast(); }, wait);
+}
 if (USAGE_PAGE) {
   try {
-    // WAL writes land in usage.db-wal, so watch the whole DB directory, debounced.
-    watch(dirname(DB_PATH), () => { clearTimeout(watchTimer); watchTimer = setTimeout(broadcast, 300); });
+    // WAL writes land in usage.db-wal, so watch the whole DB directory.
+    watch(dirname(DB_PATH), scheduleBroadcast);
   } catch (e) { console.error("db watch failed", e); }
 }
 // #endregion
@@ -406,26 +455,39 @@ try {
 }
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
-type PushSub = { endpoint: string; keys?: { p256dh: string; auth: string } };
+// `cadence` marks a subscription that can take the every-15s status pushes. Only Android Chrome can:
+// it updates a same-tag notification silently, so the stream costs one quiet tray entry. iOS alerts on
+// most pushes, so a cadence stream there would buzz the phone every cycle. Unknown (an older
+// subscription that predates the flag) is treated as NOT cadence-capable, so the worst case is the
+// feature stays off for that device until it re-registers, never a phone buzzing every 15 seconds.
+type PushSub = { endpoint: string; keys?: { p256dh: string; auth: string }; cadence?: boolean; ua?: string };
 let subs: PushSub[] = [];
 try { const s = JSON.parse(await Bun.file(SUBS_FILE).text()); if (Array.isArray(s)) subs = s; } catch {}
 let subsSaveTimer: any = null;
 function saveSubs() { clearTimeout(subsSaveTimer); subsSaveTimer = setTimeout(() => { Bun.write(SUBS_FILE, JSON.stringify(subs)).catch(() => {}); }, 200); }
-function addSub(s: PushSub) { if (!s?.endpoint) return; if (!subs.some((x) => x.endpoint === s.endpoint)) { subs.push(s); saveSubs(); } }
+function addSub(s: PushSub) {
+  if (!s?.endpoint) return;
+  const i = subs.findIndex((x) => x.endpoint === s.endpoint);
+  // Re-registering an existing endpoint UPDATES its flags rather than being a no-op, so a device that
+  // subscribed before the cadence flag existed picks it up the next time the app opens.
+  if (i !== -1) { subs[i] = { ...subs[i], ...s }; saveSubs(); return; }
+  subs.push(s); saveSubs();
+}
 function removeSub(endpoint: string) { const n = subs.length; subs = subs.filter((x) => x.endpoint !== endpoint); if (subs.length !== n) saveSubs(); }
 
-type NotifPayload = { title: string; body?: string; url?: string; tag?: string; icon?: string; requireInteraction?: boolean; sessionId?: string };
-async function pushAll(payload: NotifPayload): Promise<{ sent: number; pruned: number }> {
+type NotifPayload = { title: string; body?: string; url?: string; tag?: string; icon?: string; requireInteraction?: boolean; sessionId?: string; renotify?: boolean; silent?: boolean; status?: StatusPayload };
+async function pushAll(payload: NotifPayload, opts?: { cadenceOnly?: boolean }): Promise<{ sent: number; pruned: number }> {
   const data = JSON.stringify(payload);
   const dead: string[] = [];
-  await Promise.all(subs.map(async (s) => {
+  const targets = opts?.cadenceOnly ? subs.filter((s) => s.cadence) : subs;
+  await Promise.all(targets.map(async (s) => {
     // urgency:high tells the push service (FCM/Mozilla/APNs) to deliver immediately
     // instead of batching for power-saving, which is what made pushes feel slow.
     try { await webpush.sendNotification(s as any, data, { TTL: 120, urgency: "high" }); }
     catch (e: any) { const c = e?.statusCode; if (c === 404 || c === 410) dead.push(s.endpoint); }
   }));
   for (const d of dead) removeSub(d);
-  return { sent: subs.length, pruned: dead.length };
+  return { sent: targets.length, pruned: dead.length };
 }
 
 // Focus heartbeat: each open terminal POSTs the session it is actively watching so we
@@ -668,11 +730,47 @@ const appCtx: AppCtx = {
   publicDir: PUBLIC_DIR,
   dataDir: cfg.dataDir,
   historyHide: cfg.historyHide || [],
+  // Agent/automation project dirs (billed to a non-owner extraUser, e.g. stonkbot/sleeper): hide
+  // them wholesale from the chat-app list, same as listTranscripts() does for the terminal drawer.
+  hideProjectDirs: (() => { const a: string[] = []; for (const dirs of Object.values(cfg.extraUsers || {})) for (const d of dirs as string[]) a.push(d); return a; })(),
   defaultCwd: SPAWN_CWD,
+  // Roots the chat app may serve files from, on top of each conversation's own cwd. Owner-gated
+  // already (appRoutes requires Remote-User == OWNER), so this is a traversal guard, not an auth
+  // boundary. Defaults to the owner's home; set cfg.downloadRoots to add the data volumes Claude
+  // actually writes to. A guest container leaves it unset and keeps the cwd-only behaviour.
+  downloadRoots: (cfg.downloadRoots as string[] | undefined) || [HOME],
   models: APP_MODELS,
   moreModels: APP_MORE_MODELS,
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
+  mcpFile: join(STATE_DIR, "claude-app-mcp.json"),
+  claudeDir: join(HOME, ".claude"),
+  // Rolling 5-hour output tokens for the owner + a link to the usage dashboard, for the app's
+  // usage chip (mirrors the terminal-side usage view). Null when there's no usage DB.
+  ownerUsage: () => {
+    if (!db) return null;
+    try {
+      const hours = new Map<string, any>();
+      for (const r of qHours.all(OWNER) as any[]) hours.set(r.hour_utc, { total: r.total, output: r.output });
+      return { output5h: rolling(hours, "output", new Date(), 5), url: cfg.usageUrl || "/usage/" };
+    } catch { return null; }
+  },
+  // Count of LOCAL users active in the last ~15 min (same window the board uses). The shared
+  // plan limit is account-wide, so "2+ active" means the session limit is genuinely contended.
+  activeUsers: () => {
+    if (!db) return null; // no usage DB (guest sidecar): count is unknown, not zero
+    try {
+      const now = Date.now();
+      let n = 0;
+      for (const { user } of qUsers.all() as any[]) {
+        const meta = qMeta.get(user) as any;
+        const t = meta?.last_activity ? Date.parse(meta.last_activity) : NaN;
+        if (!isNaN(t) && now - t <= ACTIVE_MS) n++;
+      }
+      return n;
+    } catch { return null; }
+  },
+  subscriptionWarnPct: Number(cfg.subscriptionWarnPct) || 70,
   // Hands-free voice: loopback Whisper (STT) + Kokoro (TTS) sidecars. Present only when
   // configured, so a vanilla install (and guest sidecars) simply never show the mic.
   sttUrl: cfg.sttUrl || (cfg.voice ? "http://127.0.0.1:7801" : undefined),
@@ -692,11 +790,51 @@ const appCtx: AppCtx = {
     });
   },
 };
+// Status push: one coalesced, silently-updating notification while agents work, which is also the
+// service worker's wake-up to pull transcript deltas into the offline cache. Android-only by design
+// (see the `cadence` flag above). Cadence is a battery-vs-freshness dial: at 15s the cache is never
+// more than a cycle behind, and nothing is sent at all while everything is idle.
+const STATUS_PUSH_SECONDS: number = Number(cfg.statusPushSeconds) > 0 ? Number(cfg.statusPushSeconds) : 15;
+if (cfg.statusPush !== false) {
+  startStatusPush({
+    intervalMs: STATUS_PUSH_SECONDS * 1000,
+    snapshot: () => liveActivity(),
+    push: (p) => {
+      // Suppress only what you are already looking at, not the whole push. A conversation on your screen
+      // is streaming over SSE and writing its own cache, so it needs neither a delta pull nor a tray
+      // line; every OTHER conversation still does. This used to drop the entire push when any single
+      // advanced conversation was being watched, which lost the updates for the ones you could not see.
+      const unwatched = p.convs.filter((id) => !isWatched(id));
+      if (p.convs.length > 0 && unwatched.length === 0) {
+        console.log(`[status] suppressed (all ${p.convs.length} watched) working=${p.working} waiting=${p.waiting}`);
+        return; // everything that moved is on your screen
+      }
+      // Same shape as the [turn] log, so `journalctl -u claude-terminal.service | grep '\[status\]'`
+      // shows exactly what went out and to how many devices. sent=0 means no cadence-capable device is
+      // subscribed, which is a very different problem from the push not firing at all.
+      void pushAll({
+        title: p.title, body: p.body, url: "/app", tag: "ct-status",
+        // renotify stays off: a same-tag replacement with renotify:false updates with no sound or
+        // vibration, which is the whole reason this cadence is tolerable.
+        // Only the unwatched conversations get a delta pull; the watched one is caching itself.
+        renotify: false, silent: true, status: { ...p, convs: unwatched },
+      }, { cadenceOnly: true }).then((r) => {
+        console.log(`[status] ${p.idle ? "idle" : "live"} working=${p.working} waiting=${p.waiting} finished=${p.finished} warm=${unwatched.length}/${p.convs.length} sent=${r.sent} pruned=${r.pruned}`);
+      });
+    },
+  });
+}
 // #endregion
 
 const server = Bun.serve({
   hostname: HOST,
   port: PORT,
+  // Bun defaults idleTimeout to 10 SECONDS and kills any connection quiet for that long. The chat
+  // app's SSE streams sit idle between turns and their keepalive ping is every 20s, so the server
+  // was killing every stream before its own keepalive could ever fire: the client saw the socket
+  // drop, waited out `retry: 3000`, reconnected, and repeated forever. That reads as "I keep going
+  // offline" on a perfectly good wired LAN (1058 stream opens in one hour). Well above the ping.
+  idleTimeout: 120,
   async fetch(req) {
     const path = new URL(req.url).pathname;
 
@@ -791,7 +929,13 @@ const server = Bun.serve({
     if (req.method === "GET" && path === "/sw.js") {
       // Registered at scope "/", so it must advertise the wider scope. nginx passes
       // this response header through unchanged.
-      return new Response(Bun.file(swPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache" } });
+      // Stamp the current build into the cache name so a deploy always rotates the app-shell cache.
+      // Read fresh each request (like /app/api/version) so a rebuild alone ships it, with no restart.
+      let sw = await Bun.file(swPath).text();
+      let build = "dev";
+      try { build = (await Bun.file(join(PUBLIC_DIR, "app", "version.txt")).text()).trim() || "dev"; } catch { /* no built app */ }
+      sw = sw.replaceAll("%BUILD%", build);
+      return new Response(sw, { headers: { "Content-Type": "application/javascript; charset=utf-8", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache" } });
     }
     if (req.method === "GET" && path.startsWith("/pwa/")) {
       const rel = path.slice("/pwa/".length);
@@ -816,7 +960,7 @@ const server = Bun.serve({
       if (!allowed(req)) return new Response("Forbidden", { status: 403 });
       let body: any = {}; try { body = await req.json(); } catch {}
       if (!body?.endpoint) return new Response("Bad subscription", { status: 400 });
-      addSub(body);
+      addSub({ endpoint: String(body.endpoint), keys: body.keys, cadence: !!body.cadence, ua: body.ua ? String(body.ua).slice(0, 200) : undefined });
       return Response.json({ ok: true, subscribed: subs.length }, { headers: cors(req) });
     }
     if (req.method === "POST" && path === "/unsubscribe") {
@@ -1036,5 +1180,12 @@ setInterval(() => {
   const enc = new TextEncoder();
   for (const c of [...sseClients]) { try { c.enqueue(enc.encode(": ping\n\n")); } catch { sseClients.delete(c); } }
 }, 25000);
+
+// Auto-resume /app turns that the shared subscription limit cut off: re-arm any persisted intents
+// (they survive a restart) and re-run each at its window reset. Non-fatal — a failure here must
+// never stop the server from serving.
+try {
+  initSubscriptionResume({ file: join(STATE_DIR, "claude-app-subscription-resume.json"), port: PORT, owner: OWNER });
+} catch (e) { console.error("subscription-resume init failed", e); }
 
 console.log(`claude-terminal listening on http://${server.hostname}:${server.port} (owner=${OWNER}, db=${DB_PATH})`);
