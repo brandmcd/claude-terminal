@@ -202,14 +202,13 @@ idles around 300 MB and grows with open extensions; if the box starts swapping h
 sshd listens on the Tailscale address only (`/etc/ssh/sshd_config.d/98-listen.conf`),
 key auth only, no root. Two ways in, both over the tailnet:
 
-1. **Tailscale SSH** is enabled on the node (`tailscale set --ssh`). With the tailnet's
-   default policy (`autogroup:member` → `autogroup:self`, action `check`) the laptop can
-   `ssh ctuser@claude-vps` with no key; the first login opens a browser check that repeats
-   every 12 h. Remote-SSH tolerates that badly (it waits on the check URL), so for daily use
-   change that rule to `"action": "accept"` for the laptop in the Tailscale admin console.
-2. **Plain OpenSSH**: put the laptop's public key in `~ctuser/.ssh/authorized_keys` (the
-   file exists, empty, mode 600). Tailscale SSH only takes connections its policy matches;
-   everything else falls through to sshd.
+1. **Plain OpenSSH** (in use): the laptop's public key is in `~ctuser/.ssh/authorized_keys`.
+2. **Tailscale SSH** is deliberately OFF (`tailscale set --ssh=false`). When it was on,
+   tailscaled intercepted every port-22 connection from the tailnet and, under the
+   default `check` policy, waited on a browser prompt that the laptop never saw, so
+   `ssh` and Remote-SSH both timed out and sshd logged nothing
+   (journalctl -u tailscaled shows `handling conn: ... ctuser@100.114.64.51:22`). Turn it
+   back on only after changing the tailnet ssh rule to `"action": "accept"`.
 
 Laptop `~/.ssh/config`:
 
