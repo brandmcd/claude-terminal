@@ -1,0 +1,17 @@
+[Unit]
+Description=claude-terminal code-server (VS Code in the browser at /code/)
+Wants=network-online.target
+After=network-online.target
+[Service]
+User=ctuser
+WorkingDirectory=/home/ctuser
+# ~/.local/bin first so the integrated terminal finds the same self-updating `claude` the
+# ttyd tabs use, not the SDK's bundled copy.
+Environment=PATH=/home/ctuser/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Listener, auth and telemetry settings live in ~/.config/code-server/config.yaml.
+# The workspace file opens work/, vault/, the terminal repo and /etc/claude-terminal.
+ExecStart=/usr/bin/code-server /home/ctuser/claude.code-workspace
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target

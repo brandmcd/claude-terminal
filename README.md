@@ -260,6 +260,13 @@ mic button; otherwise the button is hidden and the routes return 503, so a vanil
 sidecars are unaffected. `espeak-ng` is needed for Kokoro's out-of-dictionary word fallback
 (`apt install espeak-ng`).
 
+## VS Code (`/code/`)
+
+`code-server` behind the same gate as the terminal: browse and edit any file on the box,
+view images and GIFs, preview Markdown, open a terminal. `/p/<port>/` proxies any local
+dev server for previewing a site. Setup, memory notes and the laptop Remote-SSH path are
+in `deploy/README.md` sections 7 and 8.
+
 ## Importing from a previous setup
 
 `migrate-state.ts` imports legacy per-user JSON buckets into SQLite (preserving byte-offsets so the

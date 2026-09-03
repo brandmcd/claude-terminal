@@ -149,3 +149,74 @@ amount of server-side cache-busting will change an already-installed icon.
 
 So on the iPhone: delete the installed app from the home screen, open
 `https://claude.brandmcd.com` in Safari, and Share → *Add to Home Screen* again.
+
+## 7. VS Code in the browser — `/code/` — and dev-site preview — `/p/<port>/`
+
+`code-server` (the real VS Code, served by a node process) runs as `ct-code.service` on
+`127.0.0.1:8443` with **auth off**. nginx is its only gate: `auth_request` identifies the
+user and the `$ct_code_backend` map in `/etc/nginx/conf.d/20-ct-code.conf` sends anyone
+who is not the owner to a dead port (502). Cloudflare Access in front sees `/code/` as part
+of the `Claude Terminal` app, so no Cloudflare change was needed.
+
+`apply-root.sh` installs the `.deb` if `code-server` is missing (pinned to
+`CODE_SERVER_VERSION`), the unit, the conf.d maps and the `/code + /p` vhost block. It
+does **not** write the per-user files, which live in ctuser's home and are not tracked:
+
+| File | What it holds |
+|---|---|
+| `~/.config/code-server/config.yaml` | `bind-addr 127.0.0.1:8443`, `auth: none`, telemetry and update checks off |
+| `~/.local/share/code-server/User/settings.json` | dark theme, autosave after 1 s, no minimap, word wrap |
+| `~/claude.code-workspace` | the folders VS Code opens: `~/work`, `~/vault`, `/srv/claude-terminal`, `/etc/claude-terminal` |
+
+The unit passes the workspace file as code-server's argument, so a fresh browser lands on
+those four folders. `/etc/claude-terminal` is readable but root-owned; edit it from a
+terminal with sudo, not from the editor.
+
+Upgrade: download the new `.deb` from github.com/coder/code-server/releases, `sudo dpkg -i`,
+`sudo systemctl restart ct-code`, bump `CODE_SERVER_VERSION` here. Extensions come from
+Open VSX: `code-server --install-extension <id>` as ctuser, then reload the page.
+
+Images and GIFs open in VS Code's built-in viewer, Markdown has a preview, and the
+integrated terminal has `~/.local/bin/claude` on its PATH (the same self-updating CLI the
+ttyd tabs use).
+
+**Preview a site**: anything listening on this box is reachable at
+`https://claude.brandmcd.com/p/<port>/`, owner-only, same gate. Servers that emit
+absolute asset URLs break under a subpath, so give them a base:
+
+```
+vite --base /p/5173/                   # Vite / SvelteKit dev servers
+python3 -m http.server 8000 -d out/    # static output works unchanged
+```
+
+code-server's own `/code/proxy/<port>/` does the same thing with the same limitation. A
+subdomain-per-port scheme would avoid it but needs a wildcard DNS record, a tunnel ingress
+rule and an Access policy in Cloudflare, which is not managed from this box.
+
+Memory note: this box has 3.7 GiB and the TTS service alone holds ~1.5 GiB. code-server
+idles around 300 MB and grows with open extensions; if the box starts swapping hard,
+`systemctl stop claude-tts.local` is the cheapest relief.
+
+## 8. SSH from a laptop (VS Code Remote-SSH)
+
+sshd listens on the Tailscale address only (`/etc/ssh/sshd_config.d/98-listen.conf`),
+key auth only, no root. Two ways in, both over the tailnet:
+
+1. **Tailscale SSH** is enabled on the node (`tailscale set --ssh`). With the tailnet's
+   default policy (`autogroup:member` → `autogroup:self`, action `check`) the laptop can
+   `ssh ctuser@claude-vps` with no key; the first login opens a browser check that repeats
+   every 12 h. Remote-SSH tolerates that badly (it waits on the check URL), so for daily use
+   change that rule to `"action": "accept"` for the laptop in the Tailscale admin console.
+2. **Plain OpenSSH**: put the laptop's public key in `~ctuser/.ssh/authorized_keys` (the
+   file exists, empty, mode 600). Tailscale SSH only takes connections its policy matches;
+   everything else falls through to sshd.
+
+Laptop `~/.ssh/config`:
+
+```
+Host claude-vps
+    HostName claude-vps.tail8db408.ts.net   # or 100.114.64.51
+    User ctuser
+```
+
+Then in VS Code: Remote-SSH: Connect to Host → `claude-vps`, open `/home/ctuser/claude.code-workspace`.

@@ -860,6 +860,8 @@
     '<rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>';
   const SVG_CHAT =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.38 8.38 0 0 1 3.5 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5z"/></svg>';
+  const SVG_CODE = // "</>" brackets: the VS Code editor at /code/
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 18l6-6-6-6"/><path d="M8 6l-6 6 6 6"/><path d="M14 4l-4 16"/></svg>';
   const SVG_NET =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z"/></svg>';
   const SVG_BELL =
@@ -1066,6 +1068,13 @@
   chatBtn.href = "/app";
   chatBtn.innerHTML = SVG_CHAT;
   chatBtn.style.display = "none"; // shown only for the owner (guests get 403 on the probe)
+  const codeBtn = document.createElement("a"); // VS Code in the browser (code-server at /code/)
+  codeBtn.className = "ctab-btn ctab-code";
+  codeBtn.title = "VS Code";
+  codeBtn.setAttribute("aria-label", "VS Code");
+  codeBtn.href = "/code/";
+  codeBtn.innerHTML = SVG_CODE;
+  codeBtn.style.display = "none"; // owner only, same gate as /app (nginx 502s anyone else)
   // Start a voice session in one tap. Deep-links to /app?voice=1, which opens the chat app
   // with the voice overlay already up, rather than landing on the thread and hunting for
   // the mic. Hidden until the models probe confirms the STT/TTS services are configured —
@@ -1119,6 +1128,7 @@
   bar.appendChild(netBtn);
   bar.appendChild(pasteBtn); // touch only — the phone's only way into the terminal's stdin
   bar.appendChild(voiceBtn); // one-tap voice session (/app?voice=1)
+  bar.appendChild(codeBtn); // VS Code (/code/)
   bar.appendChild(chatBtn); // link out to the /app chat UI
   bar.appendChild(historyBtn);
   bar.appendChild(themeBtn); // hidden on mobile (moves into the drawer)
@@ -1834,6 +1844,7 @@
       const r = await api("app/api/models");
       if (!r.ok) return;
       chatBtn.style.display = "";
+      codeBtn.style.display = ""; // /code/ is owner-gated by the same authz user, so one probe covers both
       // cfg.voice off, or the STT/TTS services unreachable -> no mic. Same rule the app's
       // own mic button uses, so the two can never disagree about whether voice exists.
       const d = await r.json();
