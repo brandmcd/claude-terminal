@@ -10,7 +10,7 @@ import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getSupportedModels, resolveEditPoints, type AppEvent, type AskNotifier } from "./app-runner";
+import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getCapabilities, resolveEditPoints, type AppEvent, type AskNotifier, type SessionSettings } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
 // sidecar's own default. The picker in Settings lets the user switch male/female/accent.
@@ -291,6 +291,25 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
 
 const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".map": "application/json", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".png": "image/png", ".woff2": "font/woff2" };
 
+// The effort levels the CLI accepts. "max" is session-scoped — the CLI applies it for the rest of
+// the session and never writes it to a settings file, which is why it is offered here at all.
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+// Read a settings blob off a request body into the whitelisted shape. Same four keys the
+// /app/api/settings route accepts; anything else in the body is dropped rather than forwarded into
+// Claude Code's flag settings layer. Returns undefined when there is nothing usable, so a new
+// conversation with no chosen effort gets no `settings` option at all.
+function sessionSettingsFrom(raw: unknown): SessionSettings | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const b = raw as Record<string, unknown>;
+  const out: SessionSettings = {};
+  if (typeof b.effortLevel === "string" && EFFORT_LEVELS.includes(b.effortLevel)) out.effortLevel = b.effortLevel as SessionSettings["effortLevel"];
+  if (typeof b.advisorModel === "string" && b.advisorModel) out.advisorModel = b.advisorModel.slice(0, 64);
+  if (typeof b.fastMode === "boolean") out.fastMode = b.fastMode;
+  if (typeof b.alwaysThinkingEnabled === "boolean") out.alwaysThinkingEnabled = b.alwaysThinkingEnabled;
+  return Object.keys(out).length ? out : undefined;
+}
+
 export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promise<Response | null> {
   // normalize: allow both /app* (router, no strip) and a stray /_ct/app* (prefix strip)
   if (path.startsWith("/_ct/app")) path = path.slice(4);
@@ -335,17 +354,28 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // only lists Default/Sonnet/Opus/Haiku plus whichever model happens to be selected right now —
     // so a configured model (Fable) vanished from the app the moment it stopped being the default.
     // Config entries are the operator saying "offer this here", so they always survive.
-    const bare = (v?: string) => String(v || "").replace(/\[1m\]$/, "");
+    //
+    // The dedupe key has to survive both suffixes the CLI uses, or a configured model comes back as
+    // a second row for a model already in the menu: "[1m]" on a long-context id, and the -YYYYMMDD
+    // date the CLI reports for a pinned model. claude-haiku-4-5 vs claude-haiku-4-5-20251001 is why
+    // the picker listed Haiku twice.
+    const bare = (v?: string) => String(v || "").replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
     let models = ctx.models, moreModels = ctx.moreModels;
+    let commands: unknown[] = [], agents: unknown[] = [];
     try {
-      const dyn = await getSupportedModels();
+      const caps = await getCapabilities();
+      commands = caps.commands; agents = caps.agents;
+      const dyn = caps.models;
       if (dyn.length) {
         const seen = new Set(dyn.flatMap((m) => [bare(m.id), bare(m.resolvedModel)]));
-        models = [...dyn, ...[...ctx.models, ...ctx.moreModels].filter((m) => !seen.has(bare(m.id)))];
-        moreModels = [];
+        const survives = (m: { id: string }) => !seen.has(bare(m.id));
+        // Keep the operator's two tiers. appModels are the ones worth a row in the popup; the
+        // appMoreModels leftovers stay behind "Other versions…" instead of padding the main menu.
+        models = [...dyn, ...ctx.models.filter(survives)];
+        moreModels = ctx.moreModels.filter(survives);
       }
     } catch { /* keep config fallback */ }
-    return jsonRes({ models, moreModels, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
+    return jsonRes({ models, moreModels, commands, agents, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
   }
 
   // --- MCP server management (the tools the LLM can call in /app chats) ---
@@ -732,7 +762,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
     if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.send(text, typeof b.cid === "string" ? b.cid : undefined); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
-    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile });
+    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile, settings: sessionSettingsFrom(b.settings) });
     tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
     void conv.run(text, typeof b.cid === "string" ? b.cid : undefined);
     dedupRecord(b.cid, conv.id);
@@ -800,6 +830,28 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (typeof b.model !== "string" || !b.model) return jsonRes({ error: "model required" }, ctx, req, 400);
     await conv.setModel(b.model);
     return jsonRes({ ok: true, model: b.model }, ctx, req);
+  }
+
+  // Effort level / advisor model / fast mode for one conversation. Whitelisted: this writes into
+  // Claude Code's flag settings layer, so anything accepted here would override the user's own
+  // settings.json for the session, and only these four are things the chat UI actually offers.
+  if (req.method === "POST" && path === "/app/api/settings") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const conv = b.id ? get(String(b.id)) : undefined;
+    if (!conv) return jsonRes({ error: "no live conversation" }, ctx, req, 409);
+    const patch: SessionSettings = {};
+    if ("effortLevel" in b) {
+      const v = b.effortLevel;
+      if (v === null) patch.effortLevel = null;
+      else if (EFFORT_LEVELS.includes(String(v))) patch.effortLevel = String(v) as SessionSettings["effortLevel"];
+      else return jsonRes({ error: `effortLevel must be null or one of ${EFFORT_LEVELS.join(", ")}` }, ctx, req, 400);
+    }
+    if ("advisorModel" in b) patch.advisorModel = b.advisorModel === null ? null : String(b.advisorModel).slice(0, 64);
+    if ("fastMode" in b) patch.fastMode = b.fastMode === null ? null : !!b.fastMode;
+    if ("alwaysThinkingEnabled" in b) patch.alwaysThinkingEnabled = b.alwaysThinkingEnabled === null ? null : !!b.alwaysThinkingEnabled;
+    if (!Object.keys(patch).length) return jsonRes({ error: "no recognised setting in body" }, ctx, req, 400);
+    await conv.setSettings(patch);
+    return jsonRes({ ok: true, settings: conv.settings }, ctx, req);
   }
 
   if (req.method === "POST" && path === "/app/api/interrupt") {

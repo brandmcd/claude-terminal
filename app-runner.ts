@@ -87,6 +87,9 @@ export type AppEvent =
   | { t: "context"; used: number; max?: number }
   // The model this conversation runs on: at init, and whenever it is switched.
   | { t: "model"; model: string }
+  // Effort / advisor model / fast mode for this conversation, echoed so every device watching it
+  // shows the same choice — the same reason the model switch is broadcast.
+  | { t: "settings"; settings: SessionSettings }
   // A background subagent finished. Its Task tool_result was only a launch ack, so without this the
   // card said "Running" forever after the work was done.
   | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string };
@@ -291,42 +294,68 @@ export function decorateVoiceTurn(text: string): string { return `${text}\n\n<vo
 // Sourced from a throwaway streaming query whose supportedModels() is a control request — it spends
 // no tokens and runs no turn. Stale-while-revalidate cached (the probe spawns a CLI subprocess, ~1-2s,
 // so we never do it per request); falls back to the caller's config list when the probe fails.
-export type AppModel = { id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean };
-let modelCache: { at: number; models: AppModel[] } | null = null;
-let modelInFlight: Promise<AppModel[]> | null = null;
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+export type AppModel = { id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean; supportedEffortLevels?: EffortLevel[] };
+// A slash command the CLI accepts. Sent as ordinary prompt text — the CLI intercepts a leading
+// "/name" and runs the command instead of a turn, which is how the chat palette executes them.
+export type AppCommand = { name: string; description?: string; argumentHint?: string; aliases?: string[] };
+// A subagent this session can dispatch to (the `/agents` list).
+export type AppAgent = { name: string; description?: string };
+export type AppCapabilities = { models: AppModel[]; commands: AppCommand[]; agents: AppAgent[] };
+let capCache: { at: number; caps: AppCapabilities } | null = null;
+let capInFlight: Promise<AppCapabilities> | null = null;
 const MODEL_TTL_MS = 10 * 60_000;
 
-async function probeSupportedModels(): Promise<AppModel[]> {
+// One throwaway subprocess answers all three control requests (models, slash commands, subagents),
+// so the picker, the command palette and the agent list cost a single ~1-2s probe between them
+// instead of one each.
+async function probeCapabilities(): Promise<AppCapabilities> {
   // A prompt generator that never yields keeps the query in streaming-input mode with no turn;
-  // we only issue the supportedModels() control request, then close the subprocess.
+  // we only issue control requests, then close the subprocess.
   async function* idle(): AsyncGenerator<SDKUserMessage> { await new Promise<void>(() => {}); }
   const q = query({ prompt: idle(), options: { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
   try {
-    const raw = await q.supportedModels();
-    return (raw || []).map((m) => ({ id: m.value, label: m.displayName || m.value, description: m.description, resolvedModel: m.resolvedModel, supportsEffort: m.supportsEffort }));
+    // Settled, not all: a CLI too old for supportedCommands/supportedAgents must not cost us the
+    // model list, which is the one the picker cannot do without.
+    const [rm, rc, ra] = await Promise.allSettled([q.supportedModels(), q.supportedCommands(), q.supportedAgents()]);
+    const raw = rm.status === "fulfilled" ? rm.value || [] : [];
+    const cmds = rc.status === "fulfilled" ? rc.value || [] : [];
+    const agents = ra.status === "fulfilled" ? ra.value || [] : [];
+    return {
+      models: raw.map((m) => ({ id: m.value, label: m.displayName || m.value, description: m.description, resolvedModel: m.resolvedModel, supportsEffort: m.supportsEffort, supportedEffortLevels: m.supportedEffortLevels as EffortLevel[] | undefined })),
+      // Internal plumbing commands (leading "__", and the two workflow handoff entries) are for the
+      // harness to call, not for a person to pick out of a menu.
+      commands: cmds.filter((c) => c.name && !c.name.startsWith("__") && c.name !== "workflow-launch-exec")
+        .map((c) => ({ name: c.name, description: c.description, argumentHint: c.argumentHint, aliases: c.aliases })),
+      agents: (agents as { name: string; description?: string }[]).map((a) => ({ name: a.name, description: a.description })),
+    };
   } finally {
     try { q.close(); } catch { /* */ }
   }
 }
 
-function refreshModels(): Promise<AppModel[]> {
-  if (modelInFlight) return modelInFlight;
-  modelInFlight = probeSupportedModels()
-    .then((m) => { if (m.length) modelCache = { at: Date.now(), models: m }; return m; })
-    .finally(() => { modelInFlight = null; });
-  return modelInFlight;
+function refreshCapabilities(): Promise<AppCapabilities> {
+  if (capInFlight) return capInFlight;
+  capInFlight = probeCapabilities()
+    .then((c) => { if (c.models.length) capCache = { at: Date.now(), caps: c }; return c; })
+    .finally(() => { capInFlight = null; });
+  return capInFlight;
 }
 
+const EMPTY_CAPS: AppCapabilities = { models: [], commands: [], agents: [] };
+
 // Warm cache: serve immediately and revalidate in the background when stale. Cold: probe now
-// (concurrent callers share one in-flight probe). Returns [] only if a cold probe fails, so the
-// endpoint can fall back to its config list.
-export async function getSupportedModels(): Promise<AppModel[]> {
-  if (modelCache) {
-    if (Date.now() - modelCache.at >= MODEL_TTL_MS) void refreshModels().catch(() => {});
-    return modelCache.models;
+// (concurrent callers share one in-flight probe). Returns empty lists only if a cold probe fails,
+// so the endpoint can fall back to its config list.
+export async function getCapabilities(): Promise<AppCapabilities> {
+  if (capCache) {
+    if (Date.now() - capCache.at >= MODEL_TTL_MS) void refreshCapabilities().catch(() => {});
+    return capCache.caps;
   }
-  try { return await refreshModels(); } catch { return []; }
+  try { return await refreshCapabilities(); } catch { return EMPTY_CAPS; }
 }
+
+export async function getSupportedModels(): Promise<AppModel[]> { return (await getCapabilities()).models; }
 
 // Appended to the Claude Code system prompt for /app chats so Claude actually USES the chat UI's rich
 // rendering (it otherwise defaults to terminal-style plain text). The UI renders these inline.
@@ -396,7 +425,19 @@ export interface ConvOpts {
   notifier?: AskNotifier; // notify the owner about an unwatched ask_user prompt
   mcpFile?: string; // STATE_DIR/claude-app-mcp.json — persisted MCP servers to connect for this chat
   skills?: string[] | "all"; // which skills this chat may use (the SDK `skills` option); omit for CLI defaults
+  settings?: SessionSettings; // effort / advisor model / fast mode for this chat (the flag settings layer)
 }
+
+// The slice of Claude Code's settings the chat UI lets you set per conversation. These go into the
+// FLAG settings layer, which sits above the user's settings.json and below managed policy — the same
+// layer `claude --settings` uses — so a choice here never rewrites Brandon's own settings file.
+// `effortLevel` also accepts "max", which the CLI treats as session-scoped and never persists.
+export type SessionSettings = {
+  effortLevel?: EffortLevel | null;
+  advisorModel?: string | null;
+  fastMode?: boolean | null;
+  alwaysThinkingEnabled?: boolean | null;
+};
 
 // Metadata for a still-open ask_user prompt, so a reconnecting client can re-render it.
 export type PendingAsk = { askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean };
@@ -503,6 +544,8 @@ export class Conversation {
   private runGen = 0;           // bumped per run() so a superseded run's finally stays quiet
   private inited = false;       // an init event has been seen (the SDK session is live)
   private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
+  settings: SessionSettings = {};   // flag-layer settings for this chat (effort, advisor model, fast mode)
+  private pendingSettings?: SessionSettings; // a settings change waiting for an idle boundary, same as pendingModel
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -512,6 +555,7 @@ export class Conversation {
     this.notifier = opts.notifier;
     this.mcpFile = opts.mcpFile;
     this.skills = opts.skills;
+    if (opts.settings) this.settings = { ...opts.settings };
   }
 
   // fromNow: subscribe to FUTURE events only (no buffer replay). Used when a client reopens a
@@ -651,6 +695,23 @@ export class Conversation {
     const m = this.pendingModel;
     try { await this.q.setModel(m); this.pendingModel = undefined; }
     catch (e: any) { tlog("setmodel-defer", { conv: this.id, msg: String(e?.message || e).slice(0, 80) }); }
+  }
+
+  // Merge a settings patch (effort level, advisor model, fast mode) into this chat. Same shape as
+  // setModel: remembered immediately so the next run starts with it, pushed to a live query at the
+  // next idle boundary. A null value clears the key back to the user's own settings.
+  async setSettings(patch: SessionSettings) {
+    this.settings = { ...this.settings, ...patch };
+    this.pendingSettings = { ...(this.pendingSettings || {}), ...patch };
+    this.emit({ t: "settings", settings: this.settings });
+    if (!this.busy) await this.applyPendingSettings();
+  }
+
+  private async applyPendingSettings() {
+    if (!this.pendingSettings || !this.q || !this.inited || this.closed || this.busy) return;
+    const patch = this.pendingSettings;
+    try { await (this.q as any).applyFlagSettings?.(patch); this.pendingSettings = undefined; }
+    catch (e: any) { tlog("setsettings-defer", { conv: this.id, msg: String(e?.message || e).slice(0, 80) }); }
   }
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
@@ -838,6 +899,9 @@ export class Conversation {
         ...(this.resume ? { resume: this.resume } : {}),
         ...forkOpts,
         ...(this.skills ? { skills: this.skills } : {}), // which skills this chat may use
+        // Effort / advisor model / fast mode for this chat. Same flag layer applyFlagSettings writes
+        // to, so a value chosen mid-turn and one chosen before the first turn end up in one place.
+        ...(Object.keys(this.settings).length ? { settings: this.settings as Record<string, unknown> } : {}),
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
@@ -1045,6 +1109,7 @@ export class Conversation {
         this.setPhase("idle");
         this.apiErrors = 0; // per-turn counter
         void this.applyPendingModel(); // a model change picked mid-turn takes effect now the turn is done
+        void this.applyPendingSettings(); // same for an effort / advisor-model change picked mid-turn
         tlog("done", { conv: this.id, subtype: anyM.subtype, ms: anyM.duration_ms || 0, listeners: this.subs.size });
         this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
         const u = anyM.usage || {};

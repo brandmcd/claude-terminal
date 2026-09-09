@@ -64,7 +64,14 @@ function longPressBind(open: (x: number, y: number) => void) {
 }
 
 // #region types
-type Model = { id: string; label: string; description?: string };
+type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+type Model = { id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean; supportedEffortLevels?: EffortLevel[] };
+// A slash command the CLI accepts, from its own `supportedCommands()` list — the same set `/` offers
+// in a terminal tab. Picking one puts "/name" in the composer; the CLI runs it instead of a turn.
+type Command = { name: string; description?: string; argumentHint?: string; aliases?: string[] };
+type Agent = { name: string; description?: string };
+// The settings the chat can set per conversation. Mirrors SessionSettings in app-runner.ts.
+type SessionSettings = { effortLevel?: EffortLevel | null; advisorModel?: string | null; fastMode?: boolean | null; alwaysThinkingEnabled?: boolean | null };
 type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean; queuedText?: string };
 type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
@@ -92,6 +99,7 @@ type AppEvent =
   | { t: "block_end"; bid: string; _seq?: number }                     // a streamed block finished (exact end of a thinking timer)
   | { t: "context"; used: number; max?: number; _seq?: number }        // context occupancy, from the usage on each assistant message
   | { t: "model"; model: string; _seq?: number }                       // the model this conversation runs on
+  | { t: "settings"; settings: SessionSettings; _seq?: number }         // effort / advisor model / fast mode for this conversation
   | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string; _seq?: number }; // a background subagent finished
 type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
@@ -230,7 +238,7 @@ const api = {
   convMeta: (id: string) => withTimeout(fetch(`/app/api/conversation/${encodeURIComponent(id)}?meta=1`).then(J)),
   conversation: (id: string, since?: number) =>
     withTimeout(fetch(`/app/api/conversation/${encodeURIComponent(id)}${since && since > 0 ? `?since=${since}` : ""}`).then(J)),
-  start: (b: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean }) =>
+  start: (b: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean; settings?: SessionSettings }) =>
     fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
     fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
@@ -238,6 +246,8 @@ const api = {
     fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   setModel: (b: { id: string; model: string }) =>
     fetch("/app/api/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+  setSettings: (b: { id: string } & SessionSettings) =>
+    fetch("/app/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   interrupt: (id: string) => fetch("/app/api/interrupt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }),
   upload: (id: string | null, file: File) => {
     const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
@@ -471,6 +481,7 @@ class ConvStore {
   phaseSince = 0;
   phaseDetail: string | undefined = undefined;
   model: string | null = null;  // what THIS conversation runs on (init / model events / replay), not the picker default
+  settings: SessionSettings = {}; // effort / advisor model / fast mode for THIS conversation
   ctx: { used: number; max?: number } | null = null; // context occupancy from the stream; the ring reads this
   busy = false;
   cwd: string | null = null;
@@ -574,6 +585,7 @@ class ConvStore {
       }
       case "context": this.ctx = { used: e.used, max: e.max ?? this.ctx?.max }; this.signal(); this.mgr.hooks?.onContext(this); return;
       case "model": this.model = e.model; this.signal(); return;
+      case "settings": this.settings = e.settings || {}; this.signal(); return;
       case "busy": if (this.busy !== e.busy) { this.busy = e.busy; if (!e.busy) { this.items = freezeOpen(this.items); this.touch(); } else this.signal(); } return;
       case "compacting":
         this.compacting = e.active; this.compactStart = e.active ? (this.compactStart || Date.now()) : 0; this.signal(); return;
@@ -1216,6 +1228,11 @@ function App() {
   const [models, setModels] = useState<Model[]>([]);
   const [moreModels, setMoreModels] = useState<Model[]>([]);
   const [otherOpen, setOtherOpen] = useState(false);
+  // The CLI's own slash commands and subagents, for the composer's command menu.
+  const [commands, setCommands] = useState<Command[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [cmdFilter, setCmdFilter] = useState("");
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [defaultCwd, setDefaultCwd] = useState<string>("");
@@ -1239,6 +1256,10 @@ function App() {
   // switching to a conversation that runs on another model shows that model, and picking one inside a
   // conversation changes that conversation alone.
   const [defaultModel, setDefaultModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
+  // Effort for chats that do not have their own yet. Same shape as ct-app-model: a remembered default
+  // here, a per-conversation override on the store once a chat is live. "" means "leave it to the
+  // CLI's own setting" rather than forcing a level.
+  const [defaultEffort, setDefaultEffort] = useState<string>(() => localStorage.getItem("ct-app-effort") || "");
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
   const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
@@ -1329,9 +1350,17 @@ function App() {
   const highlightRef = useRef<string>(""); // when set, scroll to + flash the first message containing it
   const activeIdRef = useRef<string | null>(null); // latest activeId for stable callbacks (voice)
   const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
+  const effortRef = useRef<string>(""); // ditto for the effort default a NEW chat starts on
   const voiceSinks = useRef<Set<(e: AppEvent) => void>>(new Set()); // voice-mode event subscribers
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { modelRef.current = defaultModel; }, [defaultModel]); // what a NEW chat starts on
+  useEffect(() => { effortRef.current = defaultEffort; }, [defaultEffort]);
+  // The settings a start request carries: a live chat's own, else the remembered default. Undefined
+  // when nothing is chosen, so the server leaves the CLI's own effortLevel alone.
+  const startSettings = (s: ConvStore): SessionSettings | undefined => {
+    const eff = s.id.startsWith("new-") ? effortRef.current : (s.settings.effortLevel || effortRef.current);
+    return eff ? { effortLevel: eff as EffortLevel } : undefined;
+  };
 
   const nextOffsetRef = useRef(0);
   const loadingMoreRef = useRef(false);
@@ -1493,7 +1522,7 @@ function App() {
     // or flaky link shows your chats immediately instead of an empty sidebar until the network answers.
     // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
     void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id);
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setCommands(d.commands || []); setAgents(d.agents || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id);
       // "?voice=1" opens straight into voice mode. The terminal's tab bar links here so a
       // voice session is one tap from the terminal rather than open-app-then-find-the-mic.
       // Gated on d.voice for the same reason the mic button is: without the services the
@@ -1891,7 +1920,7 @@ function App() {
       for (const { store: s, text } of take) {
         const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
         s.addOptimisticUser(text, cid); // now renders below the compaction divider (card already applied)
-        const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: (s.id.startsWith("new-") ? modelRef.current : s.model) || undefined, cwd: cwdRef.current || undefined };
+        const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: (s.id.startsWith("new-") ? modelRef.current : s.model) || undefined, cwd: cwdRef.current || undefined , settings: startSettings(s) };
         try { if (s.connected) await api.send({ id: s.id, text, cid }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
         catch { await offline.enqueueSend(body); void refreshQueue(); }
       }
@@ -2084,7 +2113,7 @@ function App() {
     // instead of posting the same turn twice, and so the server's echo of this turn matches it exactly.
     const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
     s!.addOptimisticUser(text, cid); // renders the turn, flips busy, sets sendState "sending"
-    const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: (s!.id.startsWith("new-") ? modelRef.current : s!.model) || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined };
+    const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: (s!.id.startsWith("new-") ? modelRef.current : s!.model) || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined , settings: startSettings(s!) };
     const queue = async () => {
       await offline.enqueueSend(body); offline.requestBackgroundSync(); offline.queueCount().then(setQueued);
       // A chat STARTED offline has no server id yet, so it wouldn't show anywhere. Drop a local
@@ -2296,6 +2325,43 @@ function App() {
     setDefaultModel(m); localStorage.setItem("ct-app-model", m); // new-chat page: the default for future chats
   };
 
+  // Effort follows the same rule as the model: a live chat gets it applied to that chat, the new-chat
+  // page sets the remembered default. Passing "" clears the override so the CLI's own effortLevel
+  // applies again.
+  const onPickEffort = async (level: string) => {
+    const s = activeStoreRef.current;
+    if (s && !s.id.startsWith("new-") && !s.id.startsWith("pending-")) {
+      s.settings = { ...s.settings, effortLevel: (level || null) as EffortLevel | null }; s.signal();
+      if (s.connected) { try { await api.setSettings({ id: s.id, effortLevel: (level || null) as EffortLevel | null }); } catch { /* not live: the next send carries it */ } }
+      return;
+    }
+    setDefaultEffort(level);
+    if (level) localStorage.setItem("ct-app-effort", level); else localStorage.removeItem("ct-app-effort");
+  };
+
+  // Put a command in the composer and leave the send to the user, exactly as typing "/name" in a
+  // terminal still needs a return. Slash commands are ordinary prompt text: the CLI intercepts a
+  // leading "/name" and runs the command instead of starting a turn, so this is only text insertion.
+  const pickCommand = (c: Command) => {
+    setCmdOpen(false);
+    const text = `/${c.name}` + (c.argumentHint ? " " : "");
+    setInput(text);
+    requestAnimationFrame(() => {
+      const ta = taRef.current; if (!ta) return;
+      ta.focus(); ta.setSelectionRange(text.length, text.length);
+      ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+    });
+  };
+
+  // Commands matching the palette's filter, name first then description, capped so the sheet stays
+  // scrollable rather than endless. Aliases match too — /cost should find /usage.
+  const shownCommands = useMemo(() => {
+    const q = cmdFilter.trim().toLowerCase().replace(/^\//, "");
+    if (!q) return commands;
+    const hit = (c: Command) => c.name.toLowerCase().includes(q) || (c.aliases || []).some((a) => a.toLowerCase().includes(q)) || (c.description || "").toLowerCase().includes(q);
+    return commands.filter(hit).sort((a, b) => Number(b.name.toLowerCase().startsWith(q)) - Number(a.name.toLowerCase().startsWith(q)));
+  }, [commands, cmdFilter]);
+
   const startRename = () => { if (!activeId) return; setTitleDraft(convs.find((c) => c.sessionId === activeId)?.title || ""); setEditingTitle(true); };
   const saveTitle = async () => {
     const t = titleDraft.trim();
@@ -2350,9 +2416,27 @@ function App() {
   // Desktop: Enter sends, Shift+Enter is a newline. Touch devices (phone/tablet): Enter is always a
   // newline — sending is the dedicated send button, so the on-screen keyboard's return key composes.
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey && !IS_TOUCH) { e.preventDefault(); void doSend(); } };
-  const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => { setInput(e.target.value); const ta = e.target; ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; };
+  const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const v = e.target.value;
+    setInput(v);
+    // A lone "/" in an empty composer means the same thing it does in a terminal: show me the
+    // commands. Only on the very first character, so a path like /srv/... never triggers it.
+    if (v === "/" && commands.length) { setCmdFilter(""); setCmdOpen(true); }
+    const ta = e.target; ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+  };
 
   const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || prettyModel(model);
+  // The picker row the current model resolves to, so the effort choices offered are the ones THIS
+  // model actually accepts. A model can be named by its alias ("opus"), its resolved id
+  // ("claude-opus-5"), or that id with a [1m] long-context suffix — all three mean the same row.
+  const modelRow = useMemo(() => {
+    const bare = (v?: string) => String(v || "").replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
+    const want = bare(model);
+    return [...models, ...moreModels].find((m) => m.id === model) || [...models, ...moreModels].find((m) => bare(m.id) === want || bare(m.resolvedModel) === want);
+  }, [models, moreModels, model]);
+  const effortLevels = modelRow?.supportedEffortLevels || (modelRow?.supportsEffort ? (["low", "medium", "high", "xhigh", "max"] as EffortLevel[]) : []);
+  // Effort in force here: this conversation's own if it has one, else the remembered new-chat default.
+  const activeEffort = (activeStore && !activeStore.id.startsWith("new-") ? activeStore.settings.effortLevel : defaultEffort) || "";
   // Collapsed pill: drop any "(…)" qualifier so it stays short and single-line (e.g. "Default
   // (recommended)" -> "Default"). The dropdown row keeps the full name + description.
   const modelBtnLabel = modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel;
@@ -2477,6 +2561,35 @@ function App() {
                 </button>
               ))}
             </div>
+          </div>
+        </div>
+      )}
+      {cmdOpen && (
+        <div className="modal-scrim" onClick={() => setCmdOpen(false)}>
+          <div className="modal cmd-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">Commands<button className="modal-x" onClick={() => setCmdOpen(false)} aria-label="Close">×</button></div>
+            <div className="cmd-search">
+              <input
+                autoFocus={!IS_TOUCH}
+                value={cmdFilter}
+                onChange={(e) => setCmdFilter(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && shownCommands[0]) { e.preventDefault(); pickCommand(shownCommands[0]); } if (e.key === "Escape") setCmdOpen(false); }}
+                placeholder="Search commands"
+                aria-label="Search commands"
+              />
+            </div>
+            <div className="modal-list cmd-list">
+              {shownCommands.map((c) => (
+                <button key={c.name} className="cmd-row" onClick={() => pickCommand(c)}>
+                  <span className="cmd-name">/{c.name}{c.argumentHint && <span className="cmd-args"> {c.argumentHint}</span>}</span>
+                  {c.description && <span className="cmd-desc">{c.description}</span>}
+                </button>
+              ))}
+              {!shownCommands.length && <div className="cmd-empty">No command matches “{cmdFilter}”.</div>}
+            </div>
+            {agents.length > 0 && (
+              <div className="cmd-foot">{agents.length} subagents available — name one in a prompt, or use /list-agents.</div>
+            )}
           </div>
         </div>
       )}
@@ -2697,6 +2810,13 @@ function App() {
               <button className="act-btn" onClick={() => setConnOpen(true)} title="Connections — MCP servers, skills, memory, network">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M9 7V4a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v3M15 7V4a1 1 0 0 0-1-1M7 7h10l-.6 9a3 3 0 0 1-3 2.8H10.6a3 3 0 0 1-3-2.8L7 7z" /><path d="M12 18v3" /></svg>
               </button>
+              {/* The CLI's slash commands. On a phone Enter is a newline, so typing "/" is not enough
+                  of an affordance on its own — this button opens the same list. */}
+              {commands.length > 0 && (
+                <button className="act-btn" onClick={() => { setCmdFilter(""); setCmdOpen(true); }} title="Commands — everything / offers in a terminal">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round"><path d="M14 4L10 20" /></svg>
+                </button>
+              )}
               <div className="spacer" />
               {dictation.available && (
                 <button
@@ -2740,6 +2860,19 @@ function App() {
                     </button>
                   ))}
                   {moreModels.length > 0 && <button className="model-other" onClick={() => { setMenuOpen(false); setOtherOpen(true); }}>Other versions…</button>}
+                  {/* Effort, for models that take it. "Auto" clears the override and lets the CLI's own
+                      effortLevel apply, which is not the same as picking medium. */}
+                  {effortLevels.length > 0 && (
+                    <div className="effort-block">
+                      <div className="effort-label">Reasoning effort</div>
+                      <div className="effort-row">
+                        <button className={activeEffort === "" ? "on" : ""} onClick={() => onPickEffort("")}>Auto</button>
+                        {effortLevels.map((lv) => (
+                          <button key={lv} className={activeEffort === lv ? "on" : ""} onClick={() => onPickEffort(lv)}>{lv === "xhigh" ? "X-high" : lv[0].toUpperCase() + lv.slice(1)}</button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -2801,5 +2934,31 @@ function App() {
     </div>
   );
 }
+
+// Pin --app-h (which #root and the mobile sidebar are sized to) to the VISUAL viewport, the part of
+// the page not covered by the on-screen keyboard. An installed iOS PWA does not shrink the layout
+// viewport when the keyboard opens; it scrolls the document instead, which slid the top bar off the
+// screen and buried the composer behind the keys. Sizing to the visual viewport and undoing that
+// scroll keeps the composer sitting on the keyboard and the top bar where it belongs.
+//
+// Pinch-zoom also shrinks the visual viewport, so a zoomed-in reader would otherwise see the layout
+// collapse under them: while scale > 1 the last unzoomed height is kept.
+function trackViewportHeight(): void {
+  const vv = window.visualViewport;
+  const apply = () => {
+    if (vv && vv.scale > 1.01) return; // pinch-zoomed: leave the layout at its unzoomed size
+    const h = Math.round(vv ? vv.height : window.innerHeight);
+    document.documentElement.style.setProperty("--app-h", `${h}px`);
+    // Nothing on the page is meant to scroll (body is position:fixed), so a non-zero scroll is iOS
+    // having pushed the document up to reveal the focused input. With the app already sized to fit,
+    // that offset is pure damage.
+    if (window.scrollY !== 0 || window.scrollX !== 0) window.scrollTo(0, 0);
+  };
+  apply();
+  if (vv) { vv.addEventListener("resize", apply); vv.addEventListener("scroll", apply); }
+  window.addEventListener("orientationchange", () => setTimeout(apply, 250));
+  window.addEventListener("resize", apply);
+}
+trackViewportHeight();
 
 createRoot(document.getElementById("root")!).render(<App />);

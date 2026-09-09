@@ -29,7 +29,13 @@ body {
   font-size: 15px; line-height: 1.6; -webkit-font-smoothing: antialiased;
   position: fixed; inset: 0; width: 100%;
 }
-#root { height: 100%; }
+/* --app-h is the VISUAL viewport height, written by main.tsx from window.visualViewport. In an
+   installed iOS PWA the layout viewport does not shrink when the on-screen keyboard opens — Safari
+   scrolls the document under the keyboard instead, which pushed the composer off-screen and left
+   the top bar scrolled out of reach. Sizing the app to the visual viewport keeps the composer sitting
+   on top of the keyboard. 100% is the fallback wherever the API is missing (it behaves correctly on
+   desktop and Android). */
+#root { height: var(--app-h, 100%); }
 button { font-family: inherit; cursor: pointer; }
 a { color: var(--accent-2); }
 
@@ -41,7 +47,7 @@ a { color: var(--accent-2); }
   border-right: 1px solid var(--line-2); display: flex; flex-direction: column;
   transition: transform .22s ease;
 }
-.sb-head { padding: 14px 12px 8px; display: flex; align-items: center; gap: 8px; }
+.sb-head { padding: calc(14px + env(safe-area-inset-top)) 12px 8px; display: flex; align-items: center; gap: 8px; }
 .brand { font-weight: 600; font-size: 16px; letter-spacing: -.01em; color: var(--text); flex: 1; padding-left: 4px; }
 .new-chat {
   display: flex; align-items: center; gap: 9px; width: calc(100% - 24px); margin: 4px 12px 8px;
@@ -130,7 +136,8 @@ a { color: var(--accent-2); }
 /* ---------- main ---------- */
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 .topbar {
-  height: 52px; flex: 0 0 52px; display: flex; align-items: center; gap: 10px; padding: 0 14px;
+  height: calc(52px + env(safe-area-inset-top)); flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  padding: env(safe-area-inset-top) 14px 0;
   border-bottom: 1px solid var(--line-2); background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: blur(8px); position: sticky; top: 0; z-index: 5;
 }
@@ -472,7 +479,7 @@ a { color: var(--accent-2); }
 /* ---------- mobile ---------- */
 @media (max-width: 820px) {
   .icon-btn { display: inline-flex; }
-  .sidebar { position: fixed; z-index: 40; height: 100dvh; transform: translateX(-100%); box-shadow: 0 0 40px rgba(0,0,0,.5); }
+  .sidebar { position: fixed; z-index: 40; height: var(--app-h, 100dvh); transform: translateX(-100%); box-shadow: 0 0 40px rgba(0,0,0,.5); }
   .app.drawer-open .sidebar { transform: translateX(0); }
   .app.drawer-open .scrim { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 35; }
   .thread { padding: 18px 14px; }
@@ -487,3 +494,53 @@ a { color: var(--accent-2); }
 /* KaTeX math: let a wide display equation scroll instead of overflowing the bubble; flag render errors. */
 .md .katex-display{overflow-x:auto;overflow-y:hidden;padding:2px 0;max-width:100%}
 .md .math-err{color:var(--danger,#f87171);font-family:ui-monospace,monospace;font-size:.9em}
+
+/* ---------- reasoning effort ---------- */
+/* A segmented row at the foot of the model menu. Only rendered for a model whose picker row reports
+   supportedEffortLevels, so Haiku (which takes none) does not show a dead control. */
+.effort-block { border-top: 1px solid var(--line-2); margin-top: 4px; padding: 8px 4px 4px; }
+.effort-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; padding: 0 6px 6px; }
+.effort-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.model-menu .effort-row button {
+  width: auto; flex: 1 1 auto; justify-content: center; padding: 6px 9px; font-size: 12px;
+  background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; color: var(--text-2); white-space: nowrap;
+}
+.model-menu .effort-row button:hover { color: var(--text); border-color: #4a413a; }
+.model-menu .effort-row button.on { background: var(--accent); border-color: var(--accent); color: #1a1613; font-weight: 600; }
+
+/* ---------- command palette ---------- */
+.cmd-modal { max-width: 520px; }
+.cmd-search { padding: 10px 12px 6px; border-bottom: 1px solid var(--line-2); }
+.cmd-search input {
+  width: 100%; padding: 9px 11px; background: var(--bg-3); border: 1px solid var(--line);
+  border-radius: 9px; color: var(--text); font: inherit; font-size: 14px; outline: none;
+}
+.cmd-search input:focus { border-color: #55493f; }
+.cmd-list { max-height: 52vh; }
+.modal-list button.cmd-row { flex-direction: column; align-items: stretch; gap: 2px; }
+.cmd-name { font-family: var(--mono); font-size: 13px; color: var(--text); }
+.cmd-args { color: var(--text-3); font-weight: 400; }
+.cmd-desc { font-size: 12px; color: var(--text-3); line-height: 1.4; white-space: normal; }
+.cmd-empty { padding: 18px 12px; text-align: center; font-size: 13px; color: var(--text-3); }
+.cmd-foot { border-top: 1px solid var(--line-2); padding: 9px 14px; font-size: 12px; color: var(--text-3); }
+
+/* ---------- touch devices ---------- */
+/* iOS Safari zooms the page whenever a focused input's font-size is under 16px, and it never zooms
+   back out. That is the "everything jumps and the zoom is wrong" on an iPhone: focusing the composer
+   scaled the layout viewport, which also shifts the top bar out from under the safe-area inset. 16px
+   everywhere a caret can land is the whole fix — maximum-scale=1 would "work" by disabling pinch
+   zoom for good, which is worse. */
+@media (pointer: coarse) {
+  .composer textarea,
+  .topbar-title-input,
+  .sb-search input,
+  .settings-select,
+  input[type="text"], input[type="search"], input[type="url"], input[type="number"], input[type="password"], textarea, select {
+    font-size: 16px;
+  }
+  /* Sheets and popups sit inside the safe area rather than under the island or the home indicator. */
+  .modal-scrim { padding: calc(20px + env(safe-area-inset-top)) 16px calc(20px + env(safe-area-inset-bottom)); }
+  .modal { max-height: calc(var(--app-h, 100dvh) - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 40px); }
+  /* Bigger tap targets on the row-style menus — 34px squares are hard to hit accurately. */
+  .model-menu .model-row, .cmd-row { padding-top: 11px; padding-bottom: 11px; }
+}
