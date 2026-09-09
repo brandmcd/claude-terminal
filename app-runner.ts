@@ -86,7 +86,10 @@ export type AppEvent =
   // Context window occupancy, from the usage the API reports on every assistant message. One source.
   | { t: "context"; used: number; max?: number }
   // The model this conversation runs on: at init, and whenever it is switched.
-  | { t: "model"; model: string };
+  | { t: "model"; model: string }
+  // A background subagent finished. Its Task tool_result was only a launch ack, so without this the
+  // card said "Running" forever after the work was done.
+  | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string };
 
 export type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
@@ -99,6 +102,11 @@ export type TurnUsage = { input: number; output: number; thinking: number; cache
 export type RewindInfo = { canRewind?: boolean; error?: string; filesChanged?: string[]; insertions?: number; deletions?: number };
 
 type Sub = (e: AppEvent) => void;
+// Max concurrent SSE subscribers per conversation before the oldest is evicted. No real client holds
+// more than a handful (one per open tab/device); anything past this is leaked reconnections that a
+// proxy never reported as closed. Generous enough for every legitimate viewer, low enough that a leak
+// can never make the server fan every token out to a hundred dead sockets.
+const SUBS_CAP = 12;
 // #endregion
 
 // #region dictation cleanup
@@ -470,7 +478,12 @@ export class Conversation {
   private lastTurnAt = 0; // wall clock of the previous turn, for the turn-context stamp below
   private apiErrors = 0; // retried API failures in the CURRENT turn (reset at each result)
   private closed = false;
-  private subs = new Set<Sub>();
+  // Each SSE subscriber, with when it attached and how to shut its stream. A Map (not a Set) so the
+  // oldest can be evicted when a conversation accumulates too many — see SUBS_CAP. Behind a proxy that
+  // holds the upstream connection open (Zoraxy), a client that reloads or navigates away leaves its
+  // subscriber alive until the stream's own lifetime expires, so without a cap the count climbs into
+  // the hundreds and every event is written to every dead socket.
+  private subs = new Map<Sub, { at: number; evict?: () => void }>();
   private hooks = new Set<Sub>(); // internal lifecycle listeners (init/closed bookkeeping); do NOT count as client subscribers, or the idle reaper never fires
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
   private pendingAsks = new Map<string, (answer: string) => void>(); // ask_user awaiting a tap
@@ -489,6 +502,7 @@ export class Conversation {
   private forkNext = false;     // one-shot: the next run() should fork the session (edit-and-rerun)
   private runGen = 0;           // bumped per run() so a superseded run's finally stays quiet
   private inited = false;       // an init event has been seen (the SDK session is live)
+  private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -503,8 +517,8 @@ export class Conversation {
   // fromNow: subscribe to FUTURE events only (no buffer replay). Used when a client reopens a
   // live conversation and has already rebuilt the current turn from the transcript + pending
   // asks, so replaying the buffer would double-render it.
-  subscribe(fn: Sub, fromNow = false): () => void {
-    this.subs.add(fn);
+  subscribe(fn: Sub, fromNow = false, evict?: () => void): () => void {
+    this.addSub(fn, evict);
     // Replay only the CURRENT turn (from the last turn boundary), so a client that reopens
     // an already-live conversation doesn't get every prior turn re-injected. The client has
     // the earlier turns from the transcript, and _seq dedupe covers mid-turn reconnects.
@@ -518,10 +532,25 @@ export class Conversation {
   // "future only" and every event emitted during the gap is lost for good — which is how a one-shot
   // event like the compaction card disappears while the streamed text around it looks fine. Safe to
   // over-deliver: the client drops anything whose _seq it has already seen.
-  subscribeSince(fn: Sub, sinceSeq: number): () => void {
-    this.subs.add(fn);
+  subscribeSince(fn: Sub, sinceSeq: number, evict?: () => void): () => void {
+    this.addSub(fn, evict);
     for (const e of this.log) { const s = (e as any)._seq; if (typeof s === "number" && s > sinceSeq) fn(e); }
     return () => this.subs.delete(fn);
+  }
+
+  // Register a subscriber and, if this conversation now has more than SUBS_CAP, evict the OLDEST.
+  // A single client keeps one stream per conversation, so a two-figure count is always leaked
+  // reconnections a proxy never told us had closed; dropping the oldest reclaims them without
+  // touching anyone actually watching (their stream reconnects and resumes from its cursor anyway).
+  private addSub(fn: Sub, evict?: () => void) {
+    this.subs.set(fn, { at: Date.now(), evict });
+    if (this.subs.size <= SUBS_CAP) return;
+    const oldest = [...this.subs.entries()].sort((a, b) => a[1].at - b[1].at);
+    for (let i = 0; i < oldest.length - SUBS_CAP; i++) {
+      const [f, meta] = oldest[i];
+      this.subs.delete(f);
+      try { meta.evict?.(); } catch {}
+    }
   }
 
   // Internal lifecycle listener (session-id registration, close bookkeeping). Unlike subscribe(),
@@ -542,7 +571,7 @@ export class Conversation {
     // client must not look idle to the sweeper (it only used to be bumped on send()).
     this.log.push(e);
     if (this.log.length > 5000) { const drop = this.log.length - 5000; this.log.splice(0, drop); this.runStart = Math.max(0, this.runStart - drop); }
-    for (const s of this.subs) {
+    for (const s of this.subs.keys()) {
       try { s(e); } catch {}
     }
     for (const s of this.hooks) {
@@ -603,10 +632,25 @@ export class Conversation {
     else this.queue.push(msg);
   }
 
+  // Change the model for THIS conversation. The SDK's live setModel writes to the query's control
+  // transport, which is NOT writable mid-turn ("ProcessTransport is not ready for writing"): calling
+  // it while a turn streams both threw AND wedged the query, so the turn never answered. So never push
+  // it live during a turn. Record it, reflect it in the UI immediately, and apply it at the next idle
+  // boundary (applyPendingModel, called from the result handler). Applied now only if already idle.
   async setModel(model: string) {
     this.model = model;
-    if (this.q) { try { await this.q.setModel(model); } catch (e: any) { this.emit({ t: "error", message: "setModel: " + (e?.message || e) }); return; } }
-    this.emit({ t: "model", model }); // every device watching this chat shows the switch, not just the one that made it
+    this.pendingModel = model;
+    this.emit({ t: "model", model }); // every device watching this chat shows the switch right away
+    if (!this.busy) await this.applyPendingModel();
+  }
+  // Push a queued model change to the live query. Only safe when the query is up and idle. On the
+  // transient "not ready" error it stays pending and is retried at the next idle boundary; it is never
+  // surfaced as a thread error, because a control-plane hiccup is not something the user said.
+  private async applyPendingModel() {
+    if (!this.pendingModel || !this.q || !this.inited || this.closed || this.busy) return;
+    const m = this.pendingModel;
+    try { await this.q.setModel(m); this.pendingModel = undefined; }
+    catch (e: any) { tlog("setmodel-defer", { conv: this.id, msg: String(e?.message || e).slice(0, 80) }); }
   }
 
   async interrupt() { try { await (this.q as any)?.interrupt?.(); } catch {} }
@@ -893,6 +937,7 @@ export class Conversation {
         else if (anyM.subtype === "task_notification") {
           const extra = anyM.usage ? ` (${anyM.usage.total_tokens || 0} tokens, ${anyM.usage.tool_uses || 0} tools)` : "";
           this.emit({ t: "notice", kind: "task", text: String(anyM.summary || "background task") + extra, status: String(anyM.status || "done") });
+          if (anyM.tool_use_id) this.emit({ t: "agent_done", id: String(anyM.tool_use_id), status: anyM.status || "completed", summary: anyM.summary ? String(anyM.summary).slice(0, 400) : undefined });
         }
         else if (anyM.subtype === "notification") {
           const isPeer = anyM.triggeredBy === "peer-send-message" || anyM.provenance === "peer-send-message";
@@ -999,6 +1044,7 @@ export class Conversation {
         // only the client knows what it has not seen echoed back yet.
         this.setPhase("idle");
         this.apiErrors = 0; // per-turn counter
+        void this.applyPendingModel(); // a model change picked mid-turn takes effect now the turn is done
         tlog("done", { conv: this.id, subtype: anyM.subtype, ms: anyM.duration_ms || 0, listeners: this.subs.size });
         this.armRateLimitedResume(); // if this turn was rejected by the limit, queue an auto-resume
         const u = anyM.usage || {};
@@ -1254,6 +1300,8 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         // output/thinking = cumulative turn totals so the footer matches what was shown live.
         out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output: turnOut, thinking: turnThink, cacheCreate, cacheRead, context, total: context + turnOut, costUsd: 0, durationMs } });
       }
+    } else if (o.type === "system" && o.subtype === "task_notification" && o.tool_use_id) {
+      out.push({ t: "agent_done", id: String(o.tool_use_id), status: o.status || "completed", summary: o.summary ? String(o.summary).slice(0, 400) : undefined });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
       turnOut = 0; turnThink = 0; turnStartTs = 0; // compaction is a fresh turn boundary
       const md = compactMeta(o); // transcript spells it compactMetadata/camelCase, the live SDK compact_metadata/snake_case

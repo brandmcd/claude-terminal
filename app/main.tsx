@@ -4,6 +4,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
+import { extractMath } from "./mathrender";
 import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { useDictation } from "./dictation";
 import { AskCard } from "./askcard";
@@ -41,14 +42,19 @@ const saveDraft = (id: string | null, v: string) => { try { if (v.trim()) localS
 
 // Long-press (touch, ~500ms, cancelled on scroll) or right-click (desktop) → open a context menu at
 // (x, y). Returns handlers to spread onto the target element.
+// A right-click / long-press on an IMAGE must fall through to the browser's own menu (Copy image,
+// Save image as) instead of our text menu — the images are served inline, so native save works.
+const isImageTarget = (t: EventTarget | null) => (t as HTMLElement | null)?.tagName === "IMG";
+
 function longPressBind(open: (x: number, y: number) => void) {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let sx = 0, sy = 0, fired = false, firedAt = 0;
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   return {
-    onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); open(e.clientX, e.clientY); },
-    // 600ms hold, cancelled by any real movement (a scroll or a normal tap never opens the menu).
-    onTouchStart: (e: React.TouchEvent) => { const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy); }, 600); },
+    onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); open(e.clientX, e.clientY); },
+    // 600ms hold, cancelled by any real movement (a scroll or a normal tap never opens the menu). On
+    // an image the hold is left to the browser so its native "save image" sheet can open.
+    onTouchStart: (e: React.TouchEvent) => { if (isImageTarget(e.target)) return; const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy); }, 600); },
     onTouchMove: (e: React.TouchEvent) => { const t = e.touches[0]; if (t && (Math.abs(t.clientX - sx) > 8 || Math.abs(t.clientY - sy) > 8)) clear(); },
     onTouchEnd: (e: React.TouchEvent) => { clear(); if (fired) e.preventDefault(); },
     onTouchCancel: clear,
@@ -85,7 +91,8 @@ type AppEvent =
   | { t: "status"; phase: Phase; since: number; detail?: string; _seq?: number } // what the runner is doing, from the SDK's own events
   | { t: "block_end"; bid: string; _seq?: number }                     // a streamed block finished (exact end of a thinking timer)
   | { t: "context"; used: number; max?: number; _seq?: number }        // context occupancy, from the usage on each assistant message
-  | { t: "model"; model: string; _seq?: number };                      // the model this conversation runs on
+  | { t: "model"; model: string; _seq?: number }                       // the model this conversation runs on
+  | { t: "agent_done"; id: string; status: "completed" | "failed" | "stopped"; summary?: string; _seq?: number }; // a background subagent finished
 type Phase = "starting" | "waiting" | "thinking" | "writing" | "tool" | "retrying" | "limited" | "compacting" | "idle";
 
 type TurnUsage = { input: number; output: number; thinking: number; cacheCreate: number; cacheRead: number; context: number; total: number; costUsd: number; durationMs: number };
@@ -98,11 +105,38 @@ type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string; usage?: TurnUsage; bid?: string }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
-  | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string } }
+  | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }; done?: "completed" | "failed" | "stopped" }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
   | { kind: "notice"; noticeKind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
   | { kind: "compact"; savedTokens?: number; durationMs?: number; pctBefore?: number; pctAfter?: number };
 // #endregion
+
+// The model the CLI/SDK reports for a conversation is the RESOLVED id (claude-fable-5-1), but a
+// picker entry can carry a context-window suffix (claude-fable-5-1[1m]), so an exact id compare
+// misses and the selector shows the raw id instead of highlighting the right row. Match on the base
+// id (before any "[...]") and return the picker's own id. Unknown, or the list not loaded yet -> unchanged.
+const baseModelId = (id: string) => id.replace(/\[[^\]]*\]$/, "");
+function canonicalModelId(reported: string, list: { id: string }[]): string {
+  if (!reported || !list.length) return reported;
+  if (list.some((m) => m.id === reported)) return reported;
+  const base = baseModelId(reported);
+  const hit = list.find((m) => baseModelId(m.id) === base);
+  return hit ? hit.id : reported;
+}
+// A friendly name for a model the picker list does not carry. The dynamic list from the CLI is only
+// the handful of current models, so a conversation that last ran on, say, claude-opus-5 had no row to
+// match and the pill showed the raw id — which looks broken. Turn "claude-opus-5" into "Opus 5",
+// "claude-opus-4-8" into "Opus 4.8", dropping a claude- prefix and any trailing yyyymmdd date.
+function prettyModel(id: string): string {
+  if (!id) return "Model";
+  let t = id.replace(/^claude-/, "").replace(/\[[^\]]*\]$/, "").replace(/-\d{8}$/, "");
+  if (t === "default") return "Default";
+  const parts = t.split("-");
+  const fam = parts.shift() || t;
+  const family = fam.charAt(0).toUpperCase() + fam.slice(1);
+  const version = parts.join(".");
+  return version ? `${family} ${version}` : family;
+}
 
 // #region api
 const J = (r: Response) => r.json();
@@ -277,9 +311,9 @@ let activeCtxMax = DEFAULT_CTX;
 
 // Freeze every live thinking block (one with a start and no end). The normal path is an exact
 // block_end from the stream; this covers the turn ending or the socket dying without one.
-function freezeOpen(items: Item[]): Item[] {
+function freezeOpen(items: Item[], all = false): Item[] {
   let out: Item[] | null = null;
-  for (let i = items.length - 1; i >= 0 && i >= items.length - 20; i--) {
+  for (let i = items.length - 1; i >= 0 && (all || i >= items.length - 20); i--) {
     const it = items[i];
     if (it.kind === "thinking" && it.started && it.elapsed == null) { out = out || items.slice(); out[i] = { ...it, elapsed: Date.now() - it.started }; }
   }
@@ -350,6 +384,13 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
         if (it.kind === "tool" && it.id === e.id) { const c = items.slice(); c[i] = { ...it, progress: { tokens: e.tokens, toolUses: e.toolUses, durationMs: e.durationMs, lastTool: e.lastTool } }; return c; }
       }
       return items; // the Task tool_use card hasn't arrived yet -> ignore
+    }
+    case "agent_done": {
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (it.kind === "tool" && it.id === e.id) { const c = items.slice(); c[i] = { ...it, done: e.status }; return c; }
+      }
+      return items;
     }
     case "tool_result": {
       for (let i = items.length - 1; i >= 0; i--) {
@@ -496,10 +537,14 @@ class ConvStore {
         return;
       }
       this.epoch = e.epoch;
-      // Future-only or full-replay sockets start from the server's current cursor, so the next
-      // reconnect resumes from here. A RESUME socket must not: the replay of the gap is about to
-      // arrive with seqs at or below this, and bumping first would make the dedupe drop it.
-      if (this.connectMode !== "resume") this.seq = Math.max(this.seq, e.seq);
+      // Adopt the server's cursor ONLY on a first connect that has no position yet (seq < 0): a
+      // future-only / full-replay socket, where jumping to the top avoids re-rendering the current
+      // buffer we already hold from the transcript. Once we have ANY position, DON'T touch seq here.
+      // The browser's own EventSource auto-retry reuses the socket (connectMode stays stale) but DOES
+      // send Last-Event-ID, so the server replays the gap right after this hello; bumping to the top
+      // first made every gap event look already-seen and dropped it, cutting the START off a block
+      // that was mid-stream when the socket dropped. Let the replayed events advance seq themselves.
+      if (this.seq < 0) this.seq = e.seq;
       return;
     }
     if (typeof e._seq === "number") { if (e._seq <= this.seq) return; this.seq = e._seq; }
@@ -587,6 +632,9 @@ class ConvStore {
 
   // ---- hydration + reconcile (the cache-vs-network policy) ----
   hydrate(items: Item[], meta: { busy?: boolean; cwd?: string | null; evCount?: number }) {
+    // A thinking timer that was live when the cache was written is stale now, whatever the clock
+    // says: one read "Thinking 382m" the evening after a restart. Freeze every one on the way in.
+    items = freezeOpen(items, true);
     this.items = items; this.cachedItems = items; this.hydrated = true;
     if (meta.busy != null) this.busy = meta.busy;
     if (meta.cwd != null) this.cwd = meta.cwd;
@@ -803,7 +851,7 @@ function rewriteLocalRefs(html: string, convId: string | null): string {
 }
 
 function Assistant({ text, convId }: { text: string; convId?: string | null }) {
-  const html = useMemo(() => rewriteLocalRefs(marked.parse(text || "") as string, convId ?? null), [text, convId]);
+  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId ?? null); }, [text, convId]);
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
@@ -942,18 +990,21 @@ function PhaseLine({ phase, since, detail }: { phase: Phase; since: number; deta
 // Thinking indicator. LIVE: "Thinking… 12s · ~340 tokens" ticking each second. When done we hide
 // the standalone indicator (the turn summary under the final reply carries the totals), unless the
 // platform actually exposed the reasoning text — then we show that.
-function ThinkingCard({ it, isLast }: { it: Extract<Item, { kind: "thinking" }>; isLast: boolean }) {
+function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinking" }>; isLast: boolean; busy: boolean }) {
+  // Live means: last item, no block_end yet, and the conversation is actually busy. Before the third
+  // condition a stale block at the end of a dead turn ticked from its start time forever.
+  const live = isLast && it.elapsed == null && busy;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!isLast) return; // only the live block ticks
+    if (!live) return; // only the live block ticks
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
-  }, [isLast]);
-  if (!isLast) {
+  }, [live]);
+  if (!live) {
     // finished: only worth showing if the reasoning text is exposed (usually redacted on subscription auth)
     return it.text ? (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>) : null;
   }
-  const secs = it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
+  const secs = it.elapsed != null ? Math.round(it.elapsed / 1000) : it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
   const meta = [secs == null ? "" : fmtDur(secs), it.tokens ? `~${it.tokens} tokens` : ""].filter(Boolean).join(" · ");
   return (
     <div className="thinking-live">
@@ -1008,7 +1059,7 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
   );
 }
 
-function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading }: { items: Item[]; i: number; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
+function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy }: { items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
   // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
   // audio actually plays (Kokoro TTS can take a moment), then a subtle "playing" state until it ends.
@@ -1028,7 +1079,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   const menuBind = (text: string, kind: "user" | "assistant"): Record<string, unknown> => {
     if (!onMenu) return {};
     if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y) => onMenu(x, y, text, kind, i)) };
-    return { onContextMenu: (e: React.MouseEvent) => { e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
+    return { onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
   };
   if (it.kind === "user") {
     // A message from another Claude session -> a tidy card, not the raw XML tag.
@@ -1073,7 +1124,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
     return <div className="compact-div">conversation compacted</div>;
   }
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
-  if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} />;
+  if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} busy={!!busy} />;
   if (it.kind === "tool") return isAgentTool(it.name, it.input) ? <div data-agent-id={it.id}><AgentToolCard it={it} /></div> : <ToolCard it={it} />;
   if (it.kind === "notice") {
     if (it.noticeKind === "skill") {
@@ -1128,6 +1179,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
 // turn-final footer), so compare exactly those: during streaming only the tail item changes
 // identity, so only the tail re-renders.
 const MessageBlock = React.memo(MessageBlockInner, (a, b) => {
+  if (a.busy !== b.busy) return false; // a thinking timer's liveness depends on it
   if (a.i !== b.i || a.convId !== b.convId || a.sendStatus !== b.sendStatus || a.reading !== b.reading) return false;
   if (a.onAnswer !== b.onAnswer || a.onMenu !== b.onMenu || a.onOpenArtifact !== b.onOpenArtifact) return false;
   if (a.items === b.items) return true;
@@ -1188,7 +1240,8 @@ function App() {
   // conversation changes that conversation alone.
   const [defaultModel, setDefaultModel] = useState<string>(() => localStorage.getItem("ct-app-model") || "");
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
-  const model = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
+  const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
+  const model = canonicalModelId(rawModel, [...models, ...moreModels]);
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
@@ -1247,6 +1300,7 @@ function App() {
   // truth from an actual 4s request heartbeat: false when requests are failing, which lets the banner
   // show "connection unstable" even while the browser insists it's online.
   const [reachable, setReachable] = useState(true);
+  const netMiss = useRef(0); // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
   const [queued, setQueued] = useState(0);
   const [artifact, setArtifact] = useState<Artifact | null>(null); // the artifact open in the split-screen / sheet viewer
   const [artifactW, setArtifactW] = useState<number>(() => { const v = Number(localStorage.getItem("ct-artifact-w")); return v >= 360 && v <= 1400 ? v : 560; }); // desktop split panel width (px), draggable + persisted
@@ -1487,8 +1541,8 @@ function App() {
   useEffect(() => {
     const pull = () => {
       if (navigator.onLine) api.statuses()
-        .then((d) => { setStatuses(d?.statuses || {}); setReachable(true); })   // a real response = link works
-        .catch(() => setReachable(false));                                       // request failed = link is down despite navigator.onLine
+        .then((d) => { setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); })   // a real response = link works
+        .catch(() => { netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
       void refreshQueue();
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
@@ -2298,7 +2352,7 @@ function App() {
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey && !IS_TOUCH) { e.preventDefault(); void doSend(); } };
   const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => { setInput(e.target.value); const ta = e.target; ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; };
 
-  const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || model || "Model";
+  const modelLabel = [...models, ...moreModels].find((m) => m.id === model)?.label || prettyModel(model);
   // Collapsed pill: drop any "(…)" qualifier so it stays short and single-line (e.g. "Default
   // (recommended)" -> "Default"). The dropdown row keeps the full name + description.
   const modelBtnLabel = modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel;
@@ -2386,7 +2440,7 @@ function App() {
           i = j - 1; continue;
         }
       }
-      nodes.push(<MessageBlock key={i} items={items} i={i} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
+      nodes.push(<MessageBlock key={i} items={items} i={i} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
     }
     return nodes;
   }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, setArtifact]);

@@ -317,14 +317,18 @@ export interface MergedToolItem {
   result?: unknown;
   isError?: boolean;
   progress?: AgentProgress; // live subagent progress merged on by main.tsx (agent_progress event)
+  done?: "completed" | "failed" | "stopped"; // a background agent's task_notification (main.tsx agent_done event)
 }
 
 // Drop-in replacement for <ToolCard> when the tool is a subagent/workflow. main.tsx can, in its
 // item-render switch, check isAgentTool(it.name, it.input) and render this instead of <ToolCard>.
 export function AgentToolCard({ it }: { it: MergedToolItem }) {
   const toolResult = it.result === undefined ? undefined : { content: it.result, isError: it.isError };
-  // `running` is left to the card: it knows a launch ack is not a result.
-  return <AgentActivityCard toolUse={{ id: it.id, name: it.name, input: it.input }} toolResult={toolResult} progress={it.progress} />;
+  // `running` is left to the card (it knows a launch ack is not a result) UNLESS the server has said
+  // the background agent finished: its tool_result was only the ack, so the card would never learn.
+  const running = it.done ? false : undefined;
+  const failed = it.done === "failed" || it.done === "stopped";
+  return <AgentActivityCard toolUse={{ id: it.id, name: it.name, input: it.input }} toolResult={failed && !toolResult ? { content: `Agent ${it.done}.`, isError: true } : toolResult} running={running} progress={it.progress} />;
 }
 // #endregion
 
@@ -514,10 +518,36 @@ function runningLabel(running: SpawnedEntry[]): string {
   return running.length === 1 ? `1 ${noun} running` : `${running.length} ${noun === "spawned" ? noun : noun + "s"} running`;
 }
 
+// How long a finished item lingers in the pinned strip before it lives only in the full-screen list.
+const STRIP_FINISHED_MS = 60 * 60 * 1000; // an hour
+// A finished LOCAL entry (parsed from the thread) may carry no end time. Stamp when we first saw it
+// finished so it still ages out. Module scope so it survives re-renders; a reload re-derives, and by
+// then the server list usually carries a real endedAt anyway.
+const firstSeenFinished = new Map<string, number>();
+function finishedAt(e: SpawnedEntry, now: number): number {
+  if (e.endedAt) return e.endedAt;
+  let t = firstSeenFinished.get(e.key);
+  if (t == null) { t = now; firstSeenFinished.set(e.key, t); }
+  return t;
+}
+
+// Minimized/expanded state for the pinned strip, persisted in localStorage so a fold survives a
+// reload and a turn boundary. A module-level store rather than component state so it does not reset
+// when the list re-renders from a poll.
+const collapsedStrip = {
+  get(): boolean { try { return localStorage.getItem("ct-spawn-collapsed") === "1"; } catch { return false; } },
+  set(v: boolean) { try { localStorage.setItem("ct-spawn-collapsed", v ? "1" : "0"); } catch { /* */ } },
+};
+
 function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[]; onOpen?: (e: SpawnedEntry) => void; onOpenIndex?: () => void }): React.JSX.Element | null {
   injectAgentStripCss();
+  const [, rerender] = useState(0); // toggle minimize -> re-read the persisted flag
+  const now = Date.now();
   const running = entries.filter((e) => e.running);
-  const rest = entries.length - running.length;
+  // Show running work, plus anything finished in the last hour so you actually see it complete. Older
+  // finished work drops out of the pinned strip and stays reachable only in the full list.
+  const shown = entries.filter((e) => e.running || now - finishedAt(e, now) < STRIP_FINISHED_MS);
+  const rest = entries.length - shown.length; // finished + aged out of the strip
   if (!entries.length) return null;
 
   const row = (e: SpawnedEntry) => {
@@ -532,33 +562,44 @@ function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[];
       </>
     );
     const hint = e.kind === "tab" ? `Switch to this conversation — ${e.label}` : `Open this ${KIND_LABEL[e.kind].toLowerCase()} — ${e.label}`;
+    const cls = "as-row" + (e.running ? "" : " as-row-done"); // finished rows dim, so the eye goes to what's live
     return onOpen
-      ? <button className="as-row as-tap" key={e.key} onClick={() => onOpen(e)} title={hint}>{body}</button>
-      : <div className="as-row" key={e.key}>{body}</div>;
+      ? <button className={cls + " as-tap"} key={e.key} onClick={() => onOpen(e)} title={hint}>{body}</button>
+      : <div className={cls} key={e.key}>{body}</div>;
   };
 
-  // Nothing in flight: render NOTHING. The idle "N spawned · review" line sat above the composer
-  // permanently for any conversation that had ever used an agent, which is clutter in the one place
-  // that has to stay small on a phone. Finished work is still reachable: the strip appears while
-  // agents run and its header button opens the full-screen view, which lists finished items too.
-  if (!running.length) return null;
+  // Nothing running AND nothing finished recently: render NOTHING. The idle "N spawned · review" line
+  // used to sit above the composer permanently for any conversation that had ever used an agent, which
+  // is clutter in the one place that has to stay small on a phone. Everything stays reachable through
+  // the header button, which opens the full-screen view that lists finished items too.
+  if (!shown.length) return null;
 
+  const headLabel = running.length ? runningLabel(running) : `${shown.length} recently finished`;
+  // Minimize collapses to the single header line, persisted so it stays that way across turns and
+  // reloads. On a phone the strip sits directly above the composer, so being able to fold it away is
+  // the difference between the thread being usable and not while a big run is in flight.
+  const collapsed = collapsedStrip.get();
+  const toggle = () => { collapsedStrip.set(!collapsed); rerender((n) => n + 1); };
   return (
-    <div className="as-strip" role="status" aria-live="polite">
-      {onOpenIndex ? (
-        <button className="as-head as-head-tap" onClick={onOpenIndex} title="Open the full spawned-work view">
-          <span className="as-spin" aria-hidden="true" />
-          <span className="as-head-label">{runningLabel(running)}</span>
-          {rest > 0 && <span className="as-sub">{rest} finished</span>}
-          <span className="as-chev" aria-hidden="true">›</span>
+    <div className={"as-strip" + (collapsed ? " as-collapsed" : "")} role="status" aria-live="polite">
+      <div className="as-head">
+        {running.length ? <span className="as-spin" aria-hidden="true" /> : null}
+        {onOpenIndex ? (
+          <button className="as-head-open" onClick={onOpenIndex} title="Open the full spawned-work view">
+            <span className="as-head-label">{headLabel}</span>
+            {rest > 0 && <span className="as-sub">{rest} more</span>}
+            <span className="as-chev" aria-hidden="true">›</span>
+          </button>
+        ) : (
+          <span className="as-head-label">{headLabel}</span>
+        )}
+        <button className="as-min" onClick={toggle} title={collapsed ? "Show the list" : "Minimize"} aria-label={collapsed ? "Show the list" : "Minimize"} aria-expanded={!collapsed}>
+          <span className="as-caret" aria-hidden="true" />
         </button>
-      ) : (
-        <div className="as-head">
-          <span className="as-spin" aria-hidden="true" />
-          {runningLabel(running)}
-        </div>
-      )}
-      {running.map(row)}
+      </div>
+      {/* Capped + scrollable: a run with many agents (7+ observed) must not push the composer off
+          the screen. ~3 rows tall, then scroll. Hidden entirely when minimized. */}
+      {!collapsed && <div className="as-rows">{shown.map(row)}</div>}
     </div>
   );
 }
@@ -626,14 +667,22 @@ function injectAgentStripCss() {
   if (stripCssDone || typeof document === "undefined") return;
   stripCssDone = true;
   const css = `
-  .as-strip{max-width:760px;margin:0 auto 8px;padding:9px 12px;background:var(--bg-2,#211c18);border:1px solid var(--line,#3a322c);border-radius:11px;font-size:12.5px}
-  .as-head{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--text-2,#b8afa5);margin-bottom:6px}
-  .as-head-tap{width:100%;background:transparent;border:0;font:inherit;font-weight:600;color:var(--text-2,#b8afa5);text-align:left;cursor:pointer;padding:2px 6px;margin:0 -6px 4px;border-radius:7px;min-height:32px}
-  .as-head-tap:hover,.as-head-tap:focus-visible{background:var(--bg-3,#2a2420);outline:none}
-  .as-head-label{flex:1;min-width:0}
+  .as-strip{max-width:760px;margin:0 auto 8px;padding:7px 12px;background:var(--bg-2,#211c18);border:1px solid var(--line,#3a322c);border-radius:11px;font-size:12.5px}
+  .as-strip.as-collapsed{padding:6px 12px}
+  .as-head{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--text-2,#b8afa5)}
+  .as-strip:not(.as-collapsed) .as-head{margin-bottom:4px}
+  .as-head-open{flex:1;min-width:0;display:flex;align-items:center;gap:7px;background:transparent;border:0;font:inherit;font-weight:600;color:var(--text-2,#b8afa5);text-align:left;cursor:pointer;padding:2px 6px;margin:0 -6px;border-radius:7px;min-height:28px}
+  .as-head-open:hover,.as-head-open:focus-visible{background:var(--bg-3,#2a2420);outline:none}
+  .as-min{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:26px;height:26px;background:transparent;border:0;color:var(--text-3,#8a8078);cursor:pointer;border-radius:7px}
+  .as-min:hover,.as-min:focus-visible{background:var(--bg-3,#2a2420);color:var(--text-2,#b8afa5);outline:none}
+  .as-caret{width:8px;height:8px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(45deg);transition:transform .15s;margin-top:-3px}
+  .as-collapsed .as-caret{transform:rotate(-135deg);margin-top:3px}
+  .as-head-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .as-spin{width:11px;height:11px;border-radius:50%;border:2px solid var(--line,#3a322c);border-top-color:var(--accent,#d97757);animation:as-spin .9s linear infinite;flex:0 0 auto}
   @keyframes as-spin{to{transform:rotate(360deg)}}
-  .as-row{display:flex;align-items:center;gap:8px;padding:3px 0;min-width:0;width:100%}
+  .as-rows{max-height:112px;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;margin:0 -4px;padding:0 4px}
+  .as-row{display:flex;align-items:center;gap:8px;padding:2px 0;min-width:0;width:100%}
+  .as-row-done .as-ic,.as-row-done .as-label{opacity:.55}
   .as-tap{background:transparent;border:0;color:inherit;font:inherit;text-align:left;cursor:pointer;padding:5px 6px;margin:0 -6px;border-radius:7px;min-height:32px}
   .as-tap:hover,.as-tap:focus-visible{background:var(--bg-3,#2a2420);outline:none}
   .as-dot{width:6px;height:6px;border-radius:50%;background:var(--accent,#d97757);flex:0 0 auto}
