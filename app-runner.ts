@@ -901,7 +901,10 @@ export class Conversation {
         ...(this.skills ? { skills: this.skills } : {}), // which skills this chat may use
         // Effort / advisor model / fast mode for this chat. Same flag layer applyFlagSettings writes
         // to, so a value chosen mid-turn and one chosen before the first turn end up in one place.
-        ...(Object.keys(this.settings).length ? { settings: this.settings as Record<string, unknown> } : {}),
+        // Nulls are dropped rather than forwarded: null means "clear this key" to applyFlagSettings
+        // mid-session, but the inline option is a plain Settings object with no null in its type, and
+        // a fresh query has nothing to clear anyway.
+        ...(() => { const f = Object.fromEntries(Object.entries(this.settings).filter(([, v]) => v != null)); return Object.keys(f).length ? { settings: f as Record<string, unknown> } : {}; })(),
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
