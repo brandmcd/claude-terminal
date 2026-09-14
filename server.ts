@@ -256,6 +256,36 @@ function ensureExt() {
 }
 const extKey = (peer: string, user: string) => "ext_" + `${peer}_${user}`.replace(/[^A-Za-z0-9_]/g, "_");
 
+// Per-model output grouped by user and month (UTC), for the weighted-output metric. Prepared
+// lazily: model_usage only exists once a collector carrying that schema has run.
+let qModelMonth: any = null, qModelMonthChecked = false;
+function modelMonthQuery() {
+  if (qModelMonthChecked || !db) return qModelMonth;
+  qModelMonthChecked = true;
+  try {
+    if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get())
+      qModelMonth = db.query(`SELECT user, substr(minute_utc,1,7) AS mk, model, sum(output) AS output
+        FROM model_usage GROUP BY user, mk, model`);
+  } catch { qModelMonth = null; }
+  return qModelMonth;
+}
+// The same figure for external peers, when their export carried per-model detail. Keyed by peer
+// and user so callers can map it onto extKey() the board already uses for those rows.
+let qExtModelMonth: any = null, qExtModelMonthChecked = false;
+function externalModelMonthQuery() {
+  if (qExtModelMonthChecked || !db) return qExtModelMonth;
+  qExtModelMonthChecked = true;
+  try {
+    if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='external_model_usage'").get())
+      qExtModelMonth = db.query(`SELECT peer, user, mk, model, sum(output) AS output
+        FROM external_model_usage GROUP BY peer, user, mk, model`);
+  } catch { qExtModelMonth = null; }
+  return qExtModelMonth;
+}
+// This fork weights output by list price, sonnet-5 output = 1. Filip's board applies its own
+// weight table to the model ids we export, so the export carries ids and raw output, not weights.
+const outputWeight = (model: string) => priceFor(model).output / BASELINE;
+
 // Latest claude.ai subscription rate-limit snapshot (the SHARED session + weekly limit everyone
 // on this box draws down, written by subscription-collector.ts). Prepared lazily because
 // subscription_samples only exists once a collector carrying that schema has run; a vanilla/old
@@ -292,6 +322,10 @@ function latestSubscription() {
 function buildExport() {
   if (!db) return { peer: OWNER, generated_at: new Date().toISOString(), users: [] };
   const cutoff = hourKeyOf(new Date(Date.now() - 45 * 24 * 3600e3));
+  const mmq = modelMonthQuery();
+  const byUserModels: Record<string, { mk: string; model: string; output: number }[]> = {};
+  if (mmq) for (const r of mmq.all() as any[])
+    (byUserModels[r.user] ??= []).push({ mk: r.mk, model: r.model, output: r.output || 0 });
   const users: any[] = [];
   for (const { user } of qUsers.all() as any[]) {
     const cum = (qCum.get(user) as any) || { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 };
@@ -308,12 +342,16 @@ function buildExport() {
       },
       meta: { sessions: meta.sessions || 0, models: meta.models || "[]", last_activity: meta.last_activity || null },
       hourly,
+      // Per-month per-model output, so the puller can weight this row by model instead of
+      // counting every token at 1. A peer reading an export without this block falls back to raw.
+      models: byUserModels[user] || [],
     });
   }
   // exportCombinePeers: fold this instance's external peers into the owner's row, so a
   // puller sees one figure covering every machine the owner runs instead of one row per
   // machine. Off by default -- the no-chaining rule above still holds for ordinary peers.
   if (cfg.exportCombinePeers) mergePeersIntoOwner(users, cutoff);
+  coverModelGaps(users);
   return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(), users };
 }
 
@@ -337,7 +375,15 @@ function mergePeersIntoOwner(users: any[], cutoff: string): void {
   const byHour = new Map<string, any>();
   for (const h of row.hourly) byHour.set(h.hour_utc, h);
   const models = new Set<string>(JSON.parse(row.meta.models || "[]"));
+  // Per-model output for the peers, so the merged row stays weightable. A peer still running an
+  // export that predates the models block contributes nothing here; coverModelGaps() then carries
+  // its output as unmetered, which the puller weights at 1 exactly as it does today.
+  row.models ??= [];
+  const emmq = externalModelMonthQuery();
+  const extModels = emmq ? (emmq.all() as any[]) : [];
   for (const { peer, user } of eq.users.all() as any[]) {
+    for (const r of extModels)
+      if (r.peer === peer && r.user === user) row.models.push({ mk: r.mk, model: r.model, output: r.output || 0 });
     const cum = (eq.cum.get(peer, user) as any) || {};
     addParts(row.cumulative, cum);
     for (const r of eq.hours.all(peer, user) as any[]) {
@@ -356,6 +402,32 @@ function mergePeersIntoOwner(users: any[], cutoff: string): void {
   row.hourly = [...byHour.values()].sort((a, b) => a.hour_utc.localeCompare(b.hour_utc));
 }
 
+// A puller weights a row from its models block ALONE and ignores raw output once that block is
+// present, so a block covering only part of a row's output would undercount the rest to zero
+// rather than to weight 1. Output the models rows miss -- hours older than per-model tracking, or
+// a merged peer that has not shipped the models block yet -- is declared under a model id no
+// weight table knows, which every puller falls back to weight 1 for. Sum of models per month
+// therefore equals the hourly output the same month exports.
+const UNMETERED_MODEL = "unmetered";
+function coverModelGaps(users: any[]): void {
+  for (const row of users) {
+    const models: { mk: string; model: string; output: number }[] = row.models || [];
+    if (!models.length) continue; // no model detail at all: the puller falls back to raw, weight 1
+    const rawByMk: Record<string, number> = {};
+    for (const h of row.hourly || []) {
+      const mk = String(h.hour_utc).slice(0, 7);
+      rawByMk[mk] = (rawByMk[mk] || 0) + (h.output || 0);
+    }
+    const covByMk: Record<string, number> = {};
+    for (const m of models) covByMk[m.mk] = (covByMk[m.mk] || 0) + (m.output || 0);
+    for (const mk of Object.keys(rawByMk)) {
+      const gap = rawByMk[mk] - (covByMk[mk] || 0);
+      if (gap > 0) models.push({ mk, model: UNMETERED_MODEL, output: gap });
+    }
+    row.models = models;
+  }
+}
+
 function buildLeaderboard() {
   const now = new Date();
   const monthPrefix = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}`;
@@ -364,6 +436,22 @@ function buildLeaderboard() {
   for (let i = 0; i < HOURLY_HOURS; i++) hour_ms.push(hour0.getTime() - (HOURLY_HOURS - 1 - i) * 3600e3);
 
   const byMonth: Record<string, Record<string, Record<string, number>>> = {};
+  // Weighted output per month per user, from model_usage at this fork's price weights, plus any
+  // per-model output imported from external peers (keyed the same way as their board rows). A
+  // user/month with raw output but no model rows falls back to raw output, weight 1.
+  const wByMonth: Record<string, Record<string, number>> = {};
+  const mmq = modelMonthQuery();
+  if (mmq) for (const r of mmq.all() as any[])
+    (wByMonth[r.mk] ??= {})[r.user] = (wByMonth[r.mk][r.user] || 0) + (r.output || 0) * outputWeight(r.model);
+  const emmq = externalModelMonthQuery();
+  if (emmq) for (const r of emmq.all() as any[]) {
+    const k = extKey(r.peer, r.user);
+    (wByMonth[r.mk] ??= {})[k] = (wByMonth[r.mk][k] || 0) + (r.output || 0) * outputWeight(r.model);
+  }
+  const weightedFor = (mk: string, user: string, rawOut: number) => {
+    const w = wByMonth[mk]?.[user];
+    return w != null ? w : rawOut;
+  };
   const users: any[] = [];
   for (const { user } of qUsers.all() as any[]) {
     const hours = new Map<string, any>();
@@ -411,7 +499,12 @@ function buildLeaderboard() {
   for (const mk of Object.keys(byMonth).sort()) {
     const parts: Record<string, Record<string, number>> = {};
     const outs: Record<string, number> = {};
-    for (const u of allUsers) { parts[u] = byMonth[mk][u] || zeroParts(); outs[u] = parts[u].total; }
+    const wtd: Record<string, number> = {};
+    for (const u of allUsers) {
+      parts[u] = byMonth[mk][u] || zeroParts();
+      outs[u] = parts[u].total;
+      wtd[u] = weightedFor(mk, u, parts[u].output);
+    }
     const total = Object.values(outs).reduce((a, b) => a + b, 0);
     const wtotal = Object.values(wtd).reduce((a, b) => a + b, 0);
     // The subscription is split by WEIGHTED output, so a heavy-model user pays for the load they put
