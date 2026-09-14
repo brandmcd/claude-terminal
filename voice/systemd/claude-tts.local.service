@@ -32,6 +32,10 @@ Environment=TTS_THREADS=2
 Environment=OMP_NUM_THREADS=2
 Environment=MKL_NUM_THREADS=2
 Environment=OPENBLAS_NUM_THREADS=2
+# Free the Kokoro model (~1.2 GB) after 10 idle minutes; the next sentence waits ~4s to reload it.
+# Added 2026-09-14: with the model always resident, Claude sessions filled RAM and swap and the
+# box went offline. See TTS_IDLE_UNLOAD_S in voice/tts/main.py.
+Environment=TTS_IDLE_UNLOAD_S=600
 
 # --- environment -------------------------------------------------------------
 Environment=HOME=/home/ctuser
