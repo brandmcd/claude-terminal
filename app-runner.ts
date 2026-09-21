@@ -53,6 +53,7 @@ export type AppEvent =
   // input and can trail it by seconds on a big argument, which is too late for voice mode to
   // tell "narration before a tool call" from "the actual answer".
   | { t: "tool_start"; id: string; name: string }
+  | { t: "title"; title: string } // AI title for the conversation, parsed from the first turn's leading <title>
   | { t: "tool_result"; id: string; content: unknown; isError: boolean }
   | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string } // live subagent progress, keyed by the Task tool_use id
   | { t: "compact"; trigger: "manual" | "auto"; preTokens?: number; postTokens?: number; durationMs?: number } // a compaction finished; metadata drives the "freed Nk" card
@@ -265,6 +266,9 @@ class CleanupSession {
 }
 const cleanupSession = new CleanupSession();
 
+
+
+/** Spin the cleanup process up while the user is still talking, so the wait at the end is the model only. */
 /** Spin the cleanup process up while the user is still talking, so the wait at the end is the model only. */
 export function warmDictation(): void { try { cleanupSession.warm(); } catch { /* */ } }
 
@@ -286,6 +290,12 @@ export async function cleanDictation(raw: string, timeoutMs = 15000): Promise<st
 // so replay strips it from the visible transcript; the live UI already renders the user's own words.
 const VOICE_DIRECTIVE = "The user is in hands-free voice mode while driving; your reply will be read aloud by text-to-speech. Keep it brief and conversational: lead with the answer in one or two spoken sentences. Do not use markdown, bullet or numbered lists, tables, code blocks, headings, or URLs unless explicitly asked. Write times and numbers as words a voice would say (for example 'five thirty PM', not '5:30 PM'). Only expand if the user asks for detail.";
 export function decorateVoiceTurn(text: string): string { return `${text}\n\n<voice-mode>${VOICE_DIRECTIVE}</voice-mode>`; }
+// Appended to the FIRST turn of a new chat so the sidebar gets a real title without a second query.
+// The model opens its reply with <title>3-6 words</title>; the runner strips that off the live stream
+// and the client strips it on replay, so the user never sees it, and convMeta reads it back off the
+// transcript for the conversation list. Wrapped in a sentinel so HIDDEN_STRIP keeps it out of the
+// user's own displayed message too.
+const TITLE_DIRECTIVE = "<title-request>Before anything else in your reply, output a 3 to 6 word title for this conversation wrapped in <title></title> tags, on its own line, then continue normally. The title is hidden from the user; it labels the chat in a list. No quotes, no trailing punctuation.</title-request>";
 // #endregion
 
 // #region dynamic model list
@@ -364,8 +374,11 @@ const APP_UI_SYSTEM_APPEND = [
   "- Images/plots/screenshots you create render inline. Reference a file you wrote under the working",
   "  directory with markdown, e.g. ![chart](chart.png), and it shows in the chat. Prefer this over",
   "  describing an image or dumping base64.",
-  "- Files you produce (CSV, PDF, zip, logs) render as download cards when you link them, e.g.",
-  "  [results.csv](out/results.csv).",
+  "- Any file you save under the working directory is served for download automatically. To hand the",
+  "  user a file of ANY type (CSV, PDF, zip, image, SVG, ...), just link its path in markdown, e.g.",
+  "  [results.csv](out/results.csv) or [wiring.svg](wiring.svg); it renders as a download card. The",
+  "  link to the saved path IS the download: do not git-commit the file, upload it anywhere, convert",
+  "  its format, or hand-build a URL to 'host' it. Save it, link it, done.",
   "- Fenced code blocks are syntax-highlighted with a copy button. A fenced ```html, ```svg, or",
   "  ```jsx/tsx/react block renders as a LIVE preview in a split-screen artifact panel, so when the",
   "  user asks for a webpage, diagram, chart, SVG, or a small interactive component, return it as one",
@@ -374,7 +387,8 @@ const APP_UI_SYSTEM_APPEND = [
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.
-const HIDDEN_STRIP = /\s*<(voice-mode|turn-context)>[\s\S]*?<\/\1>\s*/g;
+const HIDDEN_STRIP = /\s*<(voice-mode|turn-context|title-request)>[\s\S]*?<\/\1>\s*/g;
+const TITLE_TAG = /<title>[\s\S]*?<\/title>\s*/i; // the conversation-title tag the first reply opens with
 // #endregion
 
 // When Claude loads a skill, its whole body is injected as a user message that starts with
@@ -491,6 +505,10 @@ function limitNoticeText(resumeAt: number | null): string {
   return `Subscription limit reached. This turn will auto-resume around ${when} when the limit resets.`;
 }
 
+// How long a query may go silent after a send before we treat it as hung and recycle it. A live
+// query emits an init/stream event within seconds; only a dead subprocess produces nothing at all.
+const HUNG_QUERY_MS = 60_000;
+
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
   cwd: string;
@@ -502,7 +520,11 @@ export class Conversation {
   phase: Phase = "idle";
   private phaseSince = 0;
   private phaseDetail?: string;
-  get busy(): boolean { return this.phase !== "idle"; }
+  // Live background tasks (SDK background_tasks_changed level signal), ambient ones excluded. These
+  // outlive the foreground turn that spawned them, so a conversation can be "idle" on phase yet still
+  // running work; fold them into busy so the list dot shows while they run.
+  private bgTasks = new Set<string>();
+  get busy(): boolean { return this.phase !== "idle" || this.bgTasks.size > 0; }
   get seq(): number { return this.seqCounter - 1; } // highest _seq handed out so far (-1 = none)
   private curMsgId = ""; // id of the assistant message being streamed: block ids are <msg>:<index>
   private ctxMax = 0;    // context window for this model, fetched once after init
@@ -546,6 +568,16 @@ export class Conversation {
   private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
   settings: SessionSettings = {};   // flag-layer settings for this chat (effort, advisor model, fast mode)
   private pendingSettings?: SessionSettings; // a settings change waiting for an idle boundary, same as pendingModel
+  private titleScan = false;   // true during a new chat's first turn: withhold a leading <title> from the stream
+  private running = false;     // the run() query loop is alive; a send while false means the subprocess died and must be re-run
+  private titleBuf = "";
+  // Hung-query watchdog. `running` true only means the for-await loop is parked; if the SDK
+  // subprocess dies WITHOUT the iterator throwing, the loop hangs forever and sends pile up with no
+  // reply (the "keeps loading, never reaches waiting-for-model" failure). We arm a timer on each
+  // send and clear it on any message from the query; if nothing arrives, the query is dead -> recycle.
+  private lastMsgAt = 0;       // unix ms of the last message received from the live query
+  private hungWatch?: ReturnType<typeof setTimeout>;
+  private lastRecycleAt = 0;   // rate-limit the recycle so a genuinely unresumable session can't loop
 
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
@@ -672,8 +704,58 @@ export class Conversation {
     this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
-    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); }
-    else this.queue.push(msg);
+    // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
+    // nor the queue, and its dead inputGen is parked exactly at the waiter below, so the healthy-path
+    // early return must be covered too. handle() clears this the instant any real message arrives.
+    this.armHungWatch();
+    if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(msg); return; }
+    this.queue.push(msg);
+    // If the query loop has ended (the subprocess crashed or was killed), inputGen already returned
+    // and nothing will ever consume this queue -> the conversation accepts messages but never
+    // answers. Restart the query, resuming this session, so the queued turn is actually processed.
+    if (!this.running) {
+      if (!this.resume && this.inited) this.resume = this.id; // resume THIS session, not a fresh one
+      tlog("requery", { conv: this.id });
+      void this.run();
+    }
+  }
+
+  private armHungWatch() {
+    if (this.hungWatch) clearTimeout(this.hungWatch);
+    const armedAt = Date.now();
+    this.hungWatch = setTimeout(() => {
+      this.hungWatch = undefined;
+      if (this.closed || this.lastMsgAt >= armedAt) return; // answered -> healthy
+      tlog("hung-recycle", { conv: this.id, phase: this.phase });
+      this.recycleHungQuery();
+    }, HUNG_QUERY_MS);
+  }
+
+  // The query went silent after a send: tear down the hung query and start a fresh one resuming this
+  // session, re-injecting the pending turn. Rate-limited so a session that simply cannot resume can't
+  // spin in a recycle loop; after that it surfaces an error the user can act on.
+  private recycleHungQuery() {
+    const now = Date.now();
+    if (now - this.lastRecycleAt < 30_000) {
+      this.emit({ t: "error", message: "The session stopped responding and couldn't be revived automatically. Reload to retry." });
+      this.setPhase("idle");
+      return;
+    }
+    this.lastRecycleAt = now;
+    if (!this.resume && this.inited) this.resume = this.id;
+    const pending = this.currentTurnText;
+    this.runGen++;                 // supersede the hung run so its finally stays quiet
+    try { this.q?.close(); } catch { /* */ }
+    this.q = null;
+    this.running = false;
+    this.waiter = undefined;       // detach the orphaned inputGen's resolver
+    // The hung query usually swallowed the turn into its dead waiter, leaving the queue empty; only
+    // re-inject when nothing is queued, so a turn still sitting in the queue is never double-sent.
+    if (pending && this.queue.length === 0) {
+      this.queue.push({ type: "user", message: { role: "user", content: pending + "\n\n" + this.turnContext() }, parent_tool_use_id: null });
+    }
+    void this.run();
+    this.armHungWatch();           // the fresh query must answer too, or recycle again (now rate-limited)
   }
 
   // Change the model for THIS conversation. The SDK's live setModel writes to the query's control
@@ -849,6 +931,7 @@ export class Conversation {
     if (this.closed) return;
     this.closed = true;
     this.queue = [];
+    if (this.hungWatch) { clearTimeout(this.hungWatch); this.hungWatch = undefined; }
     if (this.waiter) { const w = this.waiter; this.waiter = undefined; w(null); }
     for (const [, resolve] of this.pendingAsks) resolve("(the user did not answer)"); // unblock any pending ask
     this.pendingAsks.clear();
@@ -863,7 +946,8 @@ export class Conversation {
       this.runStart = this.log.length; // first turn's replay boundary
       this.emit({ t: "user", text: first, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
-      yield { type: "user", message: { role: "user", content: first + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+      this.titleScan = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
+      yield { type: "user", message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     }
     while (!this.closed) {
       const next = this.queue.shift() ?? (await new Promise<SDKUserMessage | null>((res) => { this.waiter = res; }));
@@ -916,6 +1000,7 @@ export class Conversation {
       },
     });
     if (first === undefined && !this.inited) this.setPhase("starting"); // a resume: the subprocess is coming up before any turn is queued
+    this.running = true;
     try {
       for await (const m of this.q) this.handle(m);
     } catch (e: any) {
@@ -924,6 +1009,7 @@ export class Conversation {
     } finally {
       // Superseded by a refork -> stay silent; the new run owns the stream now.
       if (myGen === this.runGen) {
+        this.running = false;
         this.setPhase("idle"); // emits busy:false itself if it was busy
         tlog("closed", { conv: this.id, listeners: this.subs.size });
         this.emit({ t: "closed" });
@@ -953,13 +1039,44 @@ export class Conversation {
     } catch { /* */ }
   }
 
+  // Withhold text until we know whether the reply opens with <title>...</title>. Emits the title as
+  // its own event and streams only the real answer. Bounded: at most the first line is buffered.
+  private scanTitle(text: string, bid?: string) {
+    this.titleBuf += text;
+    const lead = this.titleBuf.replace(/^\s+/, "");
+    const open = "<title>";
+    if (lead.length < open.length && open.startsWith(lead)) return; // still might be "<title>", wait
+    if (lead.startsWith(open)) {
+      const end = this.titleBuf.indexOf("</title>");
+      if (end < 0) { if (this.titleBuf.length > 200) this.flushTitle(bid); return; } // wait for close (capped)
+      else {
+        const title = this.titleBuf.slice(this.titleBuf.indexOf(open) + open.length, end).replace(/\s+/g, " ").trim().slice(0, 80);
+        if (title) this.emit({ t: "title", title });
+        const rest = this.titleBuf.slice(end + "</title>".length).replace(/^\s*\n/, "");
+        this.titleScan = false; this.titleBuf = "";
+        if (rest) this.emit({ t: "text_delta", text: rest, bid });
+      }
+      return;
+    }
+    this.flushTitle(bid); // the reply did not open with a title -> emit the buffer as normal text
+  }
+  private flushTitle(bid?: string) {
+    if (!this.titleScan) return;
+    const buf = this.titleBuf; this.titleScan = false; this.titleBuf = "";
+    if (buf) this.emit({ t: "text_delta", text: buf, bid });
+  }
+
   private handle(m: SDKMessage) {
     const anyM = m as any;
+    // The query is alive: any message clears the hung-query watchdog until the next send arms it.
+    this.lastMsgAt = Date.now();
+    if (this.hungWatch) { clearTimeout(this.hungWatch); this.hungWatch = undefined; }
     if (anyM.session_id && anyM.session_id !== this.id) this.id = anyM.session_id;
     switch (m.type) {
       case "system":
         if (anyM.subtype === "init") {
           this.inited = true;
+          this.bgTasks.clear(); // the level is per-process: a (re)start resets it; the CLI re-sends a snapshot
           this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
           if (anyM.model) { this.model = anyM.model; this.emit({ t: "model", model: anyM.model }); }
           if (this.phase === "starting") this.setPhase("waiting");
@@ -994,6 +1111,17 @@ export class Conversation {
           if (anyM.status === "compacting") { this.emit({ t: "compacting", active: true }); this.setPhase("compacting"); }
           else if (anyM.compact_result === "failed") { this.emit({ t: "compacting", active: false }); this.emit({ t: "notice", kind: "info", text: "Compaction failed: " + (anyM.compact_error || "unknown") }); }
         }
+        // Level signal: the full set of live background tasks after any membership change. REPLACE
+        // semantics (never pair the task_started/notification edges). Ambient = CLI housekeeping, not
+        // user work, so excluded from the busy indicator. A change here can flip busy without a phase
+        // change, so emit the busy edge ourselves.
+        else if (anyM.subtype === "background_tasks_changed") {
+          const next = new Set<string>();
+          for (const t of (anyM.tasks as any[]) || []) if (t && !t.ambient && t.task_id) next.add(String(t.task_id));
+          const wasBusy = this.busy;
+          this.bgTasks = next;
+          if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy });
+        }
         // Background subagent activity + cross-session messages, surfaced inline so the thread
         // shows work spun off to other agents (Claude Code's task/notification stream).
         else if (anyM.subtype === "task_progress" && anyM.tool_use_id) {
@@ -1024,13 +1152,13 @@ export class Conversation {
         if (ev?.type === "content_block_start") {
           const cb = ev.content_block;
           // A tool_use block opening = the text just before it was narration, not the final answer.
-          if (cb?.type === "tool_use") { this.emit({ t: "tool_start", id: cb.id, name: cb.name }); this.setPhase("tool", cb.name); }
+          if (cb?.type === "tool_use") { if (this.titleScan) this.flushTitle(bid); this.emit({ t: "tool_start", id: cb.id, name: cb.name }); this.setPhase("tool", cb.name); }
           else if (cb?.type === "thinking") this.setPhase("thinking");
           else if (cb?.type === "text") this.setPhase("writing");
         }
         if (ev?.type === "content_block_delta") {
           const d = ev.delta;
-          if (d?.type === "text_delta" && d.text) this.emit({ t: "text_delta", text: d.text, bid });
+          if (d?.type === "text_delta" && d.text) { if (this.titleScan) this.scanTitle(d.text, bid); else this.emit({ t: "text_delta", text: d.text, bid }); }
           else if (d?.type === "thinking_delta") {
             // subscription auth redacts the thinking text (d.thinking === ""); we still get
             // estimated_tokens progress, so surface a live "thinking" indicator either way.
@@ -1109,6 +1237,7 @@ export class Conversation {
         // never drains. It pinned two conversations "in progress" for over an hour. A mid-turn
         // message surviving the idle announcement is the CLIENT's job (see trailingUnsent), because
         // only the client knows what it has not seen echoed back yet.
+        if (this.titleScan) this.flushTitle();
         this.setPhase("idle");
         this.apiErrors = 0; // per-turn counter
         void this.applyPendingModel(); // a model change picked mid-turn takes effect now the turn is done
@@ -1344,7 +1473,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
       for (let bi = 0; bi < blocks.length; bi++) {
         const b = blocks[bi];
         const bid = `${o.uuid || msg.id || "r"}:${bi}`; // same shape as the live <message id>:<index>
-        if (b?.type === "text") out.push({ t: "text", text: b.text, bid });
+        if (b?.type === "text") out.push({ t: "text", text: String(b.text || "").replace(TITLE_TAG, ""), bid }); // drop the hidden <title> the first reply carries
         else if (b?.type === "thinking") out.push({ t: "thinking", text: b.thinking || "", bid });
         else if (b?.type === "tool_use" && b.name === "mcp__app-ui__ask_user") {
           // reconstruct the ask card from the tool input (askId = tool_use id); a matching
@@ -1425,7 +1554,16 @@ export async function resolveEditPoints(path: string, userIndex: number): Promis
 // list already excludes, so it never pollutes the sidebar. getSubscriptionUsage() is non-blocking:
 // it returns the cached snapshot immediately and refreshes it in the background when stale.
 export interface SubscriptionWindow { utilization: number | null; resetsAt: string | null }
-export interface SubscriptionUsage { available: boolean; subscription: string | null; fiveHour: SubscriptionWindow | null; sevenDay: SubscriptionWindow | null; fetchedAt: number }
+export interface ModelScopedWindow { displayName: string; utilization: number | null; resetsAt: string | null }
+export interface SubscriptionUsage {
+  available: boolean; subscription: string | null;
+  fiveHour: SubscriptionWindow | null; sevenDay: SubscriptionWindow | null;
+  // Additional windows the SDK exposes; captured so the collector can log them all. Present only
+  // when the account carries them, hence nullable/optional.
+  sevenDayOauthApps: SubscriptionWindow | null; sevenDayOpus: SubscriptionWindow | null; sevenDaySonnet: SubscriptionWindow | null;
+  modelScoped: ModelScopedWindow[]; // per-model weekly windows, labelled (e.g. "Fable")
+  fetchedAt: number;
+}
 
 const SUB_CWD = "/tmp/ct-usage"; // -tmp-ct-usage project -> excluded from the conversation list
 const SUB_TTL = 90_000; // a rate-limit window moves slowly; 90s is plenty fresh
@@ -1459,7 +1597,15 @@ async function refreshSubscriptionUsage(): Promise<void> {
     const u: any = await ctrlQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
     const rl = u?.rate_limits || {};
     const win = (w: any): SubscriptionWindow | null => (w ? { utilization: typeof w.utilization === "number" ? w.utilization : null, resetsAt: w.resets_at || null } : null);
-    subCache = { available: !!u?.rate_limits_available, subscription: u?.subscription_type || null, fiveHour: win(rl.five_hour), sevenDay: win(rl.seven_day), fetchedAt: Date.now() };
+    const modelScoped: ModelScopedWindow[] = Array.isArray(rl.model_scoped)
+      ? rl.model_scoped.map((m: any) => ({ displayName: String(m?.display_name || ""), utilization: typeof m?.utilization === "number" ? m.utilization : null, resetsAt: m?.resets_at || null }))
+      : [];
+    subCache = {
+      available: !!u?.rate_limits_available, subscription: u?.subscription_type || null,
+      fiveHour: win(rl.five_hour), sevenDay: win(rl.seven_day),
+      sevenDayOauthApps: win(rl.seven_day_oauth_apps), sevenDayOpus: win(rl.seven_day_opus), sevenDaySonnet: win(rl.seven_day_sonnet),
+      modelScoped, fetchedAt: Date.now(),
+    };
   } catch { /* keep the last snapshot */ }
   finally { subRefreshing = false; }
 }

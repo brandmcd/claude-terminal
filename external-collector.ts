@@ -102,6 +102,11 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
             if (!mm?.mk || !mm?.model) continue;
             insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output));
           }
+          // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
+          for (const mm of Array.isArray(u.models) ? u.models : []) {
+            if (!mm?.mk || !mm?.model) continue;
+            insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output));
+          }
         }
       });
       tx();

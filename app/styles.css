@@ -19,6 +19,25 @@
   --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 }
+
+/* Light theme: applied by adding .theme-light to <body> (see the Theme setting). Warm neutrals to
+   match the dark palette's brown cast; accent nudged darker for contrast on a light background. */
+body.theme-light {
+  --bg: #f7f4f0;
+  --bg-2: #efeae4;
+  --bg-3: #e5ded6;
+  --panel: #ffffff;
+  --line: #ddd4c9;
+  --line-2: #e7e0d8;
+  --text: #26211d;
+  --text-2: #574f47;
+  --text-3: #857b72;
+  --accent: #c25a3c;
+  --accent-2: #d97757;
+  --user-bg: #ece5dd;
+  --danger: #c0392b;
+  color-scheme: light;
+}
 * { box-sizing: border-box; }
 /* Pin the whole app to the viewport so the PAGE never scrolls or rubber-bands — only the
    message list (.scroll) scrolls. Without this, on mobile you could drag the whole app up
@@ -256,6 +275,7 @@ a { color: var(--accent-2); }
 .md code { font-family: var(--mono); font-size: .88em; background: var(--bg-3); padding: 1.5px 5px; border-radius: 5px; }
 .md pre { background: #120f0c; border: 1px solid var(--line-2); border-radius: 11px; padding: 13px 15px; overflow-x: auto; margin: 0 0 12px; }
 .md pre code { background: none; padding: 0; font-size: .86em; line-height: 1.55; }
+body.theme-light .md pre { background: #f3eee7; }
 .md a { text-decoration: underline; text-underline-offset: 2px; }
 .md blockquote { border-left: 3px solid var(--line); margin: 0 0 12px; padding: 2px 0 2px 14px; color: var(--text-2); }
 .md table { border-collapse: collapse; margin: 0 0 12px; display: block; overflow-x: auto; }

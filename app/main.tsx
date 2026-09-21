@@ -32,6 +32,15 @@ const saveFavPending = (m: Record<string, boolean>) => { try { localStorage.setI
 // shows an unread indicator. Only conversations you've opened get an entry, so the backlog doesn't
 // all light up as unread.
 const LASTREAD_LS = "ct-app-lastread";
+// #region theme (dark / light / system)
+type ThemePref = "dark" | "light" | "system";
+const THEME_LS = "ct-app-theme";
+const themeMql = typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+const resolvedTheme = (p: ThemePref): "dark" | "light" => (p === "system" ? (themeMql?.matches ? "light" : "dark") : p);
+function applyTheme(p: ThemePref) { try { document.body.classList.toggle("theme-light", resolvedTheme(p) === "light"); } catch { /* body not ready */ } }
+const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "light" || v === "dark" ? v : "system"; } catch { return "system"; } }; // default: follow the device
+applyTheme(loadThemePref()); // apply before React paints so a returning light-theme user gets no dark flash
+// #endregion
 const loadLastRead = (): Record<string, number> => { try { const o = JSON.parse(localStorage.getItem(LASTREAD_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };
 const saveLastRead = (m: Record<string, number>) => { try { localStorage.setItem(LASTREAD_LS, JSON.stringify(m)); } catch { /* */ } };
 // Per-conversation composer drafts: an unsent message is kept under its conversation id (null = the new
@@ -261,6 +270,9 @@ const api = {
     const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
     return fetch("/app/api/upload", { method: "POST", body: fd }).then(J);
   },
+  reads: () => withTimeout(fetch("/app/api/reads").then(J)),
+  pushReads: (reads: Record<string, number>) =>
+    fetch("/app/api/reads", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ reads }) }).then(J),
   favorites: () => withTimeout(fetch("/app/api/favorites").then(J)),
   toggleFav: (id: string, fav: boolean) =>
     fetch("/app/api/favorites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, fav }) }).then(J),
@@ -867,7 +879,11 @@ function rewriteLocalRefs(html: string, convId: string | null): string {
   const dl = (p: string) => `/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`;
   return html
     .replace(/<img([^>]*?)\ssrc="([^"]+)"([^>]*)>/g, (m, pre, src, post) => /^(https?:|data:|blob:|\/app\/api\/)/i.test(src) ? `<img${pre} src="${src}"${post} loading="lazy">` : `<img${pre} src="${dl(src)}"${post} loading="lazy">`)
-    .replace(/<a([^>]*?)\shref="([^"]+)"([^>]*)>/g, (m, pre, href, post) => /^(https?:|mailto:|#|\/app\/api\/)/i.test(href) ? m : `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`);
+    .replace(/<a([^>]*?)\shref="([^"]+)"([^>]*)>/g, (m, pre, href, post) => {
+      if (/^https?:/i.test(href)) return `<a${pre} href="${href}"${post} target="_blank" rel="noreferrer noopener">`; // external -> new tab, keep the chat open
+      if (/^(mailto:|tel:|#|\/app\/api\/)/i.test(href)) return m; // mail/anchor/download handled elsewhere
+      return `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`; // local file
+    });
 }
 
 function Assistant({ text, convId }: { text: string; convId?: string | null }) {
@@ -1279,6 +1295,9 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [theme, setThemeState] = useState<ThemePref>(loadThemePref);
+  const setTheme = useCallback((t: ThemePref) => { setThemeState(t); try { localStorage.setItem(THEME_LS, t); } catch { /* */ } applyTheme(t); }, []);
+  useEffect(() => { applyTheme(theme); if (theme !== "system" || !themeMql) return; const on = () => applyTheme("system"); themeMql.addEventListener?.("change", on); return () => themeMql.removeEventListener?.("change", on); }, [theme]);
   const [connOpen, setConnOpen] = useState(false); // Connections: MCP servers, skills, memory, network
   // null = still checking, so the row shows a neutral state instead of flashing "off" then "on".
   const [pushOn, setPushOn] = useState<boolean | null>(null);
@@ -1329,7 +1348,8 @@ function App() {
   // truth from an actual 4s request heartbeat: false when requests are failing, which lets the banner
   // show "connection unstable" even while the browser insists it's online.
   const [reachable, setReachable] = useState(true);
-  const netMiss = useRef(0); // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
+  const netMiss = useRef(0);
+  const seenConvIds = useRef<Set<string>>(new Set()); // conv ids the status poll has already reacted to, so an unknown one triggers ONE list refresh (new chat from another device) // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
   const [queued, setQueued] = useState(0);
   // The viewer holds a trail, not one artifact: a note that links to another note pushes onto it and
   // the viewer's back button pops. A home-screen install draws no browser chrome, so a link into a
@@ -1448,6 +1468,19 @@ function App() {
       .catch(() => {})
       .finally(() => { loadingMoreRef.current = false; });
   }, [hasMore]);
+  // Pull the server read markers and merge by max into the local map, so a chat read on another
+  // device shows read here too. Local wins only where it is NEWER (a read this device made offline).
+  const syncReads = useCallback(() => {
+    api.reads().then((d) => {
+      const srv: Record<string, number> = d.reads || {};
+      const local = lastReadRef.current;
+      let localAhead: Record<string, number> | null = null;
+      for (const [id, t] of Object.entries(srv)) if ((t as number) > (local[id] || 0)) local[id] = t as number;
+      for (const [id, t] of Object.entries(local)) if (t > (srv[id] || 0)) (localAhead ??= {})[id] = t;
+      saveLastRead(local); setReadTick((x) => x + 1);
+      if (localAhead) void api.pushReads(localAhead).catch(() => {}); // push markers the server hasn't got
+    }).catch(() => { /* offline: local map holds */ });
+  }, []);
   const refreshFavs = useCallback(() => {
     api.favorites().then((d) => {
       const srv = new Set<string>((d.favorites || []).map((x: any) => String(x)));
@@ -1518,6 +1551,7 @@ function App() {
     const conv = (list ?? convsRef.current).find((c) => c.sessionId === id);
     const mark = conv ? Math.max(conv.mtime, lastReadRef.current[id] || 0) : (lastReadRef.current[id] || Date.now());
     lastReadRef.current[id] = mark; saveLastRead(lastReadRef.current); setReadTick((t) => t + 1);
+    void api.pushReads({ [id]: mark }).catch(() => { /* offline: local marker holds; a later syncReads reconciles */ });
     // Tell the service worker what is now read so it can dismiss any tray notification whose
     // conversations have all been read. A "conversation finished" notification otherwise sat there
     // until tapped, even though you had already opened and read it.
@@ -1553,6 +1587,7 @@ function App() {
     }).catch(() => {});
     refreshConvs();
     refreshFavs();
+    syncReads();
     const c = new URLSearchParams(location.search).get("c");
     if (c) void loadConv(c);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1592,12 +1627,23 @@ function App() {
   useEffect(() => {
     const pull = () => {
       if (navigator.onLine) api.statuses()
-        .then((d) => { setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); })   // a real response = link works
+        .then((d) => {
+          setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); // a real response = link works
+          // A conversation live on the server that this client's sidebar has never seen is a new chat
+          // started on another device. Pull the list ONCE so it appears without a manual refresh.
+          const known = new Set(convsRef.current.map((c) => c.sessionId));
+          let fresh = false;
+          for (const id of Object.keys(d?.statuses || {})) {
+            if (!/^[A-Za-z0-9-]{20,}$/.test(id) || known.has(id) || seenConvIds.current.has(id)) continue;
+            seenConvIds.current.add(id); fresh = true;
+          }
+          if (fresh) refreshConvs();
+        })
         .catch(() => { netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
       void refreshQueue();
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
-  }, [refreshQueue]);
+  }, [refreshQueue, refreshConvs]);
   // App-icon badge: how many agents are WAITING on you. Deliberately not "how many are busy" — the
   // badge answers "does anything need me", and a working agent does not. The service worker sets the
   // same badge from a status push while the app is closed, so the two agree.
@@ -2068,6 +2114,7 @@ function App() {
       void (async () => {
         await drainQueueUI();
         refreshFavs(); // flush favourite toggles made while offline
+        syncReads();    // reconcile read markers made on other devices while we were offline
         // Reload the open conversation: while offline it may have shown a partial/uncached view,
         // and a fresh server fetch pulls the full history now that we're back.
         const id = activeIdRef.current;
@@ -2084,7 +2131,7 @@ function App() {
     // "sending N queued" banner) forever. Retry every 8s until it's empty.
     const t = setInterval(() => { if (navigator.onLine && !drainingRef.current) { drainingRef.current = true; void drainQueueUI().finally(() => { drainingRef.current = false; }); } }, 8000);
     return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); clearInterval(t); };
-  }, [drainQueueUI, loadConv, refreshFavs, refreshQueue]);
+  }, [drainQueueUI, loadConv, refreshFavs, refreshQueue, syncReads]);
   // #endregion
 
   // Liveness. The server heartbeats every 15s as a data frame we can see; a socket quiet for HB_DEAD
@@ -2640,6 +2687,18 @@ function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">Settings<button className="modal-x" onClick={() => setSettingsOpen(false)} aria-label="Close">×</button></div>
             <div className="settings-body">
+              <div className="settings-section">Appearance</div>
+              <label className="settings-row">
+                <span className="settings-row-main">
+                  <span className="settings-row-title">Theme</span>
+                  <span className="settings-row-desc">Dark, light, or follow your device. Saved per device.</span>
+                </span>
+                <select className="settings-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemePref)}>
+                  <option value="dark">Dark</option>
+                  <option value="light">Light</option>
+                  <option value="system">System</option>
+                </select>
+              </label>
               <div className="settings-section">Notifications</div>
               <label className="settings-row">
                 <span className="settings-row-main">

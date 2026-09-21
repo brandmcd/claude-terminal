@@ -44,6 +44,8 @@ export interface AppCtx {
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
   favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
   titlesFile: string; // JSON map {sessionId: customTitle} — user-renamed conversations
+  readsFile: string;  // JSON map {sessionId: lastReadMs} — per-conversation read marker, server-side so unread syncs across devices
+  autoTitlesFile: string; // JSON map {sessionId: aiTitle} — Haiku-generated conversation titles, cached so each is generated once
   mcpFile: string; // JSON map {name: McpServerConfig} — MCP servers the SDK connects for /app chats
   claudeDir: string; // ~/.claude — for memory (CLAUDE.md) + skills management
   sttUrl?: string; // local Whisper service base URL (loopback); enables hands-free voice in
@@ -79,6 +81,40 @@ async function loadFavs(file: string): Promise<Set<string>> {
 }
 async function saveFavs(file: string) { if (favSet) await Bun.write(file, JSON.stringify([...favSet])); }
 // #endregion
+
+// #region read markers (per-conversation lastRead ms) — server-side so unread state syncs across
+// devices. Reading a chat on the phone clears its unread dot on the laptop, instead of every device
+// keeping its own localStorage marker and lighting up phantom unreads on the others.
+let readMap: Record<string, number> | null = null;
+async function loadReads(file: string): Promise<Record<string, number>> {
+  if (readMap) return readMap;
+  try { const o = JSON.parse(await Bun.file(file).text()); readMap = o && typeof o === "object" ? o : {}; }
+  catch { readMap = {}; }
+  return readMap!;
+}
+async function saveReads(file: string) { if (readMap) await Bun.write(file, JSON.stringify(readMap)); }
+// #endregion
+
+// #region AI conversation titles — a short Haiku summary instead of the first line of the message.
+// Generated once per conversation (in the background off the list path) and cached server-side so it
+// syncs across devices and never regenerates. A user rename still wins over it.
+const HIDDEN_TAG = /\s*<(voice-mode|turn-context)>[\s\S]*?<\/\1>\s*/g; // mirror app-runner's HIDDEN_STRIP
+let autoTitleMap: Record<string, string> | null = null;
+const titleInFlight = new Set<string>();
+async function loadAutoTitles(file: string): Promise<Record<string, string>> {
+  if (autoTitleMap) return autoTitleMap;
+  try { const o = JSON.parse(await Bun.file(file).text()); autoTitleMap = o && typeof o === "object" ? o : {}; }
+  catch { autoTitleMap = {}; }
+  return autoTitleMap!;
+}
+async function saveAutoTitles(file: string) { if (autoTitleMap) await Bun.write(file, JSON.stringify(autoTitleMap)); }
+
+// Effective sidebar title: a user rename wins, then the cached AI title, then the CLI summary, then
+// the stripped first line. Never null for a conversation that has any user text.
+function pickTitle(id: string, meta: { title: string | null; first?: string | null; aiTitle?: string | null }, titles: Record<string, string>, autos: Record<string, string>): string | null {
+  return titles[id] || meta.aiTitle || autos[id] || meta.title || meta.first || null;
+}
+// #endregion (title generation now rides the first turn inline; see app-runner TITLE_DIRECTIVE)
 
 // #region custom titles (renamed conversations) — server-side map, syncs across devices
 let titleMap: Record<string, string> | null = null;
@@ -166,12 +202,13 @@ async function listConversations(ctx: AppCtx): Promise<{ path: string; sessionId
 }
 
 // Pull a title + cwd from the head/tail of a transcript (cheap: reads once).
-async function convMeta(path: string): Promise<{ title: string | null; cwd: string | null }> {
+async function convMeta(path: string): Promise<{ title: string | null; cwd: string | null; first?: string | null; aiTitle?: string | null }> {
   let title: string | null = null;
   let cwd: string | null = null;
-  let first: string | null = null;
+  let first: string | null = null;      // stripped first user text, for the fallback title + AI-title seed
+  let aiTitle: string | null = null; // the <title> the first assistant reply emits
   let text: string;
-  try { text = await Bun.file(path).text(); } catch { return { title, cwd }; }
+  try { text = await Bun.file(path).text(); } catch { return { title, cwd, first, aiTitle }; }
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     let o: any; try { o = JSON.parse(line); } catch { continue; }
@@ -179,11 +216,18 @@ async function convMeta(path: string): Promise<{ title: string | null; cwd: stri
     if (o.type === "summary" && o.summary) { title = String(o.summary).slice(0, 100); }
     if (!first && o.type === "user" && o.message) {
       const c = o.message.content;
-      const txt = typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join("") : "";
-      if (txt && !txt.startsWith("<")) first = txt.replace(/\s+/g, " ").slice(0, 100);
+      let txt = typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join("") : "";
+      txt = txt.replace(HIDDEN_TAG, "").trim(); // drop the appended <turn-context>/<voice-mode> block
+      if (txt && !txt.startsWith("<")) first = txt.replace(/\s+/g, " ").slice(0, 400);
+    }
+    if (!aiTitle && o.type === "assistant" && o.message) {
+      const c = o.message.content;
+      const txt = Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join("") : (typeof c === "string" ? c : "");
+      const m = txt.match(/<title>([\s\S]*?)<\/title>/i); // the hidden title the first reply opens with
+      if (m && m[1].trim()) aiTitle = m[1].replace(/\s+/g, " ").trim().slice(0, 80);
     }
   }
-  return { title: title || first, cwd };
+  return { title, cwd, first, aiTitle };
 }
 
 function findTranscript(ctx: AppCtx, sessionId: string): { path: string; project: string } | null {
@@ -617,6 +661,26 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     return jsonRes({ favorites: [...f] }, ctx, req);
   }
 
+  // Read markers. GET returns the whole {id: lastReadMs} map; POST merges one or many, keeping the
+  // MAX per id so the most-recent read on any device wins and a stale device can never un-read a chat.
+  if (req.method === "GET" && path === "/app/api/reads") {
+    return jsonRes({ reads: await loadReads(ctx.readsFile) }, ctx, req);
+  }
+  if (req.method === "POST" && path === "/app/api/reads") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const m = await loadReads(ctx.readsFile);
+    const incoming: Record<string, unknown> = (b && typeof b.reads === "object" && b.reads) ? b.reads
+      : (b && b.id) ? { [String(b.id)]: b.at ?? Date.now() } : {};
+    let changed = false;
+    for (const [id, at] of Object.entries(incoming)) {
+      const t = Number(at);
+      if (!id || !Number.isFinite(t)) continue;
+      if (t > (m[id] || 0)) { m[id] = t; changed = true; }
+    }
+    if (changed) await saveReads(ctx.readsFile);
+    return jsonRes({ reads: m }, ctx, req);
+  }
+
   if (req.method === "GET" && path === "/app/api/conversations") {
     // Paginated (infinite scroll). ?offset=N walks the mtime-sorted row list; ?limit caps the
     // page. Rows without a usable title are skipped, so nextOffset tracks rows CONSUMED (not
@@ -626,13 +690,14 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
     const rows = await listConversations(ctx);
     const titles = await loadTitles(ctx.titlesFile);
+    const autoTitles = await loadAutoTitles(ctx.autoTitlesFile);
     const out: ConvRow[] = [];
     let i = offset;
     for (; i < rows.length && out.length < limit; i++) {
       const r = rows[i];
       const meta = await convMeta(r.path);
       if (ctx.historyHide.some((h) => (meta.cwd || "").startsWith(h))) continue;
-      const title = titles[r.sessionId] || meta.title; // user rename wins
+      const title = pickTitle(r.sessionId, meta, titles, autoTitles);
       if (!title) continue;
       out.push({ sessionId: r.sessionId, title, cwd: meta.cwd, mtime: r.mtime, project: r.project });
     }
@@ -648,7 +713,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
         const t = findTranscript(ctx, id);
         if (!t) continue;
         const meta = await convMeta(t.path);
-        const title = titles[id] || meta.title;
+        const title = pickTitle(id, meta, titles, autoTitles);
         if (!title) continue;
         let mtime = 0;
         try {
@@ -686,6 +751,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const q = (new URL(req.url).searchParams.get("q") || "").trim().toLowerCase();
     if (q.length < 2) return jsonRes({ results: [], q }, ctx, req);
     const titles = await loadTitles(ctx.titlesFile);
+    const autoTitles = await loadAutoTitles(ctx.autoTitlesFile);
     const rows = (await listConversations(ctx)).slice(0, 200); // recent-first
     const results: { sessionId: string; title: string; cwd: string | null; mtime: number; snippet: string; count: number }[] = [];
     for (const r of rows) {
@@ -708,7 +774,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       if (!count) continue; // matched only in system/metadata lines
       const meta = await convMeta(r.path);
       if (ctx.historyHide.some((h) => (meta.cwd || "").startsWith(h))) continue;
-      results.push({ sessionId: r.sessionId, title: titles[r.sessionId] || meta.title || "(untitled)", cwd: meta.cwd, mtime: r.mtime, snippet, count });
+      results.push({ sessionId: r.sessionId, title: titles[r.sessionId] || meta.aiTitle || autoTitles[r.sessionId] || meta.title || meta.first || "(untitled)", cwd: meta.cwd, mtime: r.mtime, snippet, count });
       if (results.length >= 40) break;
     }
     return jsonRes({ results, q }, ctx, req);
@@ -733,13 +799,13 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     // the whole transcript would cost hundreds of KB on exactly the link we are trying to protect.
     // This costs about 20 bytes instead.
     if (new URL(req.url).searchParams.get("meta") === "1") {
-      return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.title, evTotal: events.length, live: !!live, busy: !!live?.busy, epoch: live?.epoch ?? null, seq: live?.seq ?? -1 }, ctx, req);
+      return jsonRes({ sessionId: id, cwd: meta.cwd, title: meta.aiTitle || meta.title || meta.first, evTotal: events.length, live: !!live, busy: !!live?.busy, epoch: live?.epoch ?? null, seq: live?.seq ?? -1 }, ctx, req);
     }
     const sinceRaw = new URL(req.url).searchParams.get("since");
     const since = sinceRaw == null ? -1 : parseInt(sinceRaw, 10);
     const delta = Number.isInteger(since) && since >= 0 && since <= events.length;
     return jsonRes({
-      sessionId: id, cwd: meta.cwd, title: meta.title,
+      sessionId: id, cwd: meta.cwd, title: meta.aiTitle || meta.title || meta.first,
       events: delta ? events.slice(since) : events,
       delta, evTotal: events.length,
       live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [],
@@ -965,12 +1031,21 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const f = Bun.file(target);
     if (!(await f.exists())) return jsonRes({ error: "not found" }, ctx, req, 404);
     const name = target.split("/").pop() || "download";
+    // Freshness: the path is stable, so when Claude overwrites a file at the same name (an edited
+    // chart/SVG) the browser would serve the cached copy and the change would never show. An ETag
+    // off mtime+size plus no-cache makes the browser revalidate every time: 304 when the bytes are
+    // unchanged (cheap), a fresh body the moment they change.
+    let etag = "";
+    try { const st = statSync(target); etag = `"${Math.round(st.mtimeMs).toString(36)}-${st.size.toString(36)}"`; } catch { /* */ }
+    if (etag && req.headers.get("if-none-match") === etag) {
+      return new Response(null, { status: 304, headers: { ...ctx.cors(req), ETag: etag, "Cache-Control": "no-cache" } });
+    }
     // Images are usually rendered inline in the chat rather than saved, and "attachment" makes
     // opening one in a new tab download it instead of showing it. Everything else stays an
     // attachment so a click on a file card is still a download.
     const inline = /^image\//.test(f.type || "");
     const safeName = name.replace(/[^A-Za-z0-9._-]/g, "_");
-    return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"` } });
+    return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"`, "Cache-Control": "no-cache", ...(etag ? { ETag: etag } : {}) } });
   }
 
   return new Response("Not Found", { status: 404, headers: ctx.cors(req) });

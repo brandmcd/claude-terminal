@@ -83,7 +83,26 @@ if (db) db.exec("PRAGMA busy_timeout = 5000;");
 // #region usage leaderboard (SQLite -> the leaderboard.json shape the page already consumes)
 const ROLLING_HOURS = 5, GAUGE_MAX = 5_000_000, HOURLY_HOURS = 168, SPARK_HOURS = 48;
 const ACTIVE_MS = 15 * 60 * 1000;
-const SUBSCRIPTION_USD = Number(cfg.subscriptionUsd || 0);
+// Subscription pot in USD, effective-dated by month so a mid-life price change only affects months
+// from its breakpoint onward (older months keep their old split). cfg.subscriptionUsd is either a
+// flat number, or an object of { "YYYY-MM": usd } breakpoints plus an optional "default" for months
+// before the first breakpoint, e.g. { "default": 100, "2026-09": 200 }.
+const SUB_SCHEDULE: { from: string; usd: number }[] = (() => {
+  const v = cfg.subscriptionUsd;
+  if (v == null) return [{ from: "0000-00", usd: 0 }];
+  if (typeof v === "number") return [{ from: "0000-00", usd: v }];
+  const pts = Object.entries(v).filter(([k]) => /^\d{4}-\d{2}$/.test(k)).map(([k, u]) => ({ from: k, usd: Number(u) }));
+  pts.push({ from: "0000-00", usd: Number((v as any).default ?? 0) });
+  return pts.sort((a, b) => (a.from < b.from ? -1 : 1));
+})();
+function subUsdFor(mk: string): number {
+  let val = SUB_SCHEDULE[0]?.usd ?? 0;
+  for (const p of SUB_SCHEDULE) { if (mk >= p.from) val = p.usd; else break; }
+  return val;
+}
+// The flat figure the status payload reports. Read off the schedule rather than the raw config so
+// an object-valued subscriptionUsd doesn't come through as NaN.
+const SUBSCRIPTION_USD = SUB_SCHEDULE[SUB_SCHEDULE.length - 1]?.usd ?? 0;
 
 const pad = (n: number) => String(n).padStart(2, "0");
 const hourKeyOf = (d: Date) =>
@@ -305,10 +324,19 @@ function latestSubscription() {
   try {
     const r = qSub.get() as any;
     if (!r) return null;
+    // All windows are logged in subscription_samples, but the leaderboard surfaces only the Fable
+    // per-model window (opus/sonnet/oauth_apps stay in the DB for later analysis, not on the page).
+    let fable: { utilization: number | null; resets_at: string | null } | null = null;
+    try {
+      const ms = r.model_scoped ? JSON.parse(r.model_scoped) : [];
+      const f = Array.isArray(ms) ? ms.find((m: any) => /fable/i.test(String(m?.display_name || ""))) : null;
+      if (f) fable = { utilization: f.utilization ?? null, resets_at: f.resets_at ?? null };
+    } catch { /* malformed JSON -> no fable window */ }
     return {
       subscription: r.subscription ?? null,
       five_hour: { utilization: r.five_hour_util ?? null, resets_at: r.five_hour_reset ?? null },
       seven_day: { utilization: r.seven_day_util ?? null, resets_at: r.seven_day_reset ?? null },
+      fable,
       active_users: r.active_users ?? null,
       sampled_at: r.ts ?? null,
     };
@@ -319,6 +347,19 @@ function latestSubscription() {
 // buckets (last 45 days) + cumulative + meta per local user, so the puller reconstructs
 // the same gauges against its own clock. Only local users are exported (external users
 // are read from other tables), so peers never chain each other's data.
+// Per-user per-month per-model output, for the weighted metric to travel with the export so a peer's
+// board can weight it (not just count raw output). Lazy: model_usage may not exist on an old DB.
+let qExportModels: any = null, qExportModelsChecked = false;
+function exportModelsQuery() {
+  if (qExportModelsChecked || !db) return qExportModels;
+  qExportModelsChecked = true;
+  try {
+    if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get())
+      qExportModels = db.query("SELECT substr(minute_utc,1,7) AS mk, model, sum(output) AS output FROM model_usage WHERE user = ? GROUP BY mk, model");
+  } catch { qExportModels = null; }
+  return qExportModels;
+}
+
 function buildExport() {
   if (!db) return { peer: OWNER, generated_at: new Date().toISOString(), users: [] };
   const cutoff = hourKeyOf(new Date(Date.now() - 45 * 24 * 3600e3));
@@ -494,7 +535,6 @@ function buildLeaderboard() {
 
   const allUsers = users.map((u) => u.user);
   const nameOf = Object.fromEntries(users.map((u) => [u.user, u.name]));
-  const pot = SUBSCRIPTION_USD * 100;
   const months: any[] = [];
   for (const mk of Object.keys(byMonth).sort()) {
     const parts: Record<string, Record<string, number>> = {};
@@ -509,7 +549,7 @@ function buildLeaderboard() {
     const wtotal = Object.values(wtd).reduce((a, b) => a + b, 0);
     // The subscription is split by WEIGHTED output, so a heavy-model user pays for the load they put
     // on the shared limit, not a flat per-token rate.
-    const cents = splitCents(wtd, pot);
+    const cents = splitCents(wtd, subUsdFor(mk) * 100);
     const rows = allUsers.map((u) => ({
       user: u, name: nameOf[u],
       total: outs[u], output: parts[u].output, parts: partsOf(parts[u]),
@@ -523,7 +563,7 @@ function buildLeaderboard() {
   const cur: Record<string, number> = {};
   for (const u of allUsers) cur[u] = byMonth[monthPrefix]?.[u]?.total || 0;
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
-  const curCents = splitCents(cur, pot);
+  const curCents = splitCents(cur, subUsdFor(monthPrefix) * 100);
   for (const u of users) {
     u.share_usd = curCents[u.user] / 100;
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0; // share of WEIGHTED output
@@ -912,16 +952,18 @@ const APP_MODELS: { id: string; label: string }[] = cfg.appModels || [
   { id: "claude-haiku-4-5", label: "Haiku 4.5" },
 ];
 // "Other…" list (older / more versions) — shown in a dialog behind the Other option.
+// The full "Other models" dialog list. Shown alongside the live probe's quick-picks so every model is
+// selectable even when a box's CLI probe reports a shorter menu (a guest missing Fable / Opus 4.8).
+// The id is passed straight to --model, so a model the probe omitted still works.
 const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
-  { id: "claude-opus-5", label: "Opus 5" },
-  { id: "claude-opus-4-7", label: "Opus 4.7" },
-  { id: "claude-opus-4-6", label: "Opus 4.6" },
-  { id: "claude-sonnet-5", label: "Sonnet 5" },
+  { id: "claude-fable-5-1", label: "Fable 5.1" },
   { id: "claude-fable-5", label: "Fable 5" },
+  { id: "claude-opus-5", label: "Opus 5" },
+  { id: "claude-opus-4-8", label: "Opus 4.8" },
+  { id: "claude-opus-4-7", label: "Opus 4.7" },
+  { id: "claude-sonnet-5", label: "Sonnet 5" },
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
   { id: "claude-haiku-4-5", label: "Haiku 4.5" },
-  { id: "opus", label: "Opus (latest)" },
-  { id: "sonnet", label: "Sonnet (latest)" },
-  { id: "haiku", label: "Haiku (latest)" },
 ];
 const appCtx: AppCtx = {
   allowed,
@@ -942,6 +984,8 @@ const appCtx: AppCtx = {
   moreModels: APP_MORE_MODELS,
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
+  readsFile: join(STATE_DIR, "claude-app-reads.json"),
+  autoTitlesFile: join(STATE_DIR, "claude-app-autotitles.json"),
   mcpFile: join(STATE_DIR, "claude-app-mcp.json"),
   claudeDir: join(HOME, ".claude"),
   // Rolling 5-hour output tokens for the owner + a link to the usage dashboard, for the app's
