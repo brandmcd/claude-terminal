@@ -146,6 +146,9 @@ function prettyModel(id: string): string {
   return version ? `${family} ${version}` : family;
 }
 
+// "xhigh" -> "X-high", every other level simply capitalised. Used by the effort row and the pill.
+const effortName = (lv: string) => (lv === "xhigh" ? "X-high" : lv.charAt(0).toUpperCase() + lv.slice(1));
+
 // #region api
 const J = (r: Response) => r.json();
 // Reject a request that hasn't resolved within `ms`. A hung POST on a weak link never rejects on its
@@ -872,21 +875,37 @@ function Assistant({ text, convId }: { text: string; convId?: string | null }) {
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-// Context-window gauge (like the real Claude app): a donut of how full the context is, green→amber
-// →red, click to compact. Sits in the topbar next to the model picker.
-function ContextRing({ pct, total, max, onCompact, busy, estimated }: { pct: number; total: number; max: number; onCompact: () => void; busy: boolean; estimated?: boolean }) {
-  const p = Math.max(0, Math.min(100, Math.round(pct)));
+// Session-limit gauge: a donut of how much of the shared claude.ai 5-hour rate-limit window is used,
+// with the reset time beside it. Always rendered, including before the first /usage reading lands
+// (dim ring, "—"), because whether a turn can run at all is the number people check the footer for.
+// Amber at 80%, red at 95%, the same thresholds the session-limit toast uses.
+function LimitRing({ sub, url }: { sub: Subscription; url?: string }) {
+  const u = sub?.available && sub.fiveHour?.utilization != null ? Math.round(sub.fiveHour.utilization) : null;
+  const p = Math.max(0, Math.min(100, u ?? 0));
   const r = 9, C = 2 * Math.PI * r;
-  const color = p >= 80 ? "var(--error, #EF4444)" : p >= 50 ? "var(--warning, #F59E0B)" : "var(--success, #10B981)";
-  return (
-    <button className={"ctx-ring" + (estimated ? " est" : "")} onClick={onCompact} disabled={busy || estimated} title={`Context ${estimated ? "~" : ""}${p}% full (${(total / 1000).toFixed(0)}k / ${(max / 1000).toFixed(0)}k tokens)${estimated ? " (estimated — send a message for the exact figure)" : p >= 60 ? " — click to compact" : ""}`}>
+  const color = p >= 95 ? "var(--error, #EF4444)" : p >= 80 ? "var(--warning, #F59E0B)" : "var(--success, #10B981)";
+  const resetIn = fmtResetIn(sub?.fiveHour?.resetsAt);
+  const weekU = sub?.sevenDay?.utilization != null ? Math.round(sub.sevenDay.utilization) : null;
+  const weekReset = fmtResetIn(sub?.sevenDay?.resetsAt);
+  const title = u == null
+    ? "Subscription session limit (5-hour window): waiting for the first reading"
+    : `Subscription session limit (5-hour window): ${u}% used${resetIn ? `, resets in ${resetIn}` : ""}`
+      + (weekU != null ? `\nWeekly limit: ${weekU}% used${weekReset ? `, resets in ${weekReset}` : ""}` : "")
+      + (url ? "\nOpen the usage dashboard" : "");
+  const cls = "ctx-ring" + (u == null ? " est" : p >= 95 ? " crit" : p >= 80 ? " warn" : "");
+  const body = (
+    <>
       <svg width="22" height="22" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r={r} fill="none" stroke="var(--line)" strokeWidth="3" />
-        <circle cx="12" cy="12" r={r} fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeDasharray={C} strokeDashoffset={C * (1 - p / 100)} transform="rotate(-90 12 12)" />
+        {u != null && <circle cx="12" cy="12" r={r} fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeDasharray={C} strokeDashoffset={C * (1 - p / 100)} transform="rotate(-90 12 12)" />}
       </svg>
-      <span className="ctx-pct">{p}%</span>
-    </button>
+      <span className="ctx-pct">{u == null ? "—" : `${u}%`}</span>
+      {resetIn && <i className="sub-reset">{resetIn}</i>}
+    </>
   );
+  return url
+    ? <a className={cls} href={url} target="_blank" rel="noreferrer" title={title}>{body}</a>
+    : <span className={cls} title={title}>{body}</span>;
 }
 
 // Human "resets in 3h 12m" from an ISO reset timestamp.
@@ -902,29 +921,6 @@ function fmtResetIn(iso?: string | null): string {
   return hr ? `${d}d ${hr}h` : `${d}d`;
 }
 
-// Subscription session-limit chip: how much of the claude.ai 5-hour rate-limit window is used, plus
-// when it resets. Colour is status-only feedback (amber ≥80%, red ≥95%). Weekly window in the tooltip.
-function SubscriptionChip({ sub, url }: { sub: Subscription; url?: string }) {
-  if (!sub?.available || !sub.fiveHour || sub.fiveHour.utilization == null) return null;
-  const u = Math.round(sub.fiveHour.utilization);
-  const cls = u >= 95 ? " crit" : u >= 80 ? " warn" : "";
-  const resetIn = fmtResetIn(sub.fiveHour.resetsAt);
-  const weekU = sub.sevenDay?.utilization != null ? Math.round(sub.sevenDay.utilization) : null;
-  const weekReset = fmtResetIn(sub.sevenDay?.resetsAt);
-  const title = `Subscription session limit (5-hour window): ${u}% used${resetIn ? `, resets in ${resetIn}` : ""}`
-    + (weekU != null ? `\nWeekly limit: ${weekU}% used${weekReset ? `, resets in ${weekReset}` : ""}` : "")
-    + "\nOpen the usage dashboard";
-  const body = (
-    <>
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></svg>
-      <span>{u}%</span>
-      {resetIn && <i className="sub-reset">{resetIn}</i>}
-    </>
-  );
-  return url
-    ? <a className={"sub-chip" + cls} href={url} target="_blank" rel="noreferrer" title={title}>{body}</a>
-    : <span className={"sub-chip" + cls} title={title}>{body}</span>;
-}
 
 // Shown while a compaction runs (manual click or the /compact turn). The SDK doesn't expose an
 // ETA, so this is an elapsed timer + indeterminate progress rather than a fake estimate.
@@ -1232,7 +1228,6 @@ registerTranscriptRenderer({
 function App() {
   const [models, setModels] = useState<Model[]>([]);
   const [moreModels, setMoreModels] = useState<Model[]>([]);
-  const [otherOpen, setOtherOpen] = useState(false);
   // The CLI's own slash commands and subagents, for the composer's command menu.
   const [commands, setCommands] = useState<Command[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -1265,6 +1260,9 @@ function App() {
   // here, a per-conversation override on the store once a chat is live. "" means "leave it to the
   // CLI's own setting" rather than forcing a level.
   const [defaultEffort, setDefaultEffort] = useState<string>(() => localStorage.getItem("ct-app-effort") || "");
+  // The model the advisor tool consults. Same three-layer shape again: "" means "leave it to
+  // ~/.claude/settings.json's own advisorModel" rather than forcing one.
+  const [defaultAdvisor, setDefaultAdvisor] = useState<string>(() => localStorage.getItem("ct-app-advisor") || "");
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
   const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
@@ -1272,6 +1270,10 @@ function App() {
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [showOlder, setShowOlder] = useState(false); // "Older versions" group inside the picker panel
+  // Slider position while the thumb is being dragged. The pick is committed on release, so dragging
+  // from Low to Max posts once instead of once per step.
+  const [effortDrag, setEffortDrag] = useState<number | null>(null);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [installed] = useState(isStandalone); // home-screen launch: no browser reload button, so we draw one
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
@@ -1329,7 +1331,14 @@ function App() {
   const [reachable, setReachable] = useState(true);
   const netMiss = useRef(0); // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
   const [queued, setQueued] = useState(0);
-  const [artifact, setArtifact] = useState<Artifact | null>(null); // the artifact open in the split-screen / sheet viewer
+  // The viewer holds a trail, not one artifact: a note that links to another note pushes onto it and
+  // the viewer's back button pops. A home-screen install draws no browser chrome, so a link into a
+  // second note used to be a one-way trip.
+  const [artifactTrail, setArtifactTrail] = useState<Artifact[]>([]); // last entry is what the split-screen / sheet viewer shows
+  const artifact = artifactTrail.length ? artifactTrail[artifactTrail.length - 1] : null;
+  const openArtifact = useCallback((a: Artifact) => setArtifactTrail((t) => (t.length && t[t.length - 1].id === a.id ? t : [...t, a])), []);
+  const backArtifact = useCallback(() => setArtifactTrail((t) => t.slice(0, -1)), []);
+  const closeArtifact = useCallback(() => setArtifactTrail([]), []);
   const [artifactW, setArtifactW] = useState<number>(() => { const v = Number(localStorage.getItem("ct-artifact-w")); return v >= 360 && v <= 1400 ? v : 560; }); // desktop split panel width (px), draggable + persisted
   const artifactDrag = useRef<{ startX: number; startW: number } | null>(null);
   const onArtifactResizeDown = (e: React.PointerEvent) => { e.preventDefault(); try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); } catch { /* */ } artifactDrag.current = { startX: e.clientX, startW: artifactW }; };
@@ -1357,15 +1366,22 @@ function App() {
   const activeIdRef = useRef<string | null>(null); // latest activeId for stable callbacks (voice)
   const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
   const effortRef = useRef<string>(""); // ditto for the effort default a NEW chat starts on
+  const advisorRef = useRef<string>(""); // ditto for the advisor model a NEW chat starts on
   const voiceSinks = useRef<Set<(e: AppEvent) => void>>(new Set()); // voice-mode event subscribers
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
   useEffect(() => { modelRef.current = defaultModel; }, [defaultModel]); // what a NEW chat starts on
   useEffect(() => { effortRef.current = defaultEffort; }, [defaultEffort]);
+  useEffect(() => { advisorRef.current = defaultAdvisor; }, [defaultAdvisor]);
   // The settings a start request carries: a live chat's own, else the remembered default. Undefined
-  // when nothing is chosen, so the server leaves the CLI's own effortLevel alone.
+  // when nothing is chosen, so the server leaves the CLI's own effortLevel / advisorModel alone.
   const startSettings = (s: ConvStore): SessionSettings | undefined => {
-    const eff = s.id.startsWith("new-") ? effortRef.current : (s.settings.effortLevel || effortRef.current);
-    return eff ? { effortLevel: eff as EffortLevel } : undefined;
+    const isNew = s.id.startsWith("new-");
+    const eff = isNew ? effortRef.current : (s.settings.effortLevel || effortRef.current);
+    const adv = isNew ? advisorRef.current : (s.settings.advisorModel || advisorRef.current);
+    const out: SessionSettings = {};
+    if (eff) out.effortLevel = eff as EffortLevel;
+    if (adv) out.advisorModel = adv;
+    return Object.keys(out).length ? out : undefined;
   };
 
   const nextOffsetRef = useRef(0);
@@ -2304,13 +2320,17 @@ function App() {
     void deliverAsk(s, askId, answer);
   }, [deliverAsk]);
 
-  // Tapping a PWA push (e.g. "Claude has a question") posts this from the service worker;
-  // open that conversation so the ask card is right there to answer.
+  // Tapping a PWA push posts this from the service worker. A push that names a conversation
+  // (e.g. "Claude has a question") opens it, so the ask card is right there to answer. A push
+  // that names a page instead (the morning brief at /brief/) navigates there: the SW only
+  // focuses an already-open window, so without this the tap would appear to do nothing.
   useEffect(() => {
     if (!("serviceWorker" in navigator)) return;
     const onMsg = (ev: MessageEvent) => {
       const d: any = ev.data;
-      if (d?.type === "ct-notification-click" && d.sessionId) void loadConv(String(d.sessionId));
+      if (d?.type !== "ct-notification-click") return;
+      if (d.sessionId) { void loadConv(String(d.sessionId)); return; }
+      if (d.url && d.url !== "/" && d.url !== location.pathname) location.assign(String(d.url));
     };
     navigator.serviceWorker.addEventListener("message", onMsg);
     return () => navigator.serviceWorker.removeEventListener("message", onMsg);
@@ -2320,8 +2340,9 @@ function App() {
   // hands-free, but at least it's visible and answerable instead of hidden behind the overlay).
   const pendingAsk = useMemo(() => items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined, [items]);
 
+  // Picking a model leaves the panel open: effort and advisor sit in the same panel and picking a
+  // model is usually the first of the three, not the last. The scrim closes it.
   const onPickModel = async (m: string) => {
-    setMenuOpen(false); setOtherOpen(false);
     const s = activeStoreRef.current;
     if (s && !s.id.startsWith("new-") && !s.id.startsWith("pending-")) {
       s.model = m; s.signal(); // this conversation only; the server's model event confirms it for every device
@@ -2343,6 +2364,19 @@ function App() {
     }
     setDefaultEffort(level);
     if (level) localStorage.setItem("ct-app-effort", level); else localStorage.removeItem("ct-app-effort");
+  };
+
+  // Advisor model, plumbed exactly like effort. "" clears the override so the advisorModel in
+  // ~/.claude/settings.json applies again.
+  const onPickAdvisor = async (m: string) => {
+    const s = activeStoreRef.current;
+    if (s && !s.id.startsWith("new-") && !s.id.startsWith("pending-")) {
+      s.settings = { ...s.settings, advisorModel: m || null }; s.signal();
+      if (s.connected) { try { await api.setSettings({ id: s.id, advisorModel: m || null }); } catch { /* not live: the next send carries it */ } }
+      return;
+    }
+    setDefaultAdvisor(m);
+    if (m) localStorage.setItem("ct-app-advisor", m); else localStorage.removeItem("ct-app-advisor");
   };
 
   // Put a command in the composer and leave the send to the user, exactly as typing "/name" in a
@@ -2440,12 +2474,30 @@ function App() {
     const want = bare(model);
     return [...models, ...moreModels].find((m) => m.id === model) || [...models, ...moreModels].find((m) => bare(m.id) === want || bare(m.resolvedModel) === want);
   }, [models, moreModels, model]);
-  const effortLevels = modelRow?.supportedEffortLevels || (modelRow?.supportsEffort ? (["low", "medium", "high", "xhigh", "max"] as EffortLevel[]) : []);
+  // A row the CLI described carries supportedEffortLevels (or at least supportsEffort). A row that
+  // came from this box's config.json carries neither — only an id and a label — because the operator
+  // added it, not the CLI. Assume the full set for a 5-family id, which is how Fable gets a slider
+  // instead of having the control vanish. Older ids stay effort-less rather than guessing for them.
+  const ALL_EFFORT = ["low", "medium", "high", "xhigh", "max"] as EffortLevel[];
+  const configEffort = !!modelRow && !modelRow.resolvedModel && !modelRow.supportsEffort && /-5(-|$)/.test(modelRow.id);
+  const effortLevels = modelRow?.supportedEffortLevels || (modelRow?.supportsEffort || configEffort ? ALL_EFFORT : []);
   // Effort in force here: this conversation's own if it has one, else the remembered new-chat default.
   const activeEffort = (activeStore && !activeStore.id.startsWith("new-") ? activeStore.settings.effortLevel : defaultEffort) || "";
-  // Collapsed pill: drop any "(…)" qualifier so it stays short and single-line (e.g. "Default
-  // (recommended)" -> "Default"). The dropdown row keeps the full name + description.
-  const modelBtnLabel = modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel;
+  // Same rule for the advisor model.
+  const activeAdvisor = (activeStore && !activeStore.id.startsWith("new-") ? activeStore.settings.advisorModel : defaultAdvisor) || "";
+  // Everything the advisor can be pointed at. "default" is an alias for whatever the CLI would pick
+  // anyway, which is not a meaningful advisor choice, so it is dropped in favour of the explicit
+  // "Settings default" option.
+  const advisorChoices = useMemo(
+    () => [...models, ...moreModels].filter((m) => m.id !== "default"),
+    [models, moreModels],
+  );
+  // Collapsed pill: the model that will actually run, plus the effort it runs at. An alias row is
+  // named for the alias ("Default"), which says nothing about which model that is, so prefer the
+  // resolvedModel the CLI reports. Without one, fall back to the row label minus its "(…)"
+  // qualifier so the pill stays short and single-line. The dropdown keeps the full name.
+  const modelBtnName = modelRow?.resolvedModel ? prettyModel(modelRow.resolvedModel) : (modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel);
+  const modelBtnLabel = effortLevels.length > 0 ? `${modelBtnName} · ${activeEffort ? effortName(activeEffort) : "Auto"}` : modelBtnName;
 
   // sidebar grouping — favorites pulled into their own section, the rest grouped by recency
   const favConvs = useMemo(() => convs.filter((c) => favorites.has(c.sessionId)).sort((a, b) => b.mtime - a.mtime), [convs, favorites]);
@@ -2530,10 +2582,10 @@ function App() {
           i = j - 1; continue;
         }
       }
-      nodes.push(<MessageBlock key={i} items={items} i={i} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={setArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
+      nodes.push(<MessageBlock key={i} items={items} i={i} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={openArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
     }
     return nodes;
-  }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, setArtifact]);
+  }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, openArtifact]);
 
   return (
     <div className={"app" + (drawer ? " drawer-open" : "")} onTouchStart={onAppTouchStart} onTouchMove={onAppTouchMove} onTouchEnd={onAppTouchEnd}>
@@ -2552,22 +2604,6 @@ function App() {
             {limitToast.n >= 2 ? ` ${limitToast.n} people are sharing it right now.` : ""}
           </span>
           <button className="ut-dismiss" onClick={() => { limitDismissed.current = true; setLimitToast(null); }} aria-label="Dismiss">×</button>
-        </div>
-      )}
-      {otherOpen && (
-        <div className="modal-scrim" onClick={() => setOtherOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">Choose a model<button className="modal-x" onClick={() => setOtherOpen(false)} aria-label="Close">×</button></div>
-            <div className="modal-list">
-              {moreModels.map((m) => (
-                <button key={m.id} className={m.id === model ? "active" : ""} onClick={() => onPickModel(m.id)}>
-                  <span className="mm-label">{m.label}</span>
-                  <span className="mm-id">{m.id}</span>
-                  {m.id === model && <span className="dot">●</span>}
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
       )}
       {cmdOpen && (
@@ -2867,50 +2903,102 @@ function App() {
                 <span>{modelBtnLabel}</span>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
               </button>
+              {/* Click-outside closes. The panel used to close on onMouseLeave, which fires when a
+                  slider thumb is dragged a few pixels past the edge and never fires at all on touch. */}
+              {menuOpen && <div className="picker-scrim" onClick={() => setMenuOpen(false)} />}
               {menuOpen && (
-                <div className="model-menu" onMouseLeave={() => setMenuOpen(false)}>
-                  {models.map((m) => (
-                    <button key={m.id} className="model-row" onClick={() => onPickModel(m.id)}>
-                      <span className="model-line">{m.label}{m.id === model && <span className="dot">●</span>}</span>
-                      {m.description && <span className="model-desc">{m.description}</span>}
-                    </button>
-                  ))}
-                  {moreModels.length > 0 && <button className="model-other" onClick={() => { setMenuOpen(false); setOtherOpen(true); }}>Other versions…</button>}
-                  {/* Effort, for models that take it. "Auto" clears the override and lets the CLI's own
-                      effortLevel apply, which is not the same as picking medium. */}
-                  {effortLevels.length > 0 && (
-                    <div className="effort-block">
-                      <div className="effort-label">Reasoning effort</div>
-                      <div className="effort-row">
-                        <button className={activeEffort === "" ? "on" : ""} onClick={() => onPickEffort("")}>Auto</button>
-                        {effortLevels.map((lv) => (
-                          <button key={lv} className={activeEffort === lv ? "on" : ""} onClick={() => onPickEffort(lv)}>{lv === "xhigh" ? "X-high" : lv[0].toUpperCase() + lv.slice(1)}</button>
+                <div className="model-menu" role="dialog" aria-label="Model and reasoning settings">
+                  <div className="pk-sec">
+                    <div className="pk-label">Model</div>
+                    {models.map((m) => (
+                      <button key={m.id} className={"model-row" + (m.id === model ? " on" : "")} onClick={() => onPickModel(m.id)} aria-pressed={m.id === model}>
+                        <span className="model-line">{m.label}{m.id === model && <span className="dot">●</span>}</span>
+                        {m.description && <span className="model-desc">{m.description}</span>}
+                      </button>
+                    ))}
+                    {/* Older versions live in the same panel rather than a separate dialog, so every
+                        model this box offers is reachable without leaving the one control. */}
+                    {moreModels.length > 0 && (
+                      <>
+                        <button className="model-other" onClick={() => setShowOlder((o) => !o)} aria-expanded={showOlder}>
+                          <span>Older versions</span>
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" className={showOlder ? "flip" : ""}><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                        </button>
+                        {showOlder && moreModels.map((m) => (
+                          <button key={m.id} className={"model-row" + (m.id === model ? " on" : "")} onClick={() => onPickModel(m.id)} aria-pressed={m.id === model}>
+                            <span className="model-line">{m.label}{m.id === model && <span className="dot">●</span>}</span>
+                            <span className="model-desc">{m.id}</span>
+                          </button>
                         ))}
+                      </>
+                    )}
+                  </div>
+                  {/* Effort, for models that take it. Position 0 is "Auto": it clears the override so
+                      the CLI's own effortLevel applies, which is not the same as picking medium. */}
+                  {effortLevels.length > 0 && (() => {
+                    const idx = activeEffort && effortLevels.includes(activeEffort as EffortLevel) ? effortLevels.indexOf(activeEffort as EffortLevel) + 1 : 0;
+                    const shown = effortDrag ?? idx;
+                    const name = shown === 0 ? "Auto" : effortName(effortLevels[shown - 1]);
+                    const commit = (v: number) => { setEffortDrag(null); void onPickEffort(v === 0 ? "" : effortLevels[v - 1]); };
+                    return (
+                      <div className="pk-sec effort-block">
+                        <div className="pk-label">Reasoning effort<span className="pk-val">{name}</span></div>
+                        <input
+                          className="effort-slider" type="range" min={0} max={effortLevels.length} step={1} value={shown}
+                          aria-label="Reasoning effort" aria-valuetext={name}
+                          style={{ "--fill": `calc(7.5px + (100% - 15px) * ${shown / effortLevels.length})` } as any}
+                          onChange={(e) => setEffortDrag(Number(e.target.value))}
+                          onPointerUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
+                          onPointerCancel={() => setEffortDrag(null)}
+                          onKeyUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
+                          onBlur={() => { if (effortDrag != null) commit(effortDrag); }}
+                        />
+                        <div className="effort-ticks" aria-hidden="true">
+                          {["Auto", ...effortLevels.map(effortName)].map((t, i) => (
+                            <span key={t} className={i === shown ? "on" : ""}
+                              style={{ "--p": `calc(7.5px + (100% - 15px) * ${i / effortLevels.length})` } as any}>{t}</span>
+                          ))}
+                        </div>
                       </div>
+                    );
+                  })()}
+                  {/* The model the advisor tool consults. Blank defers to advisorModel in
+                      ~/.claude/settings.json, which is what a chat uses when nothing is chosen here. */}
+                  {advisorChoices.length > 0 && (
+                    <div className="pk-sec">
+                      <div className="pk-label">Advisor model</div>
+                      <select className="pk-select" value={activeAdvisor} onChange={(e) => void onPickAdvisor(e.target.value)} aria-label="Advisor model">
+                        <option value="">Settings default</option>
+                        {advisorChoices.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                      </select>
                     </div>
                   )}
                 </div>
               )}
             </div>
             <div className="cf-spacer" />
-            {activeId && context && <span className="cf-convtok" title="Total tokens in this conversation right now">{fmtTokens(context.total)}</span>}
+            {activeId && context && (
+              <button className="cf-convtok" onClick={doCompact} disabled={compacting || context.estimated}
+                title={`${fmtTokens(context.total)} tokens in this conversation, ${context.estimated ? "~" : ""}${Math.round(context.percentage)}% of the ${(context.max / 1000).toFixed(0)}k window${context.estimated ? " (estimated, send a message for the exact figure)" : " (click to compact)"}`}>
+                {fmtTokens(context.total)}
+              </button>
+            )}
             {usage5h && (
               <a className="usage-chip" href={usage5h.url} target="_blank" rel="noreferrer" title="Output tokens in the last 5 hours — open the usage dashboard">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><path d="M7 14l4-4 3 3 5-6" /></svg>
                 <span>{fmtTokens(usage5h.output5h)}</span>
               </a>
             )}
-            <SubscriptionChip sub={subscription} url={usage5h?.url} />
-            {activeId && context && <ContextRing pct={context.percentage} total={context.total} max={context.max} onCompact={doCompact} busy={compacting} estimated={context.estimated} />}
+            <LimitRing sub={subscription} url={usage5h?.url} />
           </div>
         </div>
       </main>
       {artifact && (
         window.matchMedia("(max-width: 820px)").matches
-          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={() => setArtifact(null)} onOpen={setArtifact} />
+          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={closeArtifact} onBack={artifactTrail.length > 1 ? backArtifact : undefined} onOpen={openArtifact} />
           : <div className="artifact-panel" style={{ flex: `0 0 ${artifactW}px` }}>
               <div className="artifact-resizer" onPointerDown={onArtifactResizeDown} onPointerMove={onArtifactResizeMove} onPointerUp={onArtifactResizeUp} onPointerCancel={onArtifactResizeUp} title="Drag to resize" aria-label="Resize artifact panel" />
-              <ArtifactViewer artifact={artifact} mode="panel" onClose={() => setArtifact(null)} onOpen={setArtifact} />
+              <ArtifactViewer artifact={artifact} mode="panel" onClose={closeArtifact} onBack={artifactTrail.length > 1 ? backArtifact : undefined} onOpen={openArtifact} />
             </div>
       )}
       {msgMenu && (

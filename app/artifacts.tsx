@@ -13,7 +13,7 @@
 // code cannot reach the parent origin, its cookies, or localStorage. The parent-side markdown path
 // is unchanged from main.tsx (marked + the same local-ref rewrite), so it is no less safe than today.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { marked } from "marked";
+import { marked, Marked } from "marked";
 import { extractMath } from "./mathrender";
 import hljs from "highlight.js/lib/common";
 
@@ -189,7 +189,10 @@ export function isMarkdownHref(href: string): boolean {
 // baseDir is set when rendering a .md file in the viewer: a relative ref inside a note means "next
 // to the note", not "in the chat's cwd".
 function rewriteLocalRefs(html: string, convId: string | null, baseDir?: string | null): string {
-  const abs = (p: string) => (baseDir && !/^[~/]/.test(p) ? baseDir.replace(/\/+$/, "") + "/" + p : p);
+  // marked percent-encodes a destination, and a note name is usually "Two Words.md"; the download
+  // route wants the real path, so undo that before resolving.
+  const dec = (p: string) => { try { return decodeURIComponent(p); } catch { return p; } };
+  const abs = (p: string) => { const d = dec(p); return baseDir && !/^[~/]/.test(d) ? baseDir.replace(/\/+$/, "") + "/" + d : d; };
   const dl = (p: string) => downloadUrl(convId, abs(p));
   return html
     .replace(/<img([^>]*?)\ssrc="([^"]+)"([^>]*)>/g, (m, pre, src, post) =>
@@ -379,11 +382,120 @@ window.addEventListener('error',function(ev){var b=document.getElementById('root
 <\/script></body></html>`;
 }
 
+// #region note markdown (Obsidian flavour)
+// A .md file opened in the viewer is a vault note, not a chat message, so it renders through its own
+// marked instance and a small preprocessor. Four differences from the chat path:
+//   breaks:false  notes are hard-wrapped at ~85 columns. breaks:true turned every wrapped line into
+//                 a <br>, which on a phone shredded every paragraph into three-word ribbons.
+//   frontmatter   the leading --- block is metadata. marked read the closing --- as a setext h2 and
+//                 printed the YAML as a giant heading. It is stripped, not shown.
+//   callouts      > [!note]- Title is Obsidian syntax. It came out as a blockquote starting with a
+//                 literal "[!note]-"; it now becomes a <details> that opens and closes.
+//   wikilinks     [[Note]] came out as literal brackets; it now becomes a link that opens the next
+//                 note in the same viewer.
+const noteMarked = new Marked({ gfm: true, breaks: false });
+
+// Drop a leading YAML frontmatter block (type/updated/tags/...). Obsidian shows these as properties;
+// here they are metadata the reader did not ask for, and rendering them is what broke the heading.
+export function stripFrontmatter(src: string): string {
+  const m = src.match(/^﻿?---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/);
+  return m ? src.slice(m[0].length) : src;
+}
+
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i;
+// A wikilink target without one of these is a note, and gets .md appended. An allowlist rather than
+// "does it end in a dot and a few letters", because a note called "RB 2026-09-11 22.55.42" ends in
+// exactly that shape and is still a note.
+const FILE_EXT = /\.(md|markdown|png|jpe?g|gif|webp|svg|avif|bmp|pdf|mp4|mov|m4v|mp3|wav|m4a|csv|tsv|json|ya?ml|txt|zip|pptx?|docx?|xlsx?|canvas|base|excalidraw)$/i;
+
+// [[Note]], [[Note|Alias]], [[Note#Heading]], ![[image.png]]. Emitted as ordinary markdown so the
+// existing rewriteLocalRefs / data-md path handles the click. Angle-bracket destinations because a
+// note name almost always contains spaces.
+function wikiLinks(text: string): string {
+  return text.replace(/(!?)\[\[([^\[\]\n|]+)(?:\|([^\[\]\n]*))?\]\]/g, (_m, bang: string, target: string, alias?: string) => {
+    const t = target.trim();
+    const hash = t.indexOf("#");
+    // A wikilink inside a table is written [[Note\|Alias]]; the escape belongs to the pipe, not the name.
+    const pathPart = (hash >= 0 ? t.slice(0, hash) : t).trim().replace(/\\+$/, "");
+    const heading = hash >= 0 ? t.slice(hash + 1).trim() : "";
+    const label = (alias || "").trim() || (pathPart ? (heading ? pathPart + " › " + heading : pathPart) : heading);
+    if (!pathPart) return label; // [[#Heading]] is a jump inside this note; no file to open
+    const href = FILE_EXT.test(pathPart) ? pathPart : pathPart + ".md";
+    if (bang && IMAGE_EXT.test(href)) return "![" + label + "](<" + href + ">)";
+    return "[" + label + "](<" + href + ">)";
+  });
+}
+
+// Inline code spans keep their brackets: `[[literal]]` in a note is usually being quoted, not linked.
+function wikiLinksOutsideCode(line: string): string {
+  return line.split(/(`[^`]*`)/).map((part) => (part.startsWith("`") ? part : wikiLinks(part))).join("");
+}
+
+// "ai-flag" -> "AI flag". Used when a callout has no title of its own.
+function calloutLabel(type: string): string {
+  return type.split("-").map((w) => (w.toLowerCase() === "ai" ? "AI" : w.charAt(0).toUpperCase() + w.slice(1))).join(" ");
+}
+
+const CALLOUT_HEAD = /^>[ \t]*\[!([A-Za-z0-9_-]+)\]([+-]?)[ \t]*(.*)$/;
+const FENCE_OPEN = /^(\s{0,3})(`{3,}|~{3,})(.*)$/;
+
+// One line-based pass over a note: fenced code is copied through untouched, callouts become
+// <details> blocks (recursively, so a callout inside a callout still works) and everything else gets
+// its wikilinks rewritten. Runs on the markdown source, not on marked's output, because with
+// breaks:false the callout title and its first body line merge into one paragraph.
+function transformNote(src: string): string {
+  const lines = src.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const f = line.match(FENCE_OPEN);
+    if (f) {
+      const marker = f[2];
+      const closeRe = new RegExp("^\\s{0,3}" + marker[0] + "{" + marker.length + ",}\\s*$");
+      out.push(line);
+      i++;
+      while (i < lines.length && !closeRe.test(lines[i])) { out.push(lines[i]); i++; }
+      if (i < lines.length) { out.push(lines[i]); i++; }
+      continue;
+    }
+    const c = line.match(CALLOUT_HEAD);
+    if (c) {
+      const body: string[] = [];
+      let j = i + 1;
+      for (; j < lines.length && /^>/.test(lines[j]); j++) body.push(lines[j].replace(/^>[ \t]?/, ""));
+      const type = c[1].toLowerCase();
+      const collapsed = c[2] === "-";
+      const title = c[3].trim() || calloutLabel(c[1]);
+      // A blank line after the opening tag ends the raw-HTML block, so the body is parsed as
+      // markdown rather than passed through as HTML.
+      out.push("<details class=\"cal cal-" + type + "\"" + (collapsed ? "" : " open") + ">");
+      out.push("<summary>" + (noteMarked.parseInline(wikiLinks(title)) as string) + "</summary>");
+      out.push("");
+      out.push(transformNote(body.join("\n")));
+      out.push("");
+      out.push("</details>");
+      out.push("");
+      i = j;
+      continue;
+    }
+    out.push(wikiLinksOutsideCode(line));
+    i++;
+  }
+  return out.join("\n");
+}
+
+// Full note -> HTML. Shared by the in-app viewer and the standalone document.
+export function renderNote(src: string): string {
+  return noteMarked.parse(transformNote(stripFrontmatter(src || ""))) as string;
+}
+// #endregion
+
 // Standalone document for a viewed .md file. The in-app preview renders markdown with the app's
 // own styles; this is only what "open in a new tab" and a saved copy get.
 function mdDoc(code: string): string {
-  const body = marked.parse(code) as string;
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${IFRAME_RESET}body{max-width:44rem;margin:0 auto;padding:24px 20px 60px;line-height:1.6}img{max-width:100%}pre{overflow-x:auto;background:#f6f6f4;padding:12px;border-radius:8px}code{font-family:ui-monospace,Menlo,Consolas,monospace}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 9px}</style></head><body>${body}</body></html>`;
+  const body = renderNote(code);
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${IFRAME_RESET}body{max-width:44rem;margin:0 auto;padding:24px 20px 60px;line-height:1.6}img{max-width:100%}pre{overflow-x:auto;background:#f6f6f4;padding:12px;border-radius:8px}code{font-family:ui-monospace,Menlo,Consolas,monospace}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 9px}details.cal{border:1px solid #e2ded8;border-left:3px solid #9aa;border-radius:8px;padding:8px 12px;margin:0 0 14px;background:#fafaf8}details.cal>summary{font-weight:600;cursor:pointer}</style></head><body>${body}</body></html>`;
 }
 
 async function buildArtifactDoc(a: Artifact): Promise<string> {
@@ -433,15 +545,17 @@ type Tab = "preview" | "source";
 
 // The live renderer. Works as an embedded right-hand panel (mode="panel", fills its container) or as
 // a full-screen sheet (mode="sheet"). main.tsx chooses which based on viewport width.
-export function ArtifactViewer({ artifact, mode, onClose, onOpen }: { artifact: Artifact; mode: ArtifactViewerMode; onClose: () => void; onOpen?: (a: Artifact) => void }) {
+export function ArtifactViewer({ artifact, mode, onClose, onBack, onOpen }: { artifact: Artifact; mode: ArtifactViewerMode; onClose: () => void; onBack?: () => void; onOpen?: (a: Artifact) => void }) {
   const [tab, setTab] = useState<Tab>("preview");
   const [doc, setDoc] = useState<string>("");
   const [err, setErr] = useState<string | null>(null);
   const [building, setBuilding] = useState(true);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let live = true;
     setBuilding(true); setErr(null);
+    if (bodyRef.current) bodyRef.current.scrollTop = 0; // a note opened from a link starts at its top, not where the last one was scrolled to
     buildArtifactDoc(artifact)
       .then((d) => { if (live) { setDoc(d); setBuilding(false); } })
       .catch((e: unknown) => { if (live) { setErr(e instanceof Error ? e.message : String(e)); setBuilding(false); } });
@@ -451,10 +565,10 @@ export function ArtifactViewer({ artifact, mode, onClose, onOpen }: { artifact: 
   // Esc closes the full-screen sheet.
   useEffect(() => {
     if (mode !== "sheet") return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") (onBack || onClose)(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mode, onClose]);
+  }, [mode, onClose, onBack]);
 
   const download = useCallback(() => {
     const blob = new Blob([artifact.code], { type: "text/plain;charset=utf-8" });
@@ -476,6 +590,13 @@ export function ArtifactViewer({ artifact, mode, onClose, onOpen }: { artifact: 
   return (
     <div className={"ct-av ct-av-" + mode}>
       <div className="ct-av-head">
+        {/* A note that links to another note replaces what is on screen, and an installed PWA draws
+            no browser chrome, so without this there is no way back to the note you came from. */}
+        {onBack && (
+          <button className="ct-av-back" onClick={onBack} title="Back" aria-label="Back">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M15 5l-7 7 7 7" /></svg>
+          </button>
+        )}
         <div className="ct-av-tabs">
           <button className={"ct-av-tab" + (tab === "preview" ? " on" : "")} onClick={() => setTab("preview")}>Preview</button>
           <button className={"ct-av-tab" + (tab === "source" ? " on" : "")} onClick={() => setTab("source")}>Source</button>
@@ -490,11 +611,11 @@ export function ArtifactViewer({ artifact, mode, onClose, onOpen }: { artifact: 
           </button>
         </div>
       </div>
-      <div className={"ct-av-body" + (artifact.kind === "markdown" && tab === "preview" ? " ct-av-mdbody" : "")}>
+      <div ref={bodyRef} className={"ct-av-body" + (artifact.kind === "markdown" && tab === "preview" ? " ct-av-mdbody" : "")}>
         {tab === "preview" && artifact.kind === "markdown" ? (
           // Rendered with the app's own markdown styles: dark theme, KaTeX, and .md links inside the
           // note open the next note in this same viewer.
-          <div className="ct-av-md md-root"><Markdown text={artifact.code} convId={artifact.convId ?? null} baseDir={artifact.baseDir} onOpenArtifact={onOpen} /></div>
+          <div className="ct-av-md md-root"><Markdown text={artifact.code} convId={artifact.convId ?? null} baseDir={artifact.baseDir} variant="note" onOpenArtifact={onOpen} /></div>
         ) : tab === "preview" ? (
           err ? (
             <div className="ct-av-error"><b>Could not render this artifact</b><pre>{err}</pre></div>
@@ -517,9 +638,47 @@ export function ArtifactViewer({ artifact, mode, onClose, onOpen }: { artifact: 
 }
 // #endregion
 
+// Read a .md file and hand it to the viewer. A link inside a note is written the Obsidian way — by
+// name, resolved anywhere in the vault — so when the path next to the note misses, the server is
+// asked to find the file by basename. A miss renders as a callout in the viewer rather than falling
+// back to the download: on iOS a download throws you out of the installed app.
+async function openNote(path: string, convId: string | null, open: (a: Artifact) => void): Promise<void> {
+  const name = path.split("/").pop() || "note.md";
+  const read = async (p: string): Promise<string> => {
+    const r = await fetch(downloadUrl(convId, p));
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.text();
+  };
+  let code: string | null = null;
+  let resolved = path;
+  try { code = await read(path); } catch {
+    try {
+      const r = await fetch(`/app/api/mdresolve?id=${encodeURIComponent(convId || "")}&from=${encodeURIComponent(path)}`);
+      const j = r.ok ? ((await r.json()) as { path?: string }) : null;
+      if (j?.path) { resolved = j.path; code = await read(j.path); }
+    } catch { /* not found, or an older server with no resolve route: show the card below */ }
+  }
+  if (code == null) {
+    open({
+      id: `md-missing-${shortHash(path)}`, kind: "markdown", lang: "markdown", title: name, convId, baseDir: null,
+      code: `> [!warning] Note not found\n> Nothing readable at \`${path}\`. The link may point outside this box, or the note has been renamed.`,
+    });
+    return;
+  }
+  open({
+    id: `md-${shortHash(resolved)}`, kind: "markdown", lang: "markdown", code,
+    title: resolved.split("/").pop() || name, convId,
+    baseDir: resolved.includes("/") ? resolved.replace(/\/[^/]*$/, "") : null,
+  });
+}
+
 // #region AssistantContent (drop-in replacement for main.tsx's <Assistant>)
-function Markdown({ text, convId, baseDir, onOpenArtifact }: { text: string; convId: string | null; baseDir?: string | null; onOpenArtifact?: (a: Artifact) => void }) {
-  const html = useMemo(() => { const { text: pre, restore } = extractMath(text || ""); return rewriteLocalRefs(restore(marked.parse(pre) as string), convId, baseDir); }, [text, convId, baseDir]);
+function Markdown({ text, convId, baseDir, variant, onOpenArtifact }: { text: string; convId: string | null; baseDir?: string | null; variant?: "chat" | "note"; onOpenArtifact?: (a: Artifact) => void }) {
+  const html = useMemo(() => {
+    const { text: pre, restore } = extractMath(text || "");
+    const raw = variant === "note" ? renderNote(pre) : (marked.parse(pre) as string);
+    return rewriteLocalRefs(restore(raw), convId, baseDir);
+  }, [text, convId, baseDir, variant]);
   // Tapping a .md link fetches the file and opens it in the artifact viewer (split panel on a wide
   // screen, full-screen sheet on a phone). Without this the link is a download, which on iOS leaves
   // the PWA. fetch() ignores the route's Content-Disposition, so no server change is needed to read.
@@ -530,20 +689,7 @@ function Markdown({ text, convId, baseDir, onOpenArtifact }: { text: string; con
     // No viewer to open into (the spawned-work transcript renderer mounts this without one): a new
     // tab is the old behaviour and keeps the chat where it is.
     if (!onOpenArtifact) { window.open(a.href, "_blank", "noopener"); return; }
-    const path = a.getAttribute("data-md") || "";
-    const href = a.href;
-    fetch(href)
-      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((code) => onOpenArtifact({
-        id: `md-${shortHash(path)}`,
-        kind: "markdown",
-        lang: "markdown",
-        code,
-        title: path.split("/").pop() || "note.md",
-        convId,
-        baseDir: path.includes("/") ? path.replace(/\/[^/]*$/, "") : null,
-      }))
-      .catch(() => { window.open(href, "_blank", "noopener"); }); // unreadable path — fall back to the download
+    void openNote(a.getAttribute("data-md") || "", convId, onOpenArtifact);
   }, [onOpenArtifact, convId]);
   return <div className="md" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
@@ -625,6 +771,8 @@ function injectArtifactCss() {
   .ct-av-btn{display:inline-flex;align-items:center;gap:5px;background:transparent;border:1px solid var(--line);color:var(--text-2);border-radius:8px;padding:5px 9px;font:inherit;font-size:12px;transition:background .12s,color .12s}
   .ct-av-btn:hover:not(:disabled){background:var(--bg-3);color:var(--text)}
   .ct-av-btn:disabled{opacity:.45;cursor:default}
+  .ct-av-back{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;background:transparent;border:1px solid var(--line);color:var(--text-2);border-radius:8px}
+  .ct-av-back:hover{background:var(--bg-3);color:var(--text)}
   .ct-av-close{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;background:transparent;border:1px solid var(--line);color:var(--text-2);border-radius:8px}
   .ct-av-close:hover{background:var(--bg-3);color:var(--text)}
   .ct-av-body{flex:1;min-height:0;position:relative;display:flex;background:#fff}
@@ -632,7 +780,27 @@ function injectArtifactCss() {
   .ct-av-source{flex:1;min-height:0;overflow:auto;background:var(--panel);padding:12px}
   /* viewer — markdown file preview (app theme, not the white iframe) */
   .ct-av-mdbody{background:var(--panel);display:block;overflow:auto;-webkit-overflow-scrolling:touch}
-  .ct-av-md{max-width:46rem;margin:0 auto;padding:16px 18px calc(40px + env(safe-area-inset-bottom,0px))}
+  .ct-av-md{max-width:46rem;margin:0 auto;padding:16px 18px 40px}
+  /* Obsidian callouts — > [!note]- Title becomes a <details>. The colour on the left edge is the
+     callout type; collapsed ones open on a tap of the title. */
+  .md details.cal{margin:0 0 14px;padding:9px 13px;border:1px solid var(--line-2);border-left:3px solid var(--text-3);border-radius:10px;background:var(--bg-2)}
+  .md details.cal>summary{display:flex;gap:7px;align-items:baseline;font-weight:600;font-size:13.5px;color:var(--text);cursor:pointer;list-style:none}
+  .md details.cal>summary::-webkit-details-marker{display:none}
+  .md details.cal>summary::before{content:"›";display:inline-block;color:var(--text-3);font-size:15px;line-height:1;transition:transform .15s}
+  .md details.cal[open]>summary::before{transform:rotate(90deg)}
+  .md details.cal>summary+*{margin-top:9px}
+  .md details.cal>*:last-child{margin-bottom:0}
+  .md details.cal-warning,.md details.cal-caution,.md details.cal-attention{border-left-color:var(--warning,#F59E0B)}
+  .md details.cal-danger,.md details.cal-error,.md details.cal-bug,.md details.cal-ai-flag{border-left-color:var(--error,#EF4444)}
+  .md details.cal-success,.md details.cal-tip,.md details.cal-done,.md details.cal-check{border-left-color:var(--success,#10B981)}
+  .md details.cal-info,.md details.cal-note,.md details.cal-abstract,.md details.cal-summary{border-left-color:var(--accent-2)}
+  .md details.cal-ai,.md details.cal-ai-summary{border-left-color:var(--accent)}
+  /* viewer — full-screen sheet on a phone. inset:0 puts the header, and the only way out of it,
+     under the front camera / Dynamic Island. The inset goes on the header rather than the sheet so
+     its background still runs to the top edge of the screen. */
+  .ct-av-sheet .ct-av-head{padding:calc(9px + env(safe-area-inset-top,0px)) calc(12px + env(safe-area-inset-right,0px)) 9px calc(12px + env(safe-area-inset-left,0px))}
+  .ct-av-sheet .ct-av-body{padding-bottom:env(safe-area-inset-bottom,0px)}
+  .ct-av-sheet .ct-av-md{padding-left:calc(18px + env(safe-area-inset-left,0px));padding-right:calc(18px + env(safe-area-inset-right,0px))}
   .ct-av-source .ct-code{margin:0}
   .ct-av-loading{flex:1;display:flex;align-items:center;justify-content:center;gap:9px;color:var(--text-3);font-size:13px;background:var(--panel)}
   .ct-av-spin{width:14px;height:14px;border-radius:50%;border:2px solid var(--line);border-top-color:var(--accent);animation:spin .8s linear infinite}
@@ -640,9 +808,9 @@ function injectArtifactCss() {
   .ct-av-error b{display:block;margin-bottom:8px;color:var(--danger,#e0685f)}
   .ct-av-error pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;background:var(--bg-2);border:1px solid var(--line-2);border-radius:8px;padding:12px}
   /* image lightbox */
-  .ct-lightbox{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:24px;cursor:zoom-out}
+  .ct-lightbox{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:calc(24px + env(safe-area-inset-top,0px)) calc(24px + env(safe-area-inset-right,0px)) calc(24px + env(safe-area-inset-bottom,0px)) calc(24px + env(safe-area-inset-left,0px));cursor:zoom-out}
   .ct-lightbox img{max-width:100%;max-height:100%;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
-  .ct-lightbox-x{position:fixed;top:14px;right:16px;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:26px;line-height:1}
+  .ct-lightbox-x{position:fixed;top:calc(14px + env(safe-area-inset-top,0px));right:calc(16px + env(safe-area-inset-right,0px));width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:26px;line-height:1}
   .ct-lightbox-x:hover{background:rgba(255,255,255,.22)}
   /* highlight.js — warm dark theme tuned to the app palette */
   .hljs{color:#ece7e1;background:transparent}
@@ -655,7 +823,10 @@ function injectArtifactCss() {
   .hljs-attr,.hljs-property,.hljs-params{color:#c9a7e6}
   .hljs-tag,.hljs-punctuation{color:#b8afa5}
   .hljs-emphasis{font-style:italic}.hljs-strong{font-weight:700}
-  @media (max-width:820px){.ct-av-head{gap:6px;padding:8px 8px calc(8px)}.ct-av-title{display:none}.ct-av-btn span{display:none}}
+  @media (max-width:820px){
+    .ct-av-head{gap:6px;padding:8px}.ct-av-title{display:none}.ct-av-btn span{display:none}
+    .ct-av-sheet .ct-av-head{padding:calc(8px + env(safe-area-inset-top,0px)) calc(8px + env(safe-area-inset-right,0px)) 8px calc(8px + env(safe-area-inset-left,0px))}
+  }
   `;
   const el = document.createElement("style"); el.id = "artifacts-css"; el.textContent = css; document.head.appendChild(el);
 }

@@ -1974,7 +1974,13 @@
       .catch((e) => log("sw register failed", e));
     navigator.serviceWorker.addEventListener("message", (ev) => {
       const d = ev.data || {};
-      if (d.type === "ct-notification-click" && d.sessionId && d.sessionId !== curId()) switchTo(d.sessionId);
+      if (d.type !== "ct-notification-click") return;
+      if (d.sessionId) { if (d.sessionId !== curId()) switchTo(d.sessionId); return; }
+      // A push that names a page instead of a session, e.g. the morning brief at /brief/.
+      // The service worker focuses this window without loading anything, so nothing would
+      // happen unless we navigate it ourselves. The target is inside the manifest scope, so
+      // it opens in the app window and its own back control returns here.
+      if (d.url && d.url !== "/" && d.url !== location.pathname) location.assign(d.url);
     });
   }
 

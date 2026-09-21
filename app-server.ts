@@ -897,6 +897,52 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
   }
 
   // Download a file from within a conversation's cwd (guard traversal).
+  // Resolve a note referenced by name to a real file. Obsidian's [[wikilink]] names a note, not a
+  // path: the target usually sits in a different folder of the vault, so the viewer's first read —
+  // the name next to the linking note — misses. Given that missed path, this searches the note's own
+  // tree for the basename and hands back where it actually is. Bounded by the same roots the
+  // download route allows, so it cannot read or enumerate anything a download could not.
+  if (req.method === "GET" && path === "/app/api/mdresolve") {
+    const u = new URL(req.url);
+    const id = u.searchParams.get("id") || "";
+    const from = u.searchParams.get("from") || "";
+    if (!/\.(md|markdown)$/i.test(from)) return jsonRes({ error: "not a markdown path" }, ctx, req, 400);
+    const conv = id ? get(id) : undefined;
+    let base = conv?.cwd || undefined;
+    if (!base && /^[A-Za-z0-9-]{6,}$/.test(id)) { const t = findTranscript(ctx, id); if (t) base = (await convMeta(t.path)).cwd || undefined; }
+    base = base || ctx.defaultCwd;
+    const rel = /^~(\/|$)/.test(from) ? join(process.env.HOME || homedir(), from.slice(1)) : from;
+    const target = resolve(rel.startsWith("/") ? rel : join(base, rel));
+    const under = (root: string) => target === root || target.startsWith(root.replace(/\/+$/, "") + "/");
+    const roots = [base, ...ctx.downloadRoots];
+    const root = roots.find(under);
+    if (!root) return jsonRes({ error: "path outside conversation" }, ctx, req, 403);
+    const wanted = (target.split("/").pop() || "").toLowerCase();
+    // Search the note's own vault rather than the whole root: walk up from the note until a
+    // directory that marks a tree of its own (.obsidian or .git), falling back to the root.
+    const isDir = (p: string) => { try { return statSync(p).isDirectory(); } catch { return false; } };
+    let top = target.replace(/\/[^/]*$/, "");
+    for (let d = top; d.length >= root.length; d = d.replace(/\/[^/]*$/, "")) {
+      if (isDir(join(d, ".obsidian")) || isDir(join(d, ".git"))) { top = d; break; }
+      if (d === root || !d.includes("/")) { top = root; break; }
+    }
+    // Breadth-first so a shallow match wins, and capped so a link into a huge tree cannot spin.
+    const queue = [top];
+    let seen = 0;
+    while (queue.length && seen < 2000) {
+      const dir = queue.shift() as string;
+      seen++;
+      let entries: import("fs").Dirent[];
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        if (e.name.startsWith(".") || e.name === "node_modules") continue;
+        if (e.isDirectory()) queue.push(join(dir, e.name));
+        else if (e.name.toLowerCase() === wanted) return jsonRes({ path: join(dir, e.name) }, ctx, req);
+      }
+    }
+    return jsonRes({ error: "not found" }, ctx, req, 404);
+  }
+
   if (req.method === "GET" && path === "/app/api/download") {
     const u = new URL(req.url);
     const id = u.searchParams.get("id") || "";

@@ -171,9 +171,13 @@ a { color: var(--accent-2); }
 .model-btn > span { overflow: hidden; text-overflow: ellipsis; max-width: 40vw; }
 .model-btn > svg { flex: 0 0 auto; }
 .model-btn:hover { border-color: #4a413a; }
+/* Covers the viewport behind the picker so a tap or click anywhere else closes it. Below the panel,
+   above everything else the composer draws. */
+.picker-scrim { position: fixed; inset: 0; z-index: 19; }
 .model-menu {
   position: absolute; right: 0; top: 40px; background: var(--bg-2); border: 1px solid var(--line);
-  border-radius: 12px; padding: 5px; min-width: 150px; box-shadow: 0 12px 34px rgba(0,0,0,.5); z-index: 20;
+  border-radius: 12px; padding: 5px; width: 340px; max-width: calc(100vw - 24px);
+  max-height: 70vh; overflow-y: auto; box-shadow: 0 12px 34px rgba(0,0,0,.5); z-index: 20;
 }
 .model-menu button {
   display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 8px 10px;
@@ -186,7 +190,24 @@ a { color: var(--accent-2); }
 .model-menu .model-row { max-width: 320px; }
 .model-menu .model-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .model-menu .model-desc { color: var(--text-2); font-size: 11.5px; line-height: 1.35; white-space: normal; }
-.model-menu .model-other { border-top: 1px solid var(--line-2); margin-top: 4px; padding-top: 9px; color: var(--text-2); font-size: 13px; }
+.model-menu .model-row.on { background: var(--bg-3); }
+.model-menu .model-other { color: var(--text-2); font-size: 12.5px; }
+.model-menu .model-other svg { transition: transform .15s ease; }
+.model-menu .model-other svg.flip { transform: rotate(180deg); }
+
+/* One picker panel, three labelled sections: model list, effort slider, advisor select. */
+.pk-sec + .pk-sec { border-top: 1px solid var(--line-2); margin-top: 5px; padding-top: 8px; }
+.pk-label {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3);
+  font-weight: 600; padding: 2px 8px 6px;
+}
+.pk-val { text-transform: none; letter-spacing: 0; font-size: 12px; color: var(--accent); font-weight: 600; }
+.pk-select {
+  width: calc(100% - 12px); margin: 0 6px 5px; padding: 8px 10px; background: var(--bg-3);
+  border: 1px solid var(--line); border-radius: 9px; color: var(--text); font: inherit; font-size: 13px;
+}
+.pk-select:hover { border-color: #4a413a; }
 /* In the composer foot the menu opens UPWARD (it sits at the bottom of the screen) and to the left. */
 .model-picker.up .model-menu { top: auto; bottom: 40px; left: 0; right: auto; }
 .model-picker.up .model-btn { padding: 5px 10px; font-size: 12.5px; }
@@ -292,20 +313,20 @@ a { color: var(--accent-2); }
 .working-pill { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; font-size: 11.5px; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); padding: 2px 9px; border-radius: 999px; font-weight: 600; flex: 0 0 auto; }
 .wp-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: ctpulse 1s ease-in-out infinite; }
 .ctx-ring.est { opacity: .6; }
-.ctx-ring { display: inline-flex; align-items: center; gap: 5px; background: none; border: 0; color: var(--text-2); cursor: pointer; padding: 2px 4px; border-radius: 8px; }
+.ctx-ring { display: inline-flex; align-items: center; gap: 5px; background: none; border: 0; color: var(--text-2); cursor: pointer; padding: 2px 4px; border-radius: 8px; text-decoration: none; flex: 0 0 auto; }
 .ctx-ring:hover { background: var(--bg-2); }
 .ctx-ring:disabled { opacity: .5; cursor: default; }
 .ctx-pct { font-size: 11px; font-variant-numeric: tabular-nums; }
 .usage-chip { display: inline-flex; align-items: center; gap: 5px; color: var(--text-3); text-decoration: none; font-size: 11.5px; padding: 5px 7px; border-radius: 8px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
 .usage-chip:hover { background: var(--bg-2); color: var(--text); }
-.cf-convtok { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+.cf-convtok { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; flex: 0 0 auto; background: none; border: 0; cursor: pointer; padding: 3px 5px; border-radius: 8px; font-family: inherit; }
+.cf-convtok:hover:not(:disabled) { background: var(--bg-2); color: var(--text); }
+.cf-convtok:disabled { cursor: default; }
 /* Plan session-limit chip (5-hour claude.ai window). Muted by default; status colour only as it fills. */
-.sub-chip { display: inline-flex; align-items: center; gap: 4px; color: var(--text-3); text-decoration: none; font-size: 11.5px; padding: 5px 7px; border-radius: 8px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
-.sub-chip:hover { background: var(--bg-2); color: var(--text); }
-.sub-chip .sub-reset { color: var(--text-3); font-style: normal; font-size: 10.5px; opacity: 0.75; }
-.sub-chip.warn { color: var(--warning); }
-.sub-chip.crit { color: var(--error); }
-.sub-chip.warn .sub-reset, .sub-chip.crit .sub-reset { color: inherit; opacity: 0.8; }
+.ctx-ring .sub-reset { color: var(--text-3); font-style: normal; font-size: 10.5px; opacity: 0.75; }
+.ctx-ring.warn { color: var(--warning); }
+.ctx-ring.crit { color: var(--error); }
+.ctx-ring.warn .sub-reset, .ctx-ring.crit .sub-reset { color: inherit; opacity: 0.8; }
 
 /* Shared subscription session-limit toast: fires when the 5h limit is high and the box is contended. */
 .limit-toast {
@@ -506,15 +527,38 @@ a { color: var(--accent-2); }
 /* ---------- reasoning effort ---------- */
 /* A segmented row at the foot of the model menu. Only rendered for a model whose picker row reports
    supportedEffortLevels, so Haiku (which takes none) does not show a dead control. */
-.effort-block { border-top: 1px solid var(--line-2); margin-top: 4px; padding: 8px 4px 4px; }
-.effort-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 600; padding: 0 6px 6px; }
-.effort-row { display: flex; flex-wrap: wrap; gap: 4px; }
-.model-menu .effort-row button {
-  width: auto; flex: 1 1 auto; justify-content: center; padding: 6px 9px; font-size: 12px;
-  background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; color: var(--text-2); white-space: nowrap;
+/* Effort slider. Six discrete stops (Auto + five levels) replace the button row that wrapped onto
+   two ragged lines inside the panel. --fill is set inline from the current position so the track
+   left of the thumb takes the accent colour in both engines. */
+.effort-block { padding-bottom: 4px; }
+.effort-slider {
+  -webkit-appearance: none; appearance: none; display: block; width: calc(100% - 16px);
+  margin: 2px 8px 6px; height: 20px; background: transparent; outline: none;
 }
-.model-menu .effort-row button:hover { color: var(--text); border-color: #4a413a; }
-.model-menu .effort-row button.on { background: var(--accent); border-color: var(--accent); color: #1a1613; font-weight: 600; }
+.effort-slider::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 999px;
+  background: linear-gradient(to right, var(--accent) 0 var(--fill, 0%), var(--line) var(--fill, 0%) 100%);
+}
+.effort-slider::-moz-range-track { height: 4px; border-radius: 999px; background: var(--line); }
+.effort-slider::-moz-range-progress { height: 4px; border-radius: 999px; background: var(--accent); }
+.effort-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 15px; height: 15px; margin-top: -5.5px;
+  border-radius: 50%; background: var(--accent); border: 2px solid var(--bg-2); cursor: grab;
+}
+.effort-slider::-moz-range-thumb {
+  width: 15px; height: 15px; border-radius: 50%; background: var(--accent);
+  border: 2px solid var(--bg-2); cursor: grab;
+}
+.effort-slider:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px rgba(199,139,90,.35); }
+.effort-slider:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 3px rgba(199,139,90,.35); }
+/* Tick labels sit exactly under their stop. The thumb travels between its own half-widths, so each
+   label's --p is measured on (100% - thumb) and offset by half a thumb, not on the bare width. */
+.effort-ticks { position: relative; height: 13px; margin: 0 8px 4px; }
+.effort-ticks span {
+  position: absolute; left: var(--p); transform: translateX(-50%);
+  font-size: 10px; line-height: 13px; color: var(--text-3); white-space: nowrap;
+}
+.effort-ticks span.on { color: var(--accent); font-weight: 600; }
 
 /* ---------- command palette ---------- */
 .cmd-modal { max-width: 520px; }

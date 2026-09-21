@@ -38,6 +38,11 @@ type Phase = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "
 // commentary" mode. content_block_start for the tool arrives within a few tens of ms of the text
 // ending, so this only has to cover the gap; it is also the extra delay on first audio.
 const HOLD_MS = 350;
+// "still working" cue: a quiet blip while the turn is in flight (see the cue region below).
+const CUE_HZ = 600;
+const CUE_MS = 70;
+const CUE_GAIN = 0.05;
+const CUE_EVERY_MS = 1200;
 // If the user echo never comes back (a decorated turn, a backend restart), arm anyway rather than
 // sitting silent in "thinking" forever with the answer already on screen.
 const ARM_FALLBACK_MS = 4000;
@@ -406,13 +411,45 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const turnDoneAtRef = useRef(0);   // when the turn finished (silence watchdog)
   const ttsPendingRef = useRef(0);   // TTS fetches in flight, so the watchdog waits for real silence
+  const cueTimerRef = useRef<ReturnType<typeof setInterval> | null>(null); // "don't talk yet" pulse
 
   const clearRaf = () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current); rafRef.current = null; };
+
+  // #region "still working" cue
+  // A short blip every CUE_EVERY_MS from the moment the mic closes until the reply starts speaking,
+  // so the user hears that the turn is in flight and stops talking into a dead mic. Pulsed rather
+  // than a held tone on purpose: the barge-in loop below keeps sampling the mic during "thinking",
+  // and a continuous tone leaking back through the speakers would cross its threshold and cut off
+  // the first spoken sentence. Between pulses its `loud` counter decays.
+  const clearCue = () => { if (cueTimerRef.current) { clearInterval(cueTimerRef.current); cueTimerRef.current = null; } };
+  const blip = (ctx: AudioContext) => {
+    try {
+      const t = ctx.currentTime, dur = CUE_MS / 1000;
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.type = "sine"; osc.frequency.value = CUE_HZ;
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(CUE_GAIN, t + 0.012);
+      gain.gain.linearRampToValueAtTime(0, t + dur);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(t); osc.stop(t + dur + 0.02);
+    } catch { /* the cue is cosmetic; never break a turn over it */ }
+  };
+  useEffect(() => {
+    if (phase !== "transcribing" && phase !== "thinking") { clearCue(); return; }
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+    if (ctx.state === "suspended") { try { ctx.resume(); } catch { /* */ } }
+    blip(ctx);
+    cueTimerRef.current = setInterval(() => { const c = ctxRef.current; if (c) blip(c); }, CUE_EVERY_MS);
+    return clearCue;
+  }, [phase]);
+  // #endregion
 
   // --- teardown everything ---
   const teardown = useCallback(() => {
     activeRef.current = false;
     clearRaf();
+    clearCue();
     try { recRef.current?.state !== "inactive" && recRef.current?.stop(); } catch {}
     recRef.current = null;
     playerRef.current?.stop();
@@ -687,6 +724,10 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
         if (cancelled) { try { ctx.close(); } catch {} return; }
         ctxRef.current = ctx;
         activeRef.current = true;
+        // Kokoro is freed after TTS_IDLE_UNLOAD_S and costs about twelve seconds to reload on this
+        // box, which otherwise lands on the first sentence of the first reply. Warm it here, while
+        // the user is still speaking their first turn, and discard the audio.
+        fetch("/app/api/tts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "Ready." }) }).catch(() => { /* warm-up only */ });
         if (pttRef.current) {
           // Tap-to-talk: no persistent mic. Play TTS through a real media element (ElementPlayer) so the
           // OS treats it as MEDIA — loud on the car speakers, ducks/pauses the user's music — instead of
