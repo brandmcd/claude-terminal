@@ -38,7 +38,10 @@ const THEME_LS = "ct-app-theme";
 const themeMql = typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
 const resolvedTheme = (p: ThemePref): "dark" | "light" => (p === "system" ? (themeMql?.matches ? "light" : "dark") : p);
 function applyTheme(p: ThemePref) { try { document.body.classList.toggle("theme-light", resolvedTheme(p) === "light"); } catch { /* body not ready */ } }
-const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "light" || v === "dark" ? v : "system"; } catch { return "system"; } }; // default: follow the device
+// Default dark, not "follow the device". Upstream's default flipped every phone in light mode to
+// the light palette on the next reload, which is a visual change nobody here asked for. Light and
+// System are still offered in Settings; they just have to be chosen.
+const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "light" || v === "system" ? v : "dark"; } catch { return "dark"; } };
 applyTheme(loadThemePref()); // apply before React paints so a returning light-theme user gets no dark flash
 // #endregion
 const loadLastRead = (): Record<string, number> => { try { const o = JSON.parse(localStorage.getItem(LASTREAD_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };
