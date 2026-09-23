@@ -5,7 +5,7 @@
 // with a "dk-" prefix so nothing collides with the chat app's own classes. The Win95 bevels and
 // palette mirror body.theme-retro in styles.css (read, not edited, by this file) via var()
 // fallbacks, so the shell matches the chat window it wraps even if that stylesheet is absent.
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Clawd, Elapsed, confetti, fmtElapsed, type ClawdMood, type ClawdMove } from "./clawd";
 
 // #region types (the contract main.tsx wires against)
@@ -316,8 +316,21 @@ function DesktopIcon({ icon, label, onOpen }: { icon: React.ReactNode; label: st
 type MenuItem = { label: string; icon?: React.ReactNode; onClick?: () => void; sub?: MenuItem[]; disabled?: boolean };
 function Menu({ items, style, embedded, onClose }: { items: MenuItem[]; style?: React.CSSProperties; embedded?: boolean; onClose: () => void }) {
   const [openSub, setOpenSub] = useState<number | null>(null);
+  // Keep the menu on screen. A right-click on the taskbar opens it at the cursor, which is a few
+  // pixels above the bottom edge, so it would otherwise hang off the screen; submenus can overflow
+  // the right or bottom edge the same way. Measured after layout and shifted before paint.
+  const ref = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || embedded) return;
+    el.style.translate = "";
+    const r = el.getBoundingClientRect(), m = 4;
+    const dx = r.right > window.innerWidth - m ? window.innerWidth - m - r.right : r.left < m ? m - r.left : 0;
+    const dy = r.bottom > window.innerHeight - m ? window.innerHeight - m - r.bottom : r.top < m ? m - r.top : 0;
+    if (dx || dy) el.style.translate = `${dx}px ${dy}px`;
+  });
   return (
-    <div className={"dk-menu" + (embedded ? " dk-menu-embed" : "")} style={style} onPointerDown={(e) => e.stopPropagation()}>
+    <div ref={ref} className={"dk-menu" + (embedded ? " dk-menu-embed" : "")} style={style} onPointerDown={(e) => e.stopPropagation()}>
       {items.map((it, i) => (
         <div key={i} style={{ position: "relative" }}>
           <button
@@ -706,7 +719,7 @@ export function Desktop(props: {
       if (!l.wins[winIdFor(sid)]) return l;
       const wins = { ...l.wins };
       delete wins[winIdFor(sid)];
-      const next = { ...l, wins };
+      const next = tile({ ...l, wins }, window.innerWidth, window.innerHeight); // the freed space goes back to the others
       persist(next);
       return next;
     });
@@ -821,12 +834,18 @@ export function Desktop(props: {
   };
 
   const openWindowMenuItems = (id: string): MenuItem[] => {
+    // Taskbar buttons for work with no open window: another chat ("chat:<id>") or a busy terminal tab.
+    if (id.startsWith("chat:")) return [{ label: "Open", onClick: () => { props.onOpenChat(id.slice(5)); restoreWin("claude"); } }];
     const w = layout.wins[id];
+    if (isTerm(id) && !w?.open) return [
+      { label: "Open", onClick: () => openTerminal(termSid(id)) },
+      { label: "End session", onClick: () => endSession(termSid(id)) },
+    ];
     const items: MenuItem[] = [
       { label: "Minimize", onClick: () => minimizeWin(id) },
       { label: w?.max ? "Restore" : "Maximize", onClick: () => maxToggle(id) },
     ];
-    if (isTerm(id)) items.push({ label: "End session", onClick: () => endSession(termSid(id)) });
+    if (isTerm(id)) items.push({ label: "Close window", onClick: () => closeWin(id) }, { label: "End session", onClick: () => endSession(termSid(id)) });
     else if (id !== "claude") items.push({ label: "Close", onClick: () => closeWin(id) });
     return items;
   };
@@ -979,14 +998,16 @@ export function Desktop(props: {
               (tap to open in the Claude window) and terminal tabs (tap to open their window). */}
           {props.otherBusy.map((b) => (
             <button key={"chat:" + b.id} type="button" className="dk-taskbtn dk-taskbtn-active" title={b.title}
-              onClick={() => { props.onOpenChat(b.id); restoreWin("claude"); }}>
+              onClick={() => { props.onOpenChat(b.id); restoreWin("claude"); }}
+              onContextMenu={(e) => { e.preventDefault(); setTaskMenu({ id: "chat:" + b.id, x: e.clientX, y: e.clientY }); }}>
               <span className="dk-taskbtn-ic">💬</span>
               <span className="dk-taskbtn-label">{b.title}</span>
               <TinyClawd mood="walk" /><Elapsed since={b.since ?? null} className="dk-taskbtn-elapsed" />
             </button>
           ))}
           {sessions.filter((t) => (t.state === "thinking" || t.state === "waiting") && !openIds.includes(winIdFor(t.id))).map((t) => (
-            <button key={"tty:" + t.id} type="button" className="dk-taskbtn dk-taskbtn-active" title={t.title} onClick={() => openTerminal(t.id)}>
+            <button key={"tty:" + t.id} type="button" className="dk-taskbtn dk-taskbtn-active" title={t.title} onClick={() => openTerminal(t.id)}
+              onContextMenu={(e) => { e.preventDefault(); setTaskMenu({ id: winIdFor(t.id), x: e.clientX, y: e.clientY }); }}>
               <span className="dk-taskbtn-ic">⌨</span>
               <span className="dk-taskbtn-label">{t.title}</span>
               <BusyBadge state={t.state} since={t.since} />
