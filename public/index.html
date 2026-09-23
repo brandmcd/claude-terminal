@@ -5,18 +5,49 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Claude usage leaderboard</title>
 <script src="apexcharts.min.js"></script>
+<script>
+  // Applied before the stylesheet paints anything, so a returning light/dark-pinned
+  // visitor gets no flash of the device default. Explicit "system" still leaves the
+  // attribute off and the prefers-color-scheme media query below keeps deciding. This page
+  // has no retro skin, so "retro" and an unset key (retro is the sitewide default) both
+  // pin light instead.
+  (function(){
+    try {
+      var t = localStorage.getItem("ct-app-theme");
+      if(t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+      else if(t !== "system") document.documentElement.setAttribute("data-theme", "light");
+    } catch(e) {}
+  })();
+</script>
 <style>
   :root {
-    --bg:#f4f5f7; --card:#ffffff; --ink:#14161b; --muted:#697086;
-    --line:#e7e9ee; --track:#edeef2; --shadow:0 1px 3px rgba(20,22,27,.06),0 8px 24px rgba(20,22,27,.05);
-    --grad-a:#6366f1; --grad-b:#8b5cf6;
+    --bg:#f7f4f0; --card:#ffffff; --ink:#26211d; --muted:#574f47;
+    --line:#ddd4c9; --track:#e5ded6; --shadow:0 1px 3px rgba(20,22,27,.06),0 8px 24px rgba(20,22,27,.05);
+    --accent:#c25a3c; --accent-strong:#a84a30; --danger:#c0392b;
+    --grad-a:var(--accent); --grad-b:color-mix(in srgb, var(--accent) 55%, var(--ink));
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#0c0e13; --card:#151821; --ink:#eceef3; --muted:#8b93a7;
-      --line:#232734; --track:#1e222c; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
-      --grad-a:#818cf8; --grad-b:#a78bfa;
+      --bg:#1a1613; --card:#17130f; --ink:#ece7e1; --muted:#b8afa5;
+      --line:#3a322c; --track:#2a2420; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+      --accent:#d97757; --accent-strong:var(--accent); --danger:#e0685f;
+      --grad-a:var(--accent); --grad-b:color-mix(in srgb, var(--accent) 55%, var(--ink));
     }
+  }
+  /* Explicit "ct-app-theme" pin. Higher specificity than the media query above (an
+     attribute selector on :root beats a bare :root), so it wins regardless of the
+     device setting; "system" or no value at all leaves these unmatched. */
+  :root[data-theme="light"] {
+    --bg:#f7f4f0; --card:#ffffff; --ink:#26211d; --muted:#574f47;
+    --line:#ddd4c9; --track:#e5ded6;
+    --accent:#c25a3c; --accent-strong:#a84a30; --danger:#c0392b;
+    --grad-a:var(--accent); --grad-b:color-mix(in srgb, var(--accent) 55%, var(--ink));
+  }
+  :root[data-theme="dark"] {
+    --bg:#1a1613; --card:#17130f; --ink:#ece7e1; --muted:#b8afa5;
+    --line:#3a322c; --track:#2a2420;
+    --accent:#d97757; --accent-strong:var(--accent); --danger:#e0685f;
+    --grad-a:var(--accent); --grad-b:color-mix(in srgb, var(--accent) 55%, var(--ink));
   }
   * { box-sizing:border-box; }
   body {
@@ -42,19 +73,17 @@
     -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
   }
   .sub { color:var(--muted); font-size:13px; margin:8px 0 0; max-width:64ch; }
-  /* Limit timers. Two windows, side by side, above everything else: the shared 5-hour session
-     limit and the 7-day weekly one. These are the numbers that actually stop work, so they sit
-     at the top rather than under the token board. */
-  .limits { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; margin:0 0 18px; }
-  .limit { background:var(--card); border:1px solid var(--line); border-radius:14px;
-           box-shadow:var(--shadow); padding:14px 16px; }
-  .limit .lh { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
-  .limit .lh span { color:var(--muted); font-size:12px; letter-spacing:.02em; text-transform:uppercase; }
-  .limit .lh b { font-size:22px; font-variant-numeric:tabular-nums; }
-  .limit .track { height:8px; border-radius:6px; background:var(--track); overflow:hidden; margin:10px 0 0; }
-  .limit .track > i { display:block; height:100%; border-radius:6px; transition:width .6s cubic-bezier(.2,.7,.2,1); }
-  .limit .lf { display:flex; justify-content:space-between; gap:10px; margin:8px 0 0;
-               color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+  /* Shared subscription limit panel (session 5h + weekly 7d), same layout as upstream. */
+  .util { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:6px 4px 14px; }
+  @media (max-width:520px){ .util { grid-template-columns:1fr; } }
+  .util .u { background:var(--track); border:1px solid var(--line); border-radius:12px; padding:11px 13px; }
+  .util .ul { display:flex; justify-content:space-between; align-items:baseline; font-size:12.5px; color:var(--muted); margin-bottom:8px; }
+  .util .ul b { color:var(--ink); font-size:16px; font-weight:750; font-variant-numeric:tabular-nums; }
+  .util .track { position:relative; height:8px; border-radius:6px; background:var(--line); overflow:hidden; }
+  .util .track > span { display:block; height:100%; border-radius:6px; transition:width .6s cubic-bezier(.2,.7,.2,1); }
+  .util .track > i { position:absolute; top:0; bottom:0; width:2px; margin-left:-1px; background:#fff; box-shadow:0 0 0 1px rgba(0,0,0,.45); border-radius:1px; }
+  @media (max-width:440px){ .util { gap:10px; margin:6px 2px 12px; } }
+  .billfoot { margin:14px 4px 4px; padding-top:12px; border-top:1px dashed var(--line); font-size:13.5px; color:var(--muted); }
   .updated { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; }
   .live-tag { display:inline-flex; align-items:center; gap:6px; }
   .pulse { width:7px; height:7px; border-radius:50%; background:#22c55e; animation:pulse 1.8s infinite; }
@@ -75,8 +104,8 @@
   .swatch { width:11px; height:11px; border-radius:3px; flex:none; }
   .name { font-weight:700; font-size:18px; letter-spacing:-.01em; }
   .badge { font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
-  .badge.host { color:var(--grad-b); border-color:color-mix(in srgb,var(--grad-b) 45%,transparent); }
-  .badge.external { color:#a855f7; border-color:color-mix(in srgb,#a855f7 45%,transparent); }
+  .badge.host { color:var(--accent-strong); border-color:color-mix(in srgb,var(--accent-strong) 45%,transparent); }
+  .badge.external { color:var(--muted); border-style:dashed; }
   .now { color:#22c55e; font-size:11px; font-weight:600; display:inline-flex; align-items:center; gap:5px; }
   .big { grid-column:3; grid-row:1/3; text-align:right; }
   .big b { font-size:24px; font-weight:750; font-variant-numeric:tabular-nums; letter-spacing:-.02em; display:block; line-height:1.1; }
@@ -126,7 +155,17 @@
   .modes button:hover { color:var(--ink); }
   .modes button[aria-pressed="true"] { background:var(--card); color:var(--ink); box-shadow:0 1px 2px rgba(20,22,27,.14); }
   .modes button:focus-visible { outline:2px solid var(--grad-a); outline-offset:2px; }
-  .err { background:var(--card); border:1px solid #ef4444; border-radius:14px; padding:16px; color:#ef4444; }
+  .err { background:var(--card); border:1px solid var(--danger); border-radius:14px; padding:16px; color:var(--danger); }
+
+  /* Theme toggle. One small button, cycles device -> light -> dark -> device and
+     writes "ct-app-theme", the same localStorage key /app reads, so a choice here
+     carries over. 32px visually, expanded to a 40px hit area on touch. */
+  .theme-toggle { display:inline-flex; align-items:center; justify-content:center;
+    width:32px; height:32px; border-radius:999px; border:1px solid var(--line);
+    background:var(--track); color:var(--muted); padding:0; cursor:pointer; }
+  .theme-toggle:hover { color:var(--ink); }
+  .theme-toggle:focus-visible { outline:2px solid var(--grad-a); outline-offset:2px; }
+  @media (pointer: coarse) { .theme-toggle { width:40px; height:40px; } }
 
 
 </style>
@@ -149,10 +188,17 @@
         <button type="button" data-mode="weighted" aria-pressed="false">Weighted</button>
       </div>
       <div class="updated"><span class="live-tag"><span class="pulse"></span><span id="updated">loading</span></span></div>
+      <button type="button" class="theme-toggle" id="themeToggle" aria-label="Theme"></button>
     </div>
   </header>
 
-  <div class="limits" id="limits" style="display:none"></div>
+  <!-- Shared claude.ai subscription limit (session 5h + weekly 7d). Hidden until data exists. -->
+  <div class="panel" id="subPanel" style="display:none">
+    <h2>Session limit</h2>
+    <p id="subNote">The rolling 5-hour session limit and the 7-day weekly limit, shared across everyone on this box.</p>
+    <div class="util" id="subUtil"></div>
+    <div class="billfoot" id="subFoot"></div>
+  </div>
 
   <div class="cards" id="cards"></div>
 
@@ -231,7 +277,30 @@ const medal = i => ["\u{1F947}","\u{1F948}","\u{1F949}"][i] || ("#"+(i+1));
 function ago(iso){ if(!iso) return "never"; const s=(Date.now()-new Date(iso).getTime())/1000;
   if(s<90) return "just now"; if(s<3600) return Math.round(s/60)+" min ago";
   if(s<86400) return Math.round(s/3600)+"h ago"; return Math.round(s/86400)+"d ago"; }
-const isDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+// ---- theme (light / dark / system) -----------------------------------------
+// Shared across the whole origin: /app writes and reads the same "ct-app-theme" key.
+// The explicit value "system" means follow the device, same as before this toggle
+// existed; "light"/"dark" pin the page regardless of prefers-color-scheme. /app's "retro"
+// has no skin here, and an unset key means retro (the sitewide default) — both fall
+// through to the "light" default below, same call the early inline script above makes.
+let THEME = "light";
+try { const t = localStorage.getItem("ct-app-theme"); if(t === "dark" || t === "system") THEME = t; } catch(e) {}
+const sysDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+const isDark = () => THEME === "system" ? sysDark() : THEME === "dark";
+function applyThemeAttr(){
+  if(THEME === "system") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", THEME);
+}
+const THEME_ICONS = {
+  system: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
+  light: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></svg>',
+  dark: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg>'
+};
+function paintThemeToggle(){
+  const b = document.getElementById("themeToggle"); if(!b) return;
+  b.innerHTML = THEME_ICONS[THEME];
+  b.title = "Theme: " + (THEME === "system" ? "system (device)" : THEME);
+}
 const ink = () => getComputedStyle(document.body).getPropertyValue("--ink").trim();
 const muted = () => getComputedStyle(document.body).getPropertyValue("--muted").trim();
 const reduceMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -436,39 +505,55 @@ function refresh(d){
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
 }
 
-// #region limit timers (the shared 5h session window + the 7d weekly one)
-// Utilisation comes off the API's own anthropic-ratelimit-unified-* headers, sampled by the
-// collector every 60s. The countdown re-renders on a 1s tick from the stored reset timestamp,
-// so the clock stays honest between samples instead of freezing until the next poll.
-function limitColor(u){ if(u==null) return "var(--muted)"; if(u>=85) return "#ef4444"; if(u>=60) return "#f59e0b"; return "#22c55e"; }
+// #region Shared subscription limit (session 5h + weekly 7d)
+function subColor(u){ if(u==null) return "var(--muted)"; if(u>=85) return "var(--danger)"; if(u>=60) return "#f59e0b"; return "#22c55e"; }
 function untilStr(iso){
   if(!iso) return "";
   const t = Date.parse(iso); if(isNaN(t)) return "";
-  let sec = Math.round((t - Date.now())/1000);
-  if(sec<=0) return "resetting now";
-  const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), ss=sec%60;
+  let s = Math.round((t - Date.now())/1000);
+  if(s<=0) return "resetting now";
+  const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
+  if(d>=1) return "resets in "+d+"d "+h+"h";
   if(h>=1) return "resets in "+h+"h "+m+"m";
-  if(m>=1) return "resets in "+m+"m "+ss+"s";
-  return "resets in "+ss+"s";
+  if(m>=1) return "resets in "+m+"m";
+  return "resets in <1m";
 }
-function limitCell(label, win){
+function subCell(label, win, windowSec, wide){
   const u = win && typeof win.utilization==="number" ? win.utilization : null;
   const pct = u==null ? 0 : Math.max(0,Math.min(100,u));
-  return '<div class="limit">'
-    + '<div class="lh"><span>'+label+'</span><b>'+(u==null?"–":Math.round(u)+"%")+'</b></div>'
-    + '<div class="track"><i style="width:'+pct+'%;background:'+limitColor(u)+'"></i></div>'
-    + '<div class="lf"><span>'+(u==null?"":Math.max(0,100-Math.round(u))+"% left")+'</span>'
-    + '<span>'+untilStr(win&&win.resets_at)+'</span></div>'
+  const col = subColor(u);
+  const left = u==null ? "" : Math.max(0,100-Math.round(u))+"% left";
+  // Ghost bar: where we'd be if the window were used evenly over time. elapsed = windowLen - remaining.
+  // The marker alone shows ahead/behind at a glance (fill left of the tick = ahead), no text needed.
+  let ghost = null;
+  if(win && win.resets_at && windowSec){
+    const remain = (Date.parse(win.resets_at)-Date.now())/1000;
+    if(isFinite(remain)) ghost = Math.max(0,Math.min(100,Math.round((1-remain/windowSec)*100)));
+  }
+  return '<div class="u"'+(wide?' style="grid-column:1/-1"':'')+'>'
+    + '<div class="ul"><span>'+label+'</span><b>'+(u==null?"–":Math.round(u)+"%")+'</b></div>'
+    + '<div class="track"><span style="width:'+pct+'%;background:'+col+'"></span>'+(ghost!=null?'<i title="'+ghost+'% of the window elapsed" style="left:'+ghost+'%"></i>':'')+'</div>'
+    + '<div class="ul" style="margin:8px 0 0"><span>'+left+'</span><span>'+untilStr(win&&win.resets_at)+'</span></div>'
     + '</div>';
 }
-function renderLimits(d){
-  const p = d && d.subscription, el = document.getElementById("limits");
-  if(!el) return;
-  if(!p || (!p.five_hour && !p.seven_day)){ el.style.display="none"; return; }
-  el.style.display="";
-  el.innerHTML = limitCell("Session limit (5h)", p.five_hour) + limitCell("Weekly limit (7d)", p.seven_day);
+function renderSubscription(d){
+  const p = d && d.subscription;
+  const panel = document.getElementById("subPanel");
+  if(!panel) return;
+  if(!p || (!p.five_hour && !p.seven_day)){ panel.style.display="none"; return; }
+  panel.style.display="";
+  document.getElementById("subUtil").innerHTML =
+    subCell("Session (5h)", p.five_hour, 5*3600)
+    + (p.fable ? subCell("Fable (7d)", p.fable, 7*86400) : "")
+    + subCell("Weekly (7d)", p.seven_day, 7*86400, true);
+  const n = p.active_users, foot = document.getElementById("subFoot");
+  if(typeof n==="number" && n>0){
+    foot.style.display="";
+    foot.textContent = n===1 ? "1 person active on this box right now." : n+" people sharing this limit right now.";
+  } else { foot.style.display="none"; }
 }
-setInterval(() => { if(DATA) renderLimits(DATA); }, 1000);
+// Re-render every second so the countdown and the elapsed-time marker move between polls.
+setInterval(() => { if(DATA) renderSubscription(DATA); }, 1000);
 // #endregion
 
 async function load(first){
@@ -476,7 +561,7 @@ async function load(first){
     const r = await fetch("api?t="+Date.now(), {cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const d = await r.json(); DATA = d;
-    renderLimits(d);
+    renderSubscription(d);
     learnColors(d); // must precede build/refresh — every chart reads colorFor() as it renders
     rank(d);        // and precede sig(): a reorder has to come out as a rebuild, not a refresh
     const s = sig(d);
@@ -534,6 +619,19 @@ document.getElementById("modes").addEventListener("click", e => {
   build(DATA);
 });
 
+document.getElementById("themeToggle").addEventListener("click", () => {
+  const order = ["system", "light", "dark"];
+  THEME = order[(order.indexOf(THEME) + 1) % order.length];
+  try { localStorage.setItem("ct-app-theme", THEME); } catch(e) {}
+  applyThemeAttr();
+  paintThemeToggle();
+  // Same path the prefers-color-scheme listener below uses: rebuild every chart so
+  // ApexCharts' own theme (axis/legend/tooltip colors) picks up the change too.
+  if(DATA) load(true);
+});
+applyThemeAttr();
+paintThemeToggle();
+
 applyModeText();
 load(true);
 setInterval(()=>load(false), 30000);        // fallback poll
@@ -542,7 +640,7 @@ try {
   const es = new EventSource("stream");
   es.onmessage = () => load(false);
 } catch (e) { /* SSE unsupported -> the poll above still keeps it fresh */ }
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", ()=>load(true));
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if(THEME === "system") load(true); });
 </script>
 </body>
 </html>

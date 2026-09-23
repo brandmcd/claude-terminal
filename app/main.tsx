@@ -13,6 +13,8 @@ import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { ConnectionsModal } from "./connections";
+import { Clawd, Elapsed } from "./clawd";
+import { Desktop } from "./desktop";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -33,15 +35,20 @@ const saveFavPending = (m: Record<string, boolean>) => { try { localStorage.setI
 // all light up as unread.
 const LASTREAD_LS = "ct-app-lastread";
 // #region theme (dark / light / system)
-type ThemePref = "dark" | "light" | "system";
+type ThemePref = "retro" | "dark" | "light" | "system";
 const THEME_LS = "ct-app-theme";
 const themeMql = typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
-const resolvedTheme = (p: ThemePref): "dark" | "light" => (p === "system" ? (themeMql?.matches ? "light" : "dark") : p);
-function applyTheme(p: ThemePref) { try { document.body.classList.toggle("theme-light", resolvedTheme(p) === "light"); } catch { /* body not ready */ } }
-// Default dark, not "follow the device". Upstream's default flipped every phone in light mode to
-// the light palette on the next reload, which is a visual change nobody here asked for. Light and
-// System are still offered in Settings; they just have to be chosen.
-const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "light" || v === "system" ? v : "dark"; } catch { return "dark"; } };
+const resolvedTheme = (p: ThemePref): "retro" | "dark" | "light" => (p === "system" ? (themeMql?.matches ? "light" : "dark") : p);
+function applyTheme(p: ThemePref) {
+  try {
+    const r = resolvedTheme(p);
+    document.body.classList.toggle("theme-light", r === "light");
+    document.body.classList.toggle("theme-retro", r === "retro");
+  } catch { /* body not ready */ }
+}
+// Default retro: on a wide screen that is the desktop shell, on a phone the same skin over the usual
+// layout. Dark, Light and System stay in Settings and in the Start menu.
+const loadThemePref = (): ThemePref => { try { const v = localStorage.getItem(THEME_LS); return v === "dark" || v === "light" || v === "system" ? v : "retro"; } catch { return "retro"; } };
 applyTheme(loadThemePref()); // apply before React paints so a returning light-theme user gets no dark flash
 // #endregion
 const loadLastRead = (): Record<string, number> => { try { const o = JSON.parse(localStorage.getItem(LASTREAD_LS) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } };
@@ -102,7 +109,7 @@ type AppEvent =
   | { t: "user"; text: string; cid?: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
   | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string; _seq?: number }
-  | { t: "busy"; busy: boolean; _seq?: number }
+  | { t: "busy"; busy: boolean; since?: number; _seq?: number }
   | { t: "error"; message: string; _seq?: number }
   | { t: "closed"; _seq?: number }
   | { t: "hello"; epoch: string; seq: number; resync: boolean }        // first frame of every stream: the log's identity + cursor
@@ -507,6 +514,7 @@ class ConvStore {
   settings: SessionSettings = {}; // effort / advisor model / fast mode for THIS conversation
   ctx: { used: number; max?: number } | null = null; // context occupancy from the stream; the ring reads this
   busy = false;
+  private busyStart = 0; // see turnStart()
   cwd: string | null = null;
   compacting = false;
   compactStart = 0;
@@ -609,7 +617,7 @@ class ConvStore {
       case "context": this.ctx = { used: e.used, max: e.max ?? this.ctx?.max }; this.signal(); this.mgr.hooks?.onContext(this); return;
       case "model": this.model = e.model; this.signal(); return;
       case "settings": this.settings = e.settings || {}; this.signal(); return;
-      case "busy": if (this.busy !== e.busy) { this.busy = e.busy; if (!e.busy) { this.items = freezeOpen(this.items); this.touch(); } else this.signal(); } return;
+      case "busy": if (e.busy && e.since) this.busyStart = e.since; if (this.busy !== e.busy) { this.busy = e.busy; if (!e.busy) { this.items = freezeOpen(this.items); this.touch(); } else this.signal(); } return;
       case "compacting":
         this.compacting = e.active; this.compactStart = e.active ? (this.compactStart || Date.now()) : 0; this.signal(); return;
       case "compact":
@@ -656,6 +664,13 @@ class ConvStore {
   // server, and a card that looks answered while the turn is still parked in the tool call is the
   // worst of both worlds (see deliverAsk).
   unanswerAsk(askId: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: undefined } : it)); this.touch(); }
+  // When the current turn started (epoch ms), 0 when idle. The server's busy event carries the exact
+  // start; before it arrives (an optimistic send, a reload mid-turn) the first local sighting stands in.
+  turnStart(): number {
+    if (!this.busy) { this.busyStart = 0; return 0; }
+    if (!this.busyStart) this.busyStart = Date.now();
+    return this.busyStart;
+  }
   setBusy(b: boolean) { if (this.busy === b) return; this.busy = b; this.signal(); }
   beginCompact() { this.compacting = true; this.compactStart = Date.now(); this.signal(); }
   endCompactFallback() { if (this.compacting) { this.compacting = false; this.compactStart = 0; this.signal(); } }
@@ -997,23 +1012,27 @@ function turnThinkingTotals(items: Item[], i: number): { ms: number; tokens: num
 // What the runner is doing when there is nothing streaming to look at: starting the session, waiting
 // on the API, inside a tool, retrying an API error, rate-limited, compacting. The old three dots
 // covered all of those with one animation, which is why "is it still thinking?" had no answer.
-function PhaseLine({ phase, since, detail }: { phase: Phase; since: number; detail?: string }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
-  const secs = since ? Math.max(0, Math.round((now - since) / 1000)) : 0;
-  const label = phase === "starting" ? "Starting the session"
+// The one "still working" row at the foot of the thread: a walking Clawd, what the turn is doing,
+// and how long the whole turn has been running (not just the current phase).
+const greeting = () => { const h = new Date().getHours(); return h < 5 ? "Up late" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening"; };
+
+function BusyLine({ phase, detail, since, waiting }: { phase: Phase; detail?: string; since: number; waiting?: boolean }) {
+  const label = waiting ? "Waiting for you"
+    : phase === "starting" ? "Starting the session"
     : phase === "waiting" ? "Waiting for the model"
     : phase === "tool" ? `Running ${detail || "a tool"}`
     : phase === "retrying" ? `API error, retrying${detail ? ` (${detail})` : ""}`
     : phase === "limited" ? "Rate limited, waiting for the window to reset"
     : phase === "compacting" ? "Compacting"
-    : "";
-  if (!label) return null;
+    : phase === "thinking" ? "Thinking"
+    : phase === "writing" ? "Writing"
+    : "Working";
   return (
     <div className="msg bubble-assistant">
-      <div style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--muted)", fontSize: 13 }}>
-        <div className="typing"><span></span><span></span><span></span></div>
-        <span>{label}{secs >= 3 ? ` · ${fmtDur(secs)}` : ""}</span>
+      <div className="ct-busy-line">
+        <Clawd size={1.3} mood={waiting ? "needs" : "walk"} />
+        <span>{label}</span>
+        <Elapsed since={since} />
       </div>
     </div>
   );
@@ -1269,7 +1288,6 @@ function App() {
   const todos = useMemo(() => latestTodos(items), [items]); // current task checklist (latest TodoWrite), pinned above the composer
   const compacting = activeStore?.compacting ?? false;
   const phase: Phase = activeStore?.phase ?? "idle";
-  const phaseSince = activeStore?.phaseSince ?? 0;
   const phaseDetail = activeStore?.phaseDetail;
   // The picker shows what THIS conversation runs on. The stored default only applies to a new chat;
   // switching to a conversation that runs on another model shows that model, and picking one inside a
@@ -1290,15 +1308,18 @@ function App() {
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [showOlder, setShowOlder] = useState(false); // "Older versions" group inside the picker panel
-  // Slider position while the thumb is being dragged. The pick is committed on release, so dragging
-  // from Low to Max posts once instead of once per step.
-  const [effortDrag, setEffortDrag] = useState<number | null>(null);
   const [updateAvail, setUpdateAvail] = useState(false);
   const [installed] = useState(isStandalone); // home-screen launch: no browser reload button, so we draw one
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setThemeState] = useState<ThemePref>(loadThemePref);
+  // The retro theme on a wide screen is the desktop shell. Inside an iframe (a desktop window showing
+  // /app) the plain layout renders, so the shell never nests.
+  const [wide, setWide] = useState(() => window.matchMedia("(min-width: 900px)").matches);
+  useEffect(() => { const m = window.matchMedia("(min-width: 900px)"); const on = () => setWide(m.matches); m.addEventListener("change", on); return () => m.removeEventListener("change", on); }, []);
+  const desktopMode = resolvedTheme(theme) === "retro" && wide && window.self === window.top;
+  const [termArg] = useState(() => new URLSearchParams(location.search).get("arg"));
   const setTheme = useCallback((t: ThemePref) => { setThemeState(t); try { localStorage.setItem(THEME_LS, t); } catch { /* */ } applyTheme(t); }, []);
   useEffect(() => { applyTheme(theme); if (theme !== "system" || !themeMql) return; const on = () => applyTheme("system"); themeMql.addEventListener?.("change", on); return () => themeMql.removeEventListener?.("change", on); }, [theme]);
   const [connOpen, setConnOpen] = useState(false); // Connections: MCP servers, skills, memory, network
@@ -1316,7 +1337,19 @@ function App() {
   // Shared subscription session-limit warning toast (5h limit high AND the box is contended).
   const [limitToast, setLimitToast] = useState<{ left: number; resetIn: string; n: number } | null>(null);
   const limitDismissed = useRef(false);
-  const [statuses, setStatuses] = useState<Record<string, { busy: boolean; waiting: boolean }>>({});
+  const [statuses, setStatuses] = useState<Record<string, { busy: boolean; waiting: boolean; since?: number }>>({});
+  // When the open conversation's current turn started: the server's figure from the live stream
+  // first, then the status poll's, which covers a turn driven from a terminal tab.
+  const turnSince = busy ? (activeId && statuses[activeId]?.since) || activeStore?.turnStart() || Date.now() : 0;
+  // Bumped when the open conversation's turn ends, so Clawd dances. Only a busy-to-idle change on the
+  // SAME conversation counts; switching from a busy chat to an idle one is not a finish.
+  const [finishedKey, setFinishedKey] = useState(0);
+  const lastBusy = useRef<{ id: string | null; busy: boolean }>({ id: null, busy: false });
+  useEffect(() => {
+    const p = lastBusy.current;
+    if (p.id === activeId && p.busy && !busy) setFinishedKey((k) => k + 1);
+    lastBusy.current = { id: activeId, busy };
+  }, [busy, activeId]);
   const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
   const [readTick, setReadTick] = useState(0); // bump to re-render unread dots after marking read
@@ -1789,18 +1822,14 @@ function App() {
   // Record that the app is the surface to reopen on next PWA launch (see the overlay's launch
   // routing). Deliberately "/app" with no ?c= so a relaunch lands on the default view, not a
   // specific conversation.
-  // Root serves the app as of 2026-08-31, so the app makes the reopen-last-surface call the terminal
-  // overlay used to make. Only a genuine cold PWA launch honours it: an in-app hop carries a referrer
-  // and a manual reload reports type "reload", so neither bounces you away mid-use.
+  // "/?arg=N" (old links, terminal push notifications) reaches here as "/app?arg=N" through the nginx
+  // redirect. The desktop opens that tab as a window; without the desktop it goes to the terminal
+  // page itself. "?home=1" is the PWA start_url marker and needs nothing any more.
   useEffect(() => {
     try {
       const sp = new URLSearchParams(location.search);
-      const standalone = isStandalone();
-      const navType = (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.type || "";
-      const cold = sp.get("home") === "1" || (standalone && !document.referrer && navType !== "reload");
-      if (cold && localStorage.getItem("ct-last-surface") === "/") { location.replace("/"); return; }
-      if (sp.get("home") === "1") history.replaceState(null, "", location.pathname);
-      localStorage.setItem("ct-last-surface", "/app");
+      if (termArg && !desktopMode) { location.replace("/tty/?arg=" + encodeURIComponent(termArg)); return; }
+      if (sp.has("home") || sp.has("arg")) { sp.delete("home"); sp.delete("arg"); history.replaceState(null, "", location.pathname + (sp.toString() ? "?" + sp : "")); }
     } catch { /* */ }
   }, []);
 
@@ -2542,6 +2571,41 @@ function App() {
     () => [...models, ...moreModels].filter((m) => m.id !== "default"),
     [models, moreModels],
   );
+  // Picker rows are named for the model they run ("Opus 5.5"), since the CLI's aliases ("Opus",
+  // "Default") do not say which version answers. A versioned row from config.json that is older than
+  // its family's alias row ("Opus 5" next to an alias resolving to Opus 5.5) moves under Older
+  // versions with moreModels; a config row newer than the alias stays on top.
+  const pickerRows = useMemo(() => {
+    const bare = (v?: string) => String(v || "").replace(/^claude-/, "").replace(/\[[^\]]*\]$/, "").replace(/-\d{8}$/, "");
+    const fam = (m: Model) => (bare(m.resolvedModel || m.id).match(/^(fable|opus|sonnet|haiku)\b/) || [])[1] || "";
+    const ver = (id?: string) => { const v = bare(id).match(/-(\d+(?:-\d+)?)$/); return v ? parseFloat(v[1].replace("-", ".")) : 0; };
+    const rank = (m: Model) => { if (m.id === "default") return -1; const i = ["fable", "opus", "sonnet", "haiku"].indexOf(fam(m)); return i < 0 ? 9 : i; };
+    const latest: Record<string, number> = {};
+    for (const m of models) if (m.resolvedModel) latest[fam(m)] = Math.max(latest[fam(m)] || 0, ver(m.resolvedModel));
+    const isOlder = (m: Model) => !m.resolvedModel && !!latest[fam(m)] && ver(m.id) < latest[fam(m)];
+    // The "sonnet" alias and "default" often resolve to the same model; both stay, since Default
+    // follows settings.json and Sonnet pins it.
+    const primary = models.filter((m) => !isOlder(m)).sort((x, y) => rank(x) - rank(y));
+    return { primary, older: [...models.filter(isOlder), ...moreModels] };
+  }, [models, moreModels]);
+  const pickerName = (m: Model) => (m.id === "default" ? "Default" : m.resolvedModel ? prettyModel(m.resolvedModel) : /^claude-/.test(m.id) ? prettyModel(m.id) : m.label);
+  const pickerBlurb = (m: Model) => {
+    const tail = (m.description || "").split(" · ").slice(1).join(" · ");
+    if (m.id === "default") return m.resolvedModel ? `${prettyModel(m.resolvedModel)}, from settings.json` : "From settings.json";
+    return tail || (m.description && !m.description.includes(" · ") ? m.description : "") || m.id;
+  };
+  const renderModelRow = (m: Model) => {
+    const on = m.id === model;
+    return (
+      <button key={m.id} className={"pk-row" + (on ? " on" : "")} onClick={() => void onPickModel(m.id)} aria-pressed={on}>
+        <span className="pk-row-main">
+          <span className="pk-name">{pickerName(m)}</span>
+          <span className="pk-blurb">{pickerBlurb(m)}</span>
+        </span>
+        <svg className="pk-check" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+      </button>
+    );
+  };
   // Collapsed pill: the model that will actually run, plus the effort it runs at. An alias row is
   // named for the alias ("Default"), which says nothing about which model that is, so prefer the
   // resolvedModel the CLI reports. Without one, fall back to the row label minus its "(…)"
@@ -2594,6 +2658,7 @@ function App() {
           ? <span className={"conv-status " + status + (convIsTerminal(c) ? " terminal" : "")} title={STATUS_LABEL[status]} aria-label={STATUS_LABEL[status]} />
           : <svg className="conv-ic" width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.5 8.5 0 0 1-9 8.32 8.5 8.5 0 0 1-3.6-.8L3 20l1.3-3.9A8.5 8.5 0 1 1 21 11.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>}
         <span className={"conv-title" + (status === "unread" ? " unread" : "")}>{c.title}</span>
+        {statuses[c.sessionId]?.busy && <Elapsed since={statuses[c.sessionId]?.since} />}
         <button className={"conv-star" + (fav ? " on" : "")} onClick={(e) => { e.stopPropagation(); toggleFav(c.sessionId); }} aria-label={fav ? "Unfavorite" : "Favorite"} title={fav ? "Unfavorite" : "Favorite"}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill={fav ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26" /></svg>
         </button>
@@ -2637,7 +2702,7 @@ function App() {
     return nodes;
   }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, openArtifact]);
 
-  return (
+  const ui = (
     <div className={"app" + (drawer ? " drawer-open" : "")} onTouchStart={onAppTouchStart} onTouchMove={onAppTouchMove} onTouchEnd={onAppTouchEnd}>
       {updateAvail && (
         <div className="update-toast" role="status">
@@ -2694,9 +2759,10 @@ function App() {
               <label className="settings-row">
                 <span className="settings-row-main">
                   <span className="settings-row-title">Theme</span>
-                  <span className="settings-row-desc">Dark, light, or follow your device. Saved per device.</span>
+                  <span className="settings-row-desc">Retro (a desktop on wide screens), dark, light, or follow your device. Saved per device.</span>
                 </span>
                 <select className="settings-select" value={theme} onChange={(e) => setTheme(e.target.value as ThemePref)}>
+                  <option value="retro">Retro</option>
                   <option value="dark">Dark</option>
                   <option value="light">Light</option>
                   <option value="system">System</option>
@@ -2764,7 +2830,21 @@ function App() {
       <ConnectionsModal open={connOpen} onClose={() => setConnOpen(false)} activeId={activeId} />
       <aside className="sidebar">
         <div className="sb-head">
-          <span className="brand">Claude</span>
+          <span className="brand"><Clawd size={1.1} danceKey={finishedKey} /> Claude</span>
+          {/* One tap cycles retro, dark, light; the icon shows the theme it switches to. Settings still offers "System". */}
+          {(() => {
+            const next = ({ retro: "dark", dark: "light", light: "retro" } as const)[resolvedTheme(theme)];
+            const label = `Switch to ${next} theme`;
+            return (
+              <button className="sb-gear" onClick={() => setTheme(next)} aria-label={label} title={label}>
+                {next === "dark"
+                  ? <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z" /></svg>
+                  : next === "light"
+                    ? <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"><circle cx="12" cy="12" r="4" /><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" /></svg>
+                    : <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"><rect x="3" y="4" width="18" height="13" /><path d="M3 7.5h18M8 21h8M12 17v4" /></svg>}
+              </button>
+            );
+          })()}
           <button className="sb-gear" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
           </button>
@@ -2818,7 +2898,7 @@ function App() {
           )}
         </div>
         <div className="sb-foot">
-          <a className="term-link" href="/">
+          <a className="term-link" href="/tty/">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.6" /><path d="M8 10l2.5 2L8 14M12.5 14H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
             Terminal
           </a>
@@ -2870,15 +2950,15 @@ function App() {
         <div className="scroll" ref={scrollRef} onScroll={onThreadScroll}>
           {items.length === 0 ? (
             <div className="empty">
-              <h2>What can I help with?</h2>
+              <div className="ct-hero"><Clawd size={5} danceKey={finishedKey} /></div>
+              <h2>{greeting()}. What are we making?</h2>
               <div>Ask anything. This drives Claude Code in {cwdRef.current || "your project"}.</div>
             </div>
           ) : (
             <div className="thread">
               {threadNodes}
               {compacting && <CompactionBanner start={activeStore?.compactStart ?? 0} />}
-              {!compacting && phase !== "idle" && phase !== "thinking" && phase !== "writing" && <PhaseLine phase={phase} since={phaseSince} detail={phaseDetail} />}
-              {busy && phase === "idle" && !compacting && items[items.length - 1]?.kind === "user" && (<div className="msg bubble-assistant"><div className="typing"><span></span><span></span><span></span></div></div>)}
+              {busy && !compacting && <BusyLine phase={phase} detail={phaseDetail} since={turnSince} waiting={!!activeId && !!statuses[activeId]?.waiting} />}
             </div>
           )}
         </div>
@@ -2970,68 +3050,47 @@ function App() {
               {menuOpen && <div className="picker-scrim" onClick={() => setMenuOpen(false)} />}
               {menuOpen && (
                 <div className="model-menu" role="dialog" aria-label="Model and reasoning settings">
+                  <div className="pk-grab" aria-hidden="true" />
                   <div className="pk-sec">
                     <div className="pk-label">Model</div>
-                    {models.map((m) => (
-                      <button key={m.id} className={"model-row" + (m.id === model ? " on" : "")} onClick={() => onPickModel(m.id)} aria-pressed={m.id === model}>
-                        <span className="model-line">{m.label}{m.id === model && <span className="dot">●</span>}</span>
-                        {m.description && <span className="model-desc">{m.description}</span>}
-                      </button>
-                    ))}
-                    {/* Older versions live in the same panel rather than a separate dialog, so every
-                        model this box offers is reachable without leaving the one control. */}
-                    {moreModels.length > 0 && (
+                    {pickerRows.primary.map(renderModelRow)}
+                    {/* Older versions stay in the same panel, collapsed, so every model this box
+                        offers is reachable without leaving the one control. */}
+                    {pickerRows.older.length > 0 && (
                       <>
-                        <button className="model-other" onClick={() => setShowOlder((o) => !o)} aria-expanded={showOlder}>
+                        <button className="pk-more" onClick={() => setShowOlder((o) => !o)} aria-expanded={showOlder}>
                           <span>Older versions</span>
                           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" className={showOlder ? "flip" : ""}><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
                         </button>
-                        {showOlder && moreModels.map((m) => (
-                          <button key={m.id} className={"model-row" + (m.id === model ? " on" : "")} onClick={() => onPickModel(m.id)} aria-pressed={m.id === model}>
-                            <span className="model-line">{m.label}{m.id === model && <span className="dot">●</span>}</span>
-                            <span className="model-desc">{m.id}</span>
-                          </button>
-                        ))}
+                        {showOlder && pickerRows.older.map(renderModelRow)}
                       </>
                     )}
                   </div>
-                  {/* Effort, for models that take it. Position 0 is "Auto": it clears the override so
-                      the CLI's own effortLevel applies, which is not the same as picking medium. */}
-                  {effortLevels.length > 0 && (() => {
-                    const idx = activeEffort && effortLevels.includes(activeEffort as EffortLevel) ? effortLevels.indexOf(activeEffort as EffortLevel) + 1 : 0;
-                    const shown = effortDrag ?? idx;
-                    const name = shown === 0 ? "Auto" : effortName(effortLevels[shown - 1]);
-                    const commit = (v: number) => { setEffortDrag(null); void onPickEffort(v === 0 ? "" : effortLevels[v - 1]); };
-                    return (
-                      <div className="pk-sec effort-block">
-                        <div className="pk-label">Reasoning effort<span className="pk-val">{name}</span></div>
-                        <input
-                          className="effort-slider" type="range" min={0} max={effortLevels.length} step={1} value={shown}
-                          aria-label="Reasoning effort" aria-valuetext={name}
-                          style={{ "--fill": `calc(7.5px + (100% - 15px) * ${shown / effortLevels.length})` } as any}
-                          onChange={(e) => setEffortDrag(Number(e.target.value))}
-                          onPointerUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
-                          onPointerCancel={() => setEffortDrag(null)}
-                          onKeyUp={(e) => commit(Number((e.target as HTMLInputElement).value))}
-                          onBlur={() => { if (effortDrag != null) commit(effortDrag); }}
-                        />
-                        <div className="effort-ticks" aria-hidden="true">
-                          {["Auto", ...effortLevels.map(effortName)].map((t, i) => (
-                            <span key={t} className={i === shown ? "on" : ""}
-                              style={{ "--p": `calc(7.5px + (100% - 15px) * ${i / effortLevels.length})` } as any}>{t}</span>
-                          ))}
-                        </div>
+                  {/* Effort, for models that take it. "Auto" clears the override so the CLI's own
+                      effortLevel applies, which is not the same as picking medium. */}
+                  {effortLevels.length > 0 && (
+                    <div className="pk-sec">
+                      <div className="pk-label">Reasoning effort</div>
+                      <div className="pk-seg" role="radiogroup" aria-label="Reasoning effort">
+                        {["", ...effortLevels].map((lv) => {
+                          const on = lv === "" ? !effortLevels.includes(activeEffort as EffortLevel) : lv === activeEffort;
+                          return (
+                            <button key={lv || "auto"} role="radio" aria-checked={on} className={on ? "on" : ""} onClick={() => void onPickEffort(lv)}>
+                              {lv ? effortName(lv) : "Auto"}
+                            </button>
+                          );
+                        })}
                       </div>
-                    );
-                  })()}
+                    </div>
+                  )}
                   {/* The model the advisor tool consults. Blank defers to advisorModel in
                       ~/.claude/settings.json, which is what a chat uses when nothing is chosen here. */}
                   {advisorChoices.length > 0 && (
-                    <div className="pk-sec">
-                      <div className="pk-label">Advisor model</div>
-                      <select className="pk-select" value={activeAdvisor} onChange={(e) => void onPickAdvisor(e.target.value)} aria-label="Advisor model">
+                    <div className="pk-sec pk-inline">
+                      <label className="pk-label" htmlFor="pk-advisor">Advisor</label>
+                      <select id="pk-advisor" className="pk-select" value={activeAdvisor} onChange={(e) => void onPickAdvisor(e.target.value)}>
                         <option value="">Settings default</option>
-                        {advisorChoices.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                        {advisorChoices.map((m) => <option key={m.id} value={m.id}>{pickerName(m)}</option>)}
                       </select>
                     </div>
                   )}
@@ -3098,6 +3157,23 @@ function App() {
       )}
       <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} ttsVoice={ttsVoice || undefined} tapToTalk={tapToTalk} />
     </div>
+  );
+  if (!desktopMode) return ui;
+  const titleOf = (id: string) => convs.find((c) => c.sessionId === id)?.title || "Conversation";
+  return (
+    <Desktop
+      chat={ui}
+      chatTitle={activeId ? titleOf(activeId) : "New chat"}
+      chatBusySince={busy ? turnSince : null}
+      chatWaiting={!!activeId && !!statuses[activeId]?.waiting}
+      otherBusy={Object.entries(statuses).filter(([id, st]) => st.busy && id !== activeId).map(([id, st]) => ({ id, title: titleOf(id), since: st.since }))}
+      modelLabel={modelBtnLabel}
+      onModelClick={() => setMenuOpen(true)}
+      onOpenChat={(id) => void loadConv(id)}
+      finishedKey={finishedKey}
+      openTerminalId={termArg}
+      onTheme={(t) => setTheme(t)}
+    />
   );
 }
 

@@ -23,6 +23,48 @@ A companion for running [Claude Code](https://claude.com/claude-code) in the bro
 It is config-driven: a single-person install is a few lines of JSON. You can also track extra
 "users" (separate agents, bots, or sandboxed guests) so their usage shows as its own row.
 
+## The desktop
+
+On a wide screen the site opens as a Windows 95 style desktop. The chat app, every terminal tab,
+the usage dashboard, the morning brief and VS Code each open in their own window, so the whole
+thing lives at one address instead of a chat page and a terminal page side by side.
+
+![The retro desktop with the chat and a terminal tab open](docs/screenshots/desktop.png)
+
+- **Windows.** Drag by the title bar, resize from the edges, double-click to maximize, minimize
+  to the taskbar. Layout and z-order persist per browser (`localStorage["ct-desk-layout"]`).
+  Terminal windows are ttyd in an iframe (`/tty/?arg=<id>&embed=1`), so tmux, the predictor and
+  image paste behave exactly as in a full-page terminal.
+- **Task timers.** Every running task shows how long it has been going: the chat's status line
+  under the last message, each busy conversation in the sidebar, and each chat or terminal
+  button on the taskbar. Chat turns time from when the turn started on the server; terminal
+  tabs time from the prompt that started the current turn (the `ct-hook thinking` write).
+- **Clawd.** The Claude Code mascot walks along the taskbar, shows a `?` when something is
+  waiting for you, falls asleep after ten quiet minutes, and dances when a reply finishes (with
+  confetti if the task ran over a minute). Tap any Clawd to cycle through his dances; the
+  Clawd.exe window has buttons for each one. He is also the favicon.
+- **Start menu.** New terminal, a list of every terminal tab with its state and timer, Usage,
+  Morning brief, VS Code, Theme, and Shut down.
+- **Model and effort** stay one click away: the pill under the composer, and the same label on
+  the right of the taskbar.
+
+| Chat with a running timer | Start menu | Model picker |
+|---|---|---|
+| ![](docs/screenshots/chat-timer.png) | ![](docs/screenshots/start-menu.png) | ![](docs/screenshots/model-picker.png) |
+
+<img src="docs/screenshots/phone.png" width="260" align="right" alt="The retro skin on a phone">
+
+On a phone (under 900 px) there is no desktop: the chat renders full screen in the same retro
+skin, and the Terminal link opens `/tty/` directly. Retro is the default theme; Dark, Light and
+System are in Settings, in the Start menu under Theme, and on the sidebar's theme button.
+Screenshots use demo data.
+
+Routing for the single site: `/` redirects to `/app` (keeping its query string, so old
+`/?arg=<id>` links open that terminal tab as a window), and ttyd runs with `--base-path /tty`.
+The nginx blocks are in `deploy/nginx-app-usage.conf`.
+
+<br clear="right">
+
 ## How it fits together
 
 ```
@@ -166,7 +208,7 @@ claude-spawn --name deploy --cwd /srv/app --prompt-file ./task.md
 curl -s -X POST http://127.0.0.1:7682/sessions/spawn \
   -H 'content-type: application/json' \
   -d '{"prompt":"run the full test suite and fix any failures","name":"tests","cwd":"/srv/app"}'
-# -> {"id":"tests"}   (the tab id; open /?arg=tests to watch it)
+# -> {"id":"tests"}   (the tab id; open /tty/?arg=tests to watch it)
 ```
 
 `name` and `cwd` are optional (`name` defaults to a generated `spawn-<time>-<rand>` id; `cwd`

@@ -67,7 +67,7 @@ export type AppEvent =
   // A background/peer event surfaced in the thread: a subagent task settling, or a message from
   // another of Filip's running sessions (peer-send-message). kind drives how it renders.
   | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
-  | { t: "busy"; busy: boolean }
+  | { t: "busy"; busy: boolean; since?: number }
   | { t: "error"; message: string }
   | { t: "closed" }
   // First frame on every SSE: which live log this is and how far it has got. A client that carries a
@@ -519,6 +519,8 @@ export class Conversation {
   readonly epoch = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   phase: Phase = "idle";
   private phaseSince = 0;
+  // When the current run of busy started (epoch ms), 0 when idle. Drives the "running for 4:32" timers.
+  private busyStart = 0;
   private phaseDetail?: string;
   // Live background tasks (SDK background_tasks_changed level signal), ambient ones excluded. These
   // outlive the foreground turn that spawned them, so a conversation can be "idle" on phase yet still
@@ -662,7 +664,7 @@ export class Conversation {
     const wasBusy = this.busy;
     this.phase = phase; this.phaseDetail = detail; this.phaseSince = Date.now();
     this.emit({ t: "status", phase, since: this.phaseSince, ...(detail ? { detail } : {}) });
-    if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy });
+    if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy, ...(this.busy ? { since: this.busySince() } : {}) });
   }
   statusEvent(): AppEvent { return { t: "status", phase: this.phase, since: this.phaseSince, ...(this.phaseDetail ? { detail: this.phaseDetail } : {}) }; }
 
@@ -672,7 +674,17 @@ export class Conversation {
   // spend a push (and a radio wake) every cycle just for being busy.
   get activitySeq(): number { return this.seqCounter; }
   // Live status for the conversation-list indicators: generating vs waiting on a tappable question.
-  statusInfo(): { busy: boolean; waiting: boolean } { return { busy: this.busy && !this.closed, waiting: this.pendingAsks.size > 0 }; }
+  statusInfo(): { busy: boolean; waiting: boolean; since?: number } {
+    const busy = this.busy && !this.closed;
+    return { busy, waiting: this.pendingAsks.size > 0, ...(busy ? { since: this.busySince() } : {}) };
+  }
+  // Read lazily rather than only in setPhase, because background tasks can hold `busy` up after the
+  // phase goes idle and can end without a phase change.
+  busySince(): number {
+    if (!this.busy) { this.busyStart = 0; return 0; }
+    if (!this.busyStart) this.busyStart = this.phase !== "idle" && this.phaseSince ? this.phaseSince : Date.now();
+    return this.busyStart;
+  }
 
   // The model is given today's DATE in its system prompt but no clock and no history of when turns
   // happened, so it fills the gap by inventing one: "in the hour since we started talking" after
@@ -1302,7 +1314,7 @@ export function get(key: string): Conversation | undefined { return conversation
 // transcript mtime, fell through to the unread test, and showed an unread dot instead of "thinking".
 // (Measured: three busy worktree tabs reported status "busy" here while /app reported nothing at all
 // for two of them and busy=false for the third.)
-export type LiveStatus = { busy: boolean; waiting: boolean; terminal?: boolean };
+export type LiveStatus = { busy: boolean; waiting: boolean; terminal?: boolean; since?: number };
 const SESSIONS_DIR = join(homedir(), ".claude", "sessions");
 let sessCache: { at: number; map: Record<string, LiveStatus> } = { at: 0, map: {} };
 function cliSessionStatuses(): Record<string, LiveStatus> {
@@ -1346,7 +1358,7 @@ export function liveStatuses(): Record<string, LiveStatus> {
     const cli = out[c.id];
     // OR them: this process is authoritative for its own turn, but a CLI tab on the same session id
     // can be mid-tool while we have nothing running.
-    out[c.id] = { busy: mine.busy || !!cli?.busy, waiting: mine.waiting, terminal: !!cli?.terminal };
+    out[c.id] = { busy: mine.busy || !!cli?.busy, waiting: mine.waiting, terminal: !!cli?.terminal, ...(mine.since ? { since: mine.since } : cli?.since ? { since: cli.since } : {}) };
   }
   return out;
 }

@@ -733,13 +733,13 @@ function injectArtifactCss() {
   const css = `
   .md-root > .md + .md{margin-top:0}
   /* code card */
-  .ct-code{border:1px solid var(--line-2);border-radius:11px;margin:0 0 12px;overflow:hidden;background:#120f0c}
+  .ct-code{border:1px solid var(--line-2);border-radius:11px;margin:0 0 12px;overflow:hidden;background:var(--code-bg,#120f0c)}
   .ct-code-head{display:flex;align-items:center;gap:8px;padding:7px 10px 7px 13px;background:var(--bg-2);border-bottom:1px solid var(--line-2)}
   .ct-code-lang{font-family:var(--mono);font-size:11.5px;color:var(--text-3);text-transform:uppercase;letter-spacing:.05em;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .ct-copy{display:inline-flex;align-items:center;gap:5px;background:transparent;border:1px solid var(--line);color:var(--text-2);border-radius:7px;padding:4px 9px;font-size:12px;font-family:inherit;transition:background .12s,color .12s,border-color .12s}
   .ct-copy:hover{background:var(--bg-3);color:var(--text)}
   .ct-copy.done{color:var(--success,#10B981);border-color:color-mix(in srgb,var(--success,#10B981) 45%,transparent)}
-  .ct-code pre{margin:0;padding:12px 14px;overflow-x:auto;background:#120f0c}
+  .ct-code pre{margin:0;padding:12px 14px;overflow-x:auto;background:var(--code-bg,#120f0c)}
   .ct-code pre code{font-family:var(--mono);font-size:12.5px;line-height:1.55;background:none;padding:0}
   /* file card */
   .ct-file-card{display:inline-flex;align-items:center;gap:11px;max-width:100%;margin:4px 0;padding:9px 13px;background:var(--bg-2);border:1px solid var(--line);border-radius:11px;color:var(--text);text-decoration:none;transition:border-color .12s,background .12s}
@@ -792,7 +792,7 @@ function injectArtifactCss() {
   .md details.cal>summary+*{margin-top:9px}
   .md details.cal>*:last-child{margin-bottom:0}
   .md details.cal-warning,.md details.cal-caution,.md details.cal-attention{border-left-color:var(--warning,#F59E0B)}
-  .md details.cal-danger,.md details.cal-error,.md details.cal-bug,.md details.cal-ai-flag{border-left-color:var(--error,#EF4444)}
+  .md details.cal-danger,.md details.cal-error,.md details.cal-bug,.md details.cal-ai-flag{border-left-color:var(--danger,#e0685f)}
   .md details.cal-success,.md details.cal-tip,.md details.cal-done,.md details.cal-check{border-left-color:var(--success,#10B981)}
   .md details.cal-info,.md details.cal-note,.md details.cal-abstract,.md details.cal-summary{border-left-color:var(--accent-2)}
   .md details.cal-ai,.md details.cal-ai-summary{border-left-color:var(--accent)}
@@ -824,17 +824,17 @@ function injectArtifactCss() {
   .hljs-attr,.hljs-property,.hljs-params{color:#c9a7e6}
   .hljs-tag,.hljs-punctuation{color:#b8afa5}
   .hljs-emphasis{font-style:italic}.hljs-strong{font-weight:700}
-  /* light theme: warm code card + a light syntax palette with enough contrast on the pale bg */
-  body.theme-light .ct-code,body.theme-light .ct-code pre{background:#f3eee7}
-  body.theme-light .hljs{color:#2a2420}
-  body.theme-light .hljs-comment,body.theme-light .hljs-quote{color:#a39a8f}
-  body.theme-light .hljs-keyword,body.theme-light .hljs-selector-tag,body.theme-light .hljs-literal,body.theme-light .hljs-doctag,body.theme-light .hljs-formula{color:#b0562f}
-  body.theme-light .hljs-string,body.theme-light .hljs-regexp,body.theme-light .hljs-addition,body.theme-light .hljs-attribute,body.theme-light .hljs-meta .hljs-string{color:#4c8a3a}
-  body.theme-light .hljs-number,body.theme-light .hljs-symbol,body.theme-light .hljs-bullet,body.theme-light .hljs-link,body.theme-light .hljs-selector-attr,body.theme-light .hljs-template-variable,body.theme-light .hljs-variable{color:#9a6a12}
-  body.theme-light .hljs-title,body.theme-light .hljs-section,body.theme-light .hljs-name,body.theme-light .hljs-selector-id,body.theme-light .hljs-selector-class{color:#2f6bb0}
-  body.theme-light .hljs-type,body.theme-light .hljs-class .hljs-title,body.theme-light .hljs-built_in,body.theme-light .hljs-builtin-name{color:#1f7a7a}
-  body.theme-light .hljs-attr,body.theme-light .hljs-property,body.theme-light .hljs-params{color:#7a4fb0}
-  body.theme-light .hljs-tag,body.theme-light .hljs-punctuation{color:#6b6259}
+  /* light theme: a light syntax palette with enough contrast on the pale bg (the card itself
+     already re-themes via --code-bg) */
+  :is(body.theme-light,body.theme-retro) .hljs{color:#2a2420}
+  :is(body.theme-light,body.theme-retro) .hljs-comment,:is(body.theme-light,body.theme-retro) .hljs-quote{color:#a39a8f}
+  :is(body.theme-light,body.theme-retro) .hljs-keyword,:is(body.theme-light,body.theme-retro) .hljs-selector-tag,:is(body.theme-light,body.theme-retro) .hljs-literal,:is(body.theme-light,body.theme-retro) .hljs-doctag,:is(body.theme-light,body.theme-retro) .hljs-formula{color:#b0562f}
+  :is(body.theme-light,body.theme-retro) .hljs-string,:is(body.theme-light,body.theme-retro) .hljs-regexp,:is(body.theme-light,body.theme-retro) .hljs-addition,:is(body.theme-light,body.theme-retro) .hljs-attribute,:is(body.theme-light,body.theme-retro) .hljs-meta .hljs-string{color:#4c8a3a}
+  :is(body.theme-light,body.theme-retro) .hljs-number,:is(body.theme-light,body.theme-retro) .hljs-symbol,:is(body.theme-light,body.theme-retro) .hljs-bullet,:is(body.theme-light,body.theme-retro) .hljs-link,:is(body.theme-light,body.theme-retro) .hljs-selector-attr,:is(body.theme-light,body.theme-retro) .hljs-template-variable,:is(body.theme-light,body.theme-retro) .hljs-variable{color:#9a6a12}
+  :is(body.theme-light,body.theme-retro) .hljs-title,:is(body.theme-light,body.theme-retro) .hljs-section,:is(body.theme-light,body.theme-retro) .hljs-name,:is(body.theme-light,body.theme-retro) .hljs-selector-id,:is(body.theme-light,body.theme-retro) .hljs-selector-class{color:#2f6bb0}
+  :is(body.theme-light,body.theme-retro) .hljs-type,:is(body.theme-light,body.theme-retro) .hljs-class .hljs-title,:is(body.theme-light,body.theme-retro) .hljs-built_in,:is(body.theme-light,body.theme-retro) .hljs-builtin-name{color:#1f7a7a}
+  :is(body.theme-light,body.theme-retro) .hljs-attr,:is(body.theme-light,body.theme-retro) .hljs-property,:is(body.theme-light,body.theme-retro) .hljs-params{color:#7a4fb0}
+  :is(body.theme-light,body.theme-retro) .hljs-tag,:is(body.theme-light,body.theme-retro) .hljs-punctuation{color:#6b6259}
   @media (max-width:820px){
     .ct-av-head{gap:6px;padding:8px}.ct-av-title{display:none}.ct-av-btn span{display:none}
     .ct-av-sheet .ct-av-head{padding:calc(8px + env(safe-area-inset-top,0px)) calc(8px + env(safe-area-inset-right,0px)) 8px calc(8px + env(safe-area-inset-left,0px))}

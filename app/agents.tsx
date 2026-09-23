@@ -351,16 +351,16 @@ function injectAgentCss() {
   .agent-pill{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;margin-left:auto;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;border:1px solid var(--line)}
   .agent-pill.agent-running{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
   .agent-pill.agent-done{color:var(--success,#10B981);border-color:color-mix(in srgb,var(--success,#10B981) 45%,transparent);background:color-mix(in srgb,var(--success,#10B981) 12%,transparent)}
-  .agent-pill.agent-failed{color:var(--danger,#EF4444);border-color:color-mix(in srgb,var(--danger,#EF4444) 45%,transparent);background:color-mix(in srgb,var(--danger,#EF4444) 12%,transparent)}
+  .agent-pill.agent-failed{color:var(--danger,#e0685f);border-color:color-mix(in srgb,var(--danger,#e0685f) 45%,transparent);background:color-mix(in srgb,var(--danger,#e0685f) 12%,transparent)}
   .agent-tok{flex:0 0 auto;font-size:11px;color:var(--text-3);font-variant-numeric:tabular-nums}
   .agent-spin{width:10px;height:10px;border-radius:50%;border:2px solid color-mix(in srgb,currentColor 30%,transparent);border-top-color:currentColor;animation:agent-spin .8s linear infinite;display:inline-block}
   @keyframes agent-spin{to{transform:rotate(360deg)}}
   .agent-body{padding:0 12px 12px}
   .agent-label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-3);margin-top:10px}
-  .agent-pre{background:#120f0c;border:1px solid var(--line-2);border-radius:9px;padding:10px 12px;overflow-x:auto;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;margin:6px 0 0}
-  .agent-pre-err{border-color:color-mix(in srgb,var(--danger,#EF4444) 55%,var(--line-2));color:var(--danger,#EF4444)}
+  .agent-pre{background:var(--code-bg,#120f0c);border:1px solid var(--line-2);border-radius:9px;padding:10px 12px;overflow-x:auto;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;margin:6px 0 0}
+  .agent-pre-err{border-color:color-mix(in srgb,var(--danger,#e0685f) 55%,var(--line-2));color:var(--danger,#e0685f)}
   .agent-result{margin:6px 0 0;font-size:13.5px;line-height:1.55;color:var(--text)}
-  .agent-result.agent-result-err{color:var(--danger,#EF4444)}
+  .agent-result.agent-result-err{color:var(--danger,#e0685f)}
   .agent-result>:first-child{margin-top:0}
   .agent-result>:last-child{margin-bottom:0}
   .agent-waiting{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12.5px;color:var(--text-3)}
@@ -370,7 +370,7 @@ function injectAgentCss() {
   .agent-phase-dot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--text-3)}
   .agent-phase-dot.agent-running{background:var(--accent)}
   .agent-phase-dot.agent-done{background:var(--success,#10B981)}
-  .agent-phase-dot.agent-failed{background:var(--danger,#EF4444)}
+  .agent-phase-dot.agent-failed{background:var(--danger,#e0685f)}
   .agent-phase-dot.agent-pending{background:var(--line)}
   .agent-phase-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .agent-phase-status{flex:0 0 auto;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-3)}

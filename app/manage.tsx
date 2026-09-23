@@ -135,11 +135,11 @@ type McpStatus = {
 };
 
 const MCP_DOT: Record<string, string> = {
-  connected: "#10B981",
-  failed: "#EF4444",
-  "needs-auth": "#F59E0B",
-  pending: "#8a8078",
-  disabled: "#8a8078",
+  connected: "var(--success)",
+  failed: "var(--danger)",
+  "needs-auth": "var(--warning)",
+  pending: "var(--text-3)",
+  disabled: "var(--text-3)",
 };
 
 function toolCountOf(s: McpStatus | undefined): number | null {
@@ -336,7 +336,7 @@ export function McpSection({ activeId }: { activeId: string | null }) {
             return (
               <div className="ms-row" key={n}>
                 <div className="ms-row-top">
-                  <span className="ms-dot" style={{ background: st ? MCP_DOT[st.status || ""] || "#8a8078" : "#8a8078" }} title={st?.status || "not connected in this chat"} />
+                  <span className="ms-dot" style={{ background: st ? MCP_DOT[st.status || ""] || "var(--text-3)" : "var(--text-3)" }} title={st?.status || "not connected in this chat"} />
                   <span className="ms-name">{n}</span>
                   <span className="ms-badge">{type}</span>
                   <span className="ms-state">
@@ -597,7 +597,7 @@ export function MemorySection() {
 }
 // #endregion
 
-// #region injected styles (app CSS vars only — nothing hardcoded but the status dots)
+// #region injected styles (app CSS vars only — nothing hardcoded but the toggle knob, which stays white in both themes)
 let cssDone = false;
 export function injectManageCss() {
   if (cssDone || typeof document === "undefined") return;
@@ -612,7 +612,7 @@ export function injectManageCss() {
   .ms-btn{padding:9px 14px;border-radius:10px;border:1px solid var(--line,#3a322c);background:var(--bg-3,#2a2420);color:var(--text,#ece7e1);font-size:13.5px;font-weight:500}
   .ms-btn:hover{border-color:var(--text-3,#8a8078)}
   .ms-btn:disabled{opacity:.5;cursor:default}
-  .ms-btn.ms-primary{margin-top:16px;background:var(--accent,#d97757);border-color:var(--accent,#d97757);color:#fff;font-weight:600}
+  .ms-btn.ms-primary{margin-top:16px;background:var(--accent,#d97757);border-color:var(--accent,#d97757);color:var(--bg,#1a1613);font-weight:600}
   .ms-btn.ms-primary:hover{filter:brightness(1.06)}
 
   .ms-list{display:flex;flex-direction:column;gap:10px}
@@ -628,16 +628,16 @@ export function injectManageCss() {
   .ms-ic{background:transparent;border:none;color:var(--text-3,#8a8078);font-size:12px;padding:6px 8px;border-radius:7px}
   .ms-ic:hover{color:var(--text,#ece7e1);background:var(--bg-3,#2a2420)}
   .ms-ic-x{font-size:17px;line-height:1}
-  .ms-ic.ms-danger{color:#EF4444;font-weight:600}
+  .ms-ic.ms-danger{color:var(--danger,#e0685f);font-weight:600}
   .ms-sub{margin-top:8px;font-size:12px;line-height:1.5;color:var(--text-3,#8a8078);word-break:break-word}
   .ms-clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-  .ms-rowerr{margin-top:8px;font-size:12px;line-height:1.5;color:#EF4444;word-break:break-word}
+  .ms-rowerr{margin-top:8px;font-size:12px;line-height:1.5;color:var(--danger,#e0685f);word-break:break-word}
   .ms-hint{font-size:11.5px;color:var(--text-3,#8a8078);margin-top:5px}
 
-  .ms-err{display:flex;align-items:flex-start;gap:8px;margin:0 0 12px;font-size:12.5px;line-height:1.5;color:#EF4444}
+  .ms-err{display:flex;align-items:flex-start;gap:8px;margin:0 0 12px;font-size:12.5px;line-height:1.5;color:var(--danger,#e0685f)}
   .ms-x{background:transparent;border:none;color:inherit;font-size:16px;line-height:1;padding:0 2px;margin-left:auto}
-  .ms-ok{margin:0 0 12px;font-size:12.5px;color:#10B981}
-  .ms-ok-inline{font-size:12px;color:#10B981;margin-right:auto}
+  .ms-ok{margin:0 0 12px;font-size:12.5px;color:var(--success,#10B981)}
+  .ms-ok-inline{font-size:12px;color:var(--success,#10B981);margin-right:auto}
 
   .ms-dead{display:flex;flex-direction:column;align-items:flex-start;gap:12px;font-size:12.5px;line-height:1.6;color:var(--text-3,#8a8078)}
 

@@ -169,11 +169,12 @@ const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 
 // #region model weighting — "what did this usage actually cost"
 // Every rate below is Anthropic's published list price, read off
-// https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-02), not inferred:
+// https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-22), not inferred:
 //
 //   model              input   5m write   1h write   cache read   output    ($/MTok)
 //   Fable 5.1 / Mythos 5.1   10    12.50      20         0.25        50     <- 0.025x read, not 0.1x
 //   Fable 5   / Mythos 5     10    12.50      20         1.00        50
+//   Opus 5.5                  4     5.00       8         0.20        20     <- 0.05x read, not 0.1x
 //   Opus 5 / 4.8 / 4.7 / 4.6  5     6.25      10         0.50        25
 //   Sonnet 5                  2     2.50       4         0.20        10     <- $2/$10 is now the standard price
 //   Sonnet 4.6                3     3.75       6         0.30        15
@@ -193,6 +194,7 @@ const MODEL_PRICES: Record<string, Price> = {
   "claude-mythos-5-1": { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 0.25 },
   "claude-fable-5":    { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 1 },
   "claude-mythos-5":   { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 1 },
+  "claude-opus-5-5":   { input: 4, output: 20, write5m: 5, write1h: 8, read: 0.2 },
   "claude-opus-5":     { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
   "claude-opus-4-8":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
   "claude-opus-4-7":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
@@ -947,6 +949,7 @@ const conns = new Connections(STATE_DIR, cfg.netApplyHelper);
 // is config-overridable; the ids are CLI/SDK model aliases resolved at query time.
 // Quick picks (shown in the model menu) — versioned ids so the label shows the version.
 const APP_MODELS: { id: string; label: string }[] = cfg.appModels || [
+  { id: "claude-opus-5-5", label: "Opus 5.5" },
   { id: "claude-opus-4-8", label: "Opus 4.8" },
   { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
   { id: "claude-haiku-4-5", label: "Haiku 4.5" },
@@ -958,6 +961,7 @@ const APP_MODELS: { id: string; label: string }[] = cfg.appModels || [
 const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
   { id: "claude-fable-5-1", label: "Fable 5.1" },
   { id: "claude-fable-5", label: "Fable 5" },
+  { id: "claude-opus-5-5", label: "Opus 5.5" },
   { id: "claude-opus-5", label: "Opus 5" },
   { id: "claude-opus-4-8", label: "Opus 4.8" },
   { id: "claude-opus-4-7", label: "Opus 4.7" },
@@ -1259,7 +1263,7 @@ const server = Bun.serve({
       const t = (await titleForSession(id)) || `Session ${id}`;
       const title = kind === "waiting" ? "⏳ Waiting for input" : "✅ Turn finished";
       const res = await pushAll({
-        title, body: t, url: "/?arg=" + encodeURIComponent(id),
+        title, body: t, url: "/app?arg=" + encodeURIComponent(id),
         tag: "sess-" + id, sessionId: id, requireInteraction: kind === "waiting",
       });
       return Response.json({ ok: true, ...res });
@@ -1295,7 +1299,12 @@ const server = Bun.serve({
       const withTitles = await Promise.all(rows.map(async (r) => {
         const ai = await titleForSession(r.id);
         const title = ai || (/^\d+$/.test(r.id) ? "New Tab" : r.id);
-        return { id: r.id, title, state: await stateForSession(r.id), created: r.created, attached: r.attached };
+        const state = await stateForSession(r.id);
+        // ct-hook writes "thinking" on UserPromptSubmit only, so the state file's mtime is when the
+        // current turn started. The desktop taskbar ticks its "running for" timer from it.
+        let since: number | undefined;
+        if (state === "thinking") { try { since = Math.round(statSync(join(REG_DIR, `${r.id}.state`)).mtimeMs); } catch {} }
+        return { id: r.id, title, state, created: r.created, attached: r.attached, ...(since ? { since } : {}) };
       }));
       // Creation order, and nothing else. Session "1" used to be pinned to the front,
       // which meant a bare-URL visit put an untouched "New Tab" ahead of every real

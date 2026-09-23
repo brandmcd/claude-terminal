@@ -47,6 +47,16 @@ through to ttyd and 404.
 Paste the contents of `nginx-app-usage.conf` into the `server { … }` block in
 `/etc/nginx/sites-enabled/claude-terminal`, **above** the catch-all `location /`.
 
+The same file also makes this one site: `location = /` redirects to `/app` and ttyd is served
+under `/tty/`. That needs ttyd started with `--base-path /tty`; on this box the flag is in the
+`ExecStart` of `/etc/systemd/system/ct-ttyd.service`, which is not in the repo:
+
+```
+ExecStart=/usr/local/bin/ttyd --port 7681 --interface 127.0.0.1 --base-path /tty --url-arg --writable …
+```
+
+Restarting ct-ttyd drops open terminal connections (tmux sessions survive), so reload those tabs.
+
 ```bash
 nginx -t && systemctl reload nginx
 ```

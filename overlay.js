@@ -2,33 +2,42 @@
   const log = (...a) => console.log("[claude-paste]", ...a);
   log("overlay loaded");
 
-  // #region PWA launch routing — reopen the surface you left off on (terminal vs app).
-  // The manifest start_url is "/?home=1"; that marker only appears on a cold PWA launch, so a
-  // normal in-app navigation to the terminal never bounces. If the app ("/app") was the last
-  // surface, jump there (its default view, NOT a specific conversation). Otherwise stay here.
+  // #region embed detection
+  // This page runs two ways now: as its own top-level surface (a phone PWA tab), or framed
+  // inside the retro desktop's terminal window (/app draws it as an iframe on screens wide
+  // enough for the desktop). The desktop passes ?embed=1; window.self !== window.top is the
+  // fallback for an embedder that forgets the query string. /app is the site's home now and
+  // owns tab chrome, install prompts and cold-launch routing itself, so none of that belongs
+  // here in embed mode — see every "if (!IS_EMBED)" guard below.
+  let IS_EMBED = false;
   try {
-    var _sp = new URLSearchParams(location.search);
-    var _last = null; try { _last = localStorage.getItem("ct-last-surface"); } catch (e) {}
-    var _standalone = false;
-    try { _standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true; } catch (e) {}
-    var _navType = "";
-    try { var _nav = performance.getEntriesByType("navigation")[0]; _navType = _nav ? _nav.type : ""; } catch (e) {}
-    // Treat this as a cold PWA launch (so honour "reopen last surface") on EITHER signal:
-    //  - the start_url marker "?home=1" (a correctly-updated install), or
-    //  - a standalone top-level launch with no same-app referrer and not a reload. This covers
-    //    OLD installs whose baked start_url predates the marker — Android WebAPK / iOS bake the
-    //    start_url at install and rarely refresh it, so the marker alone would miss them. A later
-    //    in-app hop to the terminal carries a referrer, and a manual reload reports type "reload",
-    //    so neither trips the fallback. (last-surface is also rewritten to "/" below, so once you
-    //    are on the terminal a reload can't bounce you away.)
-    var _cold = _sp.get("home") === "1" || (_standalone && !document.referrer && _navType !== "reload");
-    // Root is the APP now, so a cold launch never lands here by accident and there is nothing to
-    // bounce to: the app owns the reopen-last-surface decision (see main.tsx). Kept only for an old
-    // install whose baked start_url still points at a terminal URL.
-    if (_cold && _last === "/app") { location.replace("/app"); return; }
-    if (_sp.get("home") === "1") { try { history.replaceState(null, "", location.pathname); } catch (e) {} } // drop the marker
-    try { localStorage.setItem("ct-last-surface", "/"); } catch (e) {} // we're on the terminal now
-  } catch (e) {}
+    IS_EMBED = new URLSearchParams(location.search).get("embed") === "1" || window.self !== window.top;
+  } catch (e) {
+    IS_EMBED = true; // cross-origin frame access threw -> we ARE framed, by someone
+  }
+  // #endregion
+
+  // #region retro chrome (non-embedded terminal only — the desktop supplies its own theme
+  // to an embedded frame, and this page's chrome never mounts there at all)
+  if (!IS_EMBED) {
+    // "ct-app-theme" is the same key /app, /usage and /brief read; retro is the sitewide
+    // default, so an unset key means retro here too. This only toggles OUR chrome (the tab
+    // bar, drawer, history/connections modals below); xterm's own colors are a separate
+    // toggle (.theme-light, further down) and out of scope for the retro skin.
+    const applyChromeTheme = () => {
+      if (!document.body) return false;
+      let t = null;
+      try { t = localStorage.getItem("ct-app-theme"); } catch (e) {}
+      document.body.classList.toggle("theme-retro", t === "retro" || !t);
+      return true;
+    };
+    if (!applyChromeTheme()) {
+      // This script runs from <head>, before the parser has reached <body> — same race
+      // mountBar()'s own MutationObserver (further down) exists to cover, so reuse the idiom.
+      const bodyWatch = new MutationObserver(() => { if (applyChromeTheme()) bodyWatch.disconnect(); });
+      bodyWatch.observe(document.documentElement, { childList: true });
+    }
+  }
   // #endregion
 
   // #region ttyd WebSocket capture
@@ -100,13 +109,13 @@
   // standing between the phone and a full round trip per keystroke, so the measured hit rate
   // now decides something real rather than describing a desktop-only nicety.
   //
-  // SHIPS MEASURE-ONLY. With PAINT=false the whole pipeline runs — classify, queue,
-  // reconcile, hit/miss, srtt — and paints nothing, so real typing can be judged from
-  // window.__ctPredictStats() before a single speculative pixel is shown. Turn painting on
-  // by flipping PAINT, or with localStorage["ct-predict"]="paint" — overlay.js is served
-  // immutable for a year, so the switch has to be reachable without a redeploy. The same
-  // way out: localStorage["ct-predict"]="off", or ?nopredict in the URL, disables it whole.
-  const PAINT = false;
+  // PAINT defaults to true: predictions are shown, not just measured. Turn painting off
+  // per browser with localStorage["ct-predict"]="off" (or with ?nopredict in the URL,
+  // which also disables the rest of the pipeline: classify, queue, reconcile, hit/miss,
+  // srtt, not just the paint). localStorage["ct-predict"]="paint" still works, it is just
+  // a no-op now that painting is the default. overlay.js is served immutable for a year,
+  // so these switches have to be reachable without a redeploy.
+  const PAINT = true;
 
   const predictMode = (function () {
     try {
@@ -229,7 +238,16 @@
       }
       const code = p.charCodeAt(0);
       if (code === 8 || code === 127) { unpush(); return; }
-      if (code < 0x20 || code > 0x7e) { flush(); return; } // Enter, ESC, arrows, Ctrl-*, Tab
+      if (code < 0x20 || code > 0x7e) {
+        // Enter, ESC, arrows, Ctrl-*, Tab. The same quiet window as a multi-byte burst,
+        // and for the same reason: Enter in particular moves the cursor to a new line the
+        // server hasn't confirmed yet, so a character typed in the next instant would
+        // anchor against the OLD line's last cell and paint there instead of on the new
+        // line. Without this, that stray glyph survives until the watchdog clears it.
+        pasteUntil = Date.now() + PASTE_QUIET_MS;
+        flush();
+        return;
+      }
       push(p);
     }
 
@@ -456,8 +474,9 @@
     return { attach: attach, stats: stats };
   })();
 
-  // The whole point of the measure-only ship: read this after a day of real typing.
-  // `samples` counts predictions made, hits+misses the ones that were scored.
+  // Read this after a day of real typing, painted or not: `samples` counts predictions
+  // made, hits+misses the ones that were scored, so the rate is measured independently
+  // of whether PAINT is showing anything.
   window.__ctPredictStats = predict.stats;
   // #endregion
 
@@ -871,44 +890,77 @@
 
   const barStyle = document.createElement("style");
   barStyle.textContent = [
-    // make room for the fixed bar
-    "#terminal-container{top:calc(" + BAR_H + "px + " + SAT + ") !important;height:calc(100% - " + BAR_H + "px - " + SAT + " - " + SAB + ") !important}",
-    // the bar itself (dark defaults; light overrides below via body.theme-light)
-    "#claude-tabbar{position:fixed;top:" + SAT + ";left:0;right:0;height:" + BAR_H + "px;z-index:50;display:flex;align-items:stretch;gap:6px;padding:0 calc(8px + " + SAR + ") 0 calc(8px + " + SAL + ");box-sizing:border-box;background:#181818;border-bottom:1px solid #2e2e2e;font:12px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:#cfcfcf;user-select:none;-webkit-user-select:none}",
+    // make room for the fixed bar — except embedded, where there is no bar and the
+    // terminal fills the iframe the retro desktop gave it, edge to edge
+    (IS_EMBED
+      ? "#terminal-container{top:0 !important;height:100% !important}"
+      : "#terminal-container{top:calc(" + BAR_H + "px + " + SAT + ") !important;height:calc(100% - " + BAR_H + "px - " + SAT + " - " + SAB + ") !important}"),
+    // the bar itself (colors are CSS vars, so body.theme-light repaints it for free)
+    "#claude-tabbar{position:fixed;top:" + SAT + ";left:0;right:0;height:" + BAR_H + "px;z-index:50;display:flex;align-items:stretch;gap:6px;padding:0 calc(8px + " + SAR + ") 0 calc(8px + " + SAL + ");box-sizing:border-box;background:var(--ct-panel);border-bottom:1px solid var(--ct-line);font:12px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:var(--ct-text-2);user-select:none;-webkit-user-select:none}",
     // Solid strip filling the status-bar / Dynamic Island region. Always dark, because
     // black-translucent forces white status text regardless of the app theme.
     ":root{--ct-sat:env(safe-area-inset-top, 0px);--ct-sab:env(safe-area-inset-bottom, 0px)}",
-    "#ct-safetop{position:fixed;top:0;left:0;right:0;height:" + SAT + ";z-index:60;background:#181818;pointer-events:none}",
-    "html,body{background:#0d1117}",
+    // Same warm-neutral palette as /app (styles.css :root / body.theme-light), duplicated
+    // here rather than shared: this page never loads app/styles.css. ct-* prefix keeps
+    // these clear of ttyd's own CSS custom properties.
+    ":root{--ct-bg:#1a1613;--ct-bg-2:#211c18;--ct-bg-3:#2a2420;--ct-panel:#17130f;--ct-line:#3a322c;--ct-line-2:#2c2621;--ct-text:#ece7e1;--ct-text-2:#b8afa5;--ct-text-3:#8a8078;--ct-accent:#d97757;--ct-accent-2:#e08a6d;--ct-danger:#e0685f}",
+    // "~ *", not just "body.theme-light": mountBar() and every open*() below append the
+    // bar, both modals and the drawer as siblings of <body> (children of <html>, per the
+    // comment at mountBar), never as descendants of it, so a plain body.theme-light rule
+    // would set these custom properties somewhere nothing we render can inherit them from.
+    // This reaches the actual siblings ttyd's toggle leaves body.theme-light next to.
+    // Every OTHER "body.theme-light <selector>" rule below is written the same
+    // "~" way for the same reason, including a few (.ctab-bell.on, .ct-applying) that
+    // predate this pass: as plain descendant selectors they could never have matched
+    // either, so their light-theme colors have been dead code since they were written.
+    "body.theme-light ~ *{--ct-bg:#f7f4f0;--ct-bg-2:#efeae4;--ct-bg-3:#e5ded6;--ct-panel:#ffffff;--ct-line:#ddd4c9;--ct-line-2:#e7e0d8;--ct-text:#26211d;--ct-text-2:#574f47;--ct-text-3:#857b72;--ct-accent:#c25a3c;--ct-accent-2:#d97757;--ct-danger:#c0392b}",
+    // Literal, not var(--ct-panel): this strip must stay dark in EITHER theme (see above),
+    // so it cannot switch with the var body.theme-light redefines.
+    "#ct-safetop{position:fixed;top:0;left:0;right:0;height:" + SAT + ";z-index:60;background:#17130f;pointer-events:none}",
+    // Literal too, and unconditionally dark in both themes, same as before this pass: this
+    // is the html/body base color visible only at an overscroll/rubber-band edge, behind
+    // the bar and (once ttyd repaints) behind xterm's own themed background.
+    "html,body{background:#1a1613}",
     "#claude-tabbar *{box-sizing:border-box}",
+    // One rule for keyboard focus across the bar, both modals and the drawer, rather than
+    // repeating it per control. Most controls here are plain divs/spans with no tabindex
+    // and so can never actually receive focus (a pre-existing gap, not something this pass
+    // adds); this is what lights up the ones that can, today the search input, the two
+    // form fields and the plain-link buttons.
+    "#claude-tabbar *:focus-visible,#ct-histmodal *:focus-visible,#ct-connmodal *:focus-visible,#ct-drawer *:focus-visible{outline:2px solid var(--ct-accent);outline-offset:2px}",
     // chips scroll; the + sits right after them (left-aligned, browser-style)
     "#claude-tabbar .ctab-list{display:flex;align-items:stretch;gap:6px;overflow-x:auto;scrollbar-width:none;flex:0 1 auto;min-width:0;-webkit-overflow-scrolling:touch}",
     "#claude-tabbar .ctab-list::-webkit-scrollbar{height:0;display:none}",
     "#claude-tabbar .ctab-spacer{flex:1 1 auto;min-width:8px}",
-    "#claude-tabbar .ctab{display:flex;align-items:center;gap:6px;max-width:340px;padding:0 8px;margin:5px 0;border-radius:7px;background:#262626;border:1px solid #333;cursor:pointer;white-space:nowrap;transition:background .12s,border-color .12s}",
-    "#claude-tabbar .ctab:hover{background:#303030}",
-    "#claude-tabbar .ctab.active{background:#2b3b55;border-color:#3d6cc4;color:#fff}",
+    "#claude-tabbar .ctab{display:flex;align-items:center;gap:6px;max-width:340px;padding:0 8px;margin:5px 0;border-radius:8px;background:var(--ct-bg-3);border:1px solid var(--ct-line);cursor:pointer;white-space:nowrap;transition:background .12s,border-color .12s}",
+    "#claude-tabbar .ctab:hover{background:var(--ct-line)}",
+    // tinted with the accent rather than var(--ct-bg-*): this is the one chip that must
+    // read as selected at a glance, not just slightly different.
+    "#claude-tabbar .ctab.active{background:rgba(217,119,87,.16);border-color:var(--ct-accent);color:var(--ct-text)}",
+    "body.theme-light ~ #claude-tabbar .ctab.active{background:rgba(194,90,60,.12)}",
     // per-session state dot
-    "#claude-tabbar .ctab .ctab-state{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:#6b7280}",
+    "#claude-tabbar .ctab .ctab-state{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--ct-text-3)}",
     "#claude-tabbar .ctab .ctab-state.thinking{background:#f59e0b}",
     "#claude-tabbar .ctab .ctab-state.waiting{background:#a855f7}",
     "#claude-tabbar .ctab .ctab-state.done{background:#22c55e}",
-    "#claude-tabbar .ctab .ctab-state.seen{background:#6b7280}",
+    "#claude-tabbar .ctab .ctab-state.seen{background:var(--ct-text-3)}",
     "@media (prefers-reduced-motion:no-preference){#claude-tabbar .ctab .ctab-state.thinking,#claude-tabbar .ctab .ctab-state.waiting{animation:ctabPulse 1.1s ease-in-out infinite}}",
     "@keyframes ctabPulse{0%,100%{opacity:1}50%{opacity:.35}}",
     "#claude-tabbar .ctab .ctab-label{overflow:hidden;text-overflow:ellipsis;max-width:290px}",
-    "#claude-tabbar .ctab .ctab-icon{display:flex;align-items:center;opacity:.55;border-radius:4px;padding:2px}",
+    "#claude-tabbar .ctab .ctab-icon{display:flex;align-items:center;opacity:.55;border-radius:5px;padding:2px}",
     "#claude-tabbar .ctab .ctab-icon:hover{opacity:1;background:rgba(255,255,255,.12)}",
-    "#claude-tabbar .ctab .ctab-close{font-size:15px;line-height:1;width:16px;height:16px;display:flex;align-items:center;justify-content:center;opacity:.5;border-radius:4px}",
-    "#claude-tabbar .ctab .ctab-close:hover{opacity:1;background:rgba(255,80,80,.25);color:#fff}",
-    "#claude-tabbar .ctab-btn{display:flex;align-items:center;justify-content:center;width:28px;flex:0 0 auto;margin:5px 0;border-radius:7px;background:#262626;border:1px solid #333;cursor:pointer;color:#cfcfcf}",
-    "#claude-tabbar .ctab-btn:hover{background:#333;color:#fff}",
+    "body.theme-light ~ #claude-tabbar .ctab .ctab-icon:hover{background:rgba(0,0,0,.08)}",
+    "#claude-tabbar .ctab .ctab-close{font-size:15px;line-height:1;width:16px;height:16px;display:flex;align-items:center;justify-content:center;opacity:.5;border-radius:5px}",
+    "#claude-tabbar .ctab .ctab-close:hover{opacity:1;background:rgba(224,104,95,.25);color:var(--ct-text)}",
+    "body.theme-light ~ #claude-tabbar .ctab .ctab-close:hover{background:rgba(192,57,43,.18)}",
+    "#claude-tabbar .ctab-btn{display:flex;align-items:center;justify-content:center;width:28px;flex:0 0 auto;margin:5px 0;border-radius:8px;background:var(--ct-bg-3);border:1px solid var(--ct-line);cursor:pointer;color:var(--ct-text-2)}",
+    "#claude-tabbar .ctab-btn:hover{background:var(--ct-line);color:var(--ct-text)}",
     "#claude-tabbar .ctab-new{font-size:18px;line-height:1}",
     "#claude-tabbar .ctab-usage{width:auto;padding:0 9px;gap:5px}",
     "#claude-tabbar .ctab-usage .ctab-usage-fig{font-size:11px;font-variant-numeric:tabular-nums}",
     // notification bell (green glow when on)
     "#claude-tabbar .ctab-bell.on{color:#22c55e;border-color:#2f6f43}",
-    "body.theme-light #claude-tabbar .ctab-bell.on{color:#16a34a;border-color:#8fd0a6}",
+    "body.theme-light ~ #claude-tabbar .ctab-bell.on{color:#16a34a;border-color:#8fd0a6}",
     // install prompt banner (mobile)
     "#ct-install{position:fixed;left:12px;right:12px;bottom:14px;z-index:70;display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;background:#201b18;border:1px solid #3a2f28;color:#f0e9e4;box-shadow:0 10px 34px rgba(0,0,0,.5);font:13px/1.35 system-ui,-apple-system,Segoe UI,sans-serif}",
     "#ct-install img{width:40px;height:40px;flex:0 0 auto}",
@@ -922,22 +974,17 @@
     "#ct-install.ios{align-items:flex-start}",
     // history dialog (resume a past conversation)
     "#ct-histmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5)}",
-    "#ct-histmodal .ct-hist{margin-top:calc(" + (BAR_H + 12) + "px + " + SAT + ");width:min(640px,92vw);max-height:78vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
-    "#ct-histmodal .ct-hist-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
-    "#ct-histmodal .ct-hist-search{margin:8px 10px 2px;padding:7px 10px;border-radius:7px;border:1px solid #3a3a3a;background:#161616;color:#e6e6e6;font:13px system-ui,sans-serif;outline:none}",
-    "#ct-histmodal .ct-hist-search:focus{border-color:#3d6cc4}",
-    "body.theme-light #ct-histmodal .ct-hist-search{background:#f6f6f6;border-color:#dcdcdc;color:#1f1f1f}",
-    "#ct-histmodal .ct-hist-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
-    "#ct-histmodal .ct-hist-close:hover{opacity:1}",
+    "#ct-histmodal .ct-hist{margin-top:calc(" + (BAR_H + 12) + "px + " + SAT + ");width:min(640px,92vw);max-height:78vh;display:flex;flex-direction:column;background:var(--ct-panel);color:var(--ct-text);border:1px solid var(--ct-line);border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.4);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-histmodal .ct-hist-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--ct-line-2);font-weight:600}",
+    "#ct-histmodal .ct-hist-search{margin:8px 10px 2px;padding:8px 10px;border-radius:8px;border:1px solid var(--ct-line);background:var(--ct-bg-3);color:var(--ct-text);font:13px system-ui,sans-serif;outline:none}",
+    "#ct-histmodal .ct-hist-search:focus{border-color:var(--ct-accent)}",
+    "#ct-histmodal .ct-hist-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:8px}",
+    "#ct-histmodal .ct-hist-close:hover{opacity:1;background:var(--ct-bg-3)}",
     "#ct-histmodal .ct-hist-list{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:6px}",
-    "#ct-histmodal .ct-hist-row{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:7px;cursor:pointer}",
-    "#ct-histmodal .ct-hist-row:hover{background:#2c2c2c}",
+    "#ct-histmodal .ct-hist-row{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:8px;cursor:pointer}",
+    "#ct-histmodal .ct-hist-row:hover{background:var(--ct-bg-3)}",
     "#ct-histmodal .ct-hist-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-    "#ct-histmodal .ct-hist-sub{font-size:11px;color:#9a9a9a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-    "body.theme-light #ct-histmodal .ct-hist{background:#fff;color:#1f1f1f;border-color:#dcdcdc}",
-    "body.theme-light #ct-histmodal .ct-hist-head{border-color:#ececec}",
-    "body.theme-light #ct-histmodal .ct-hist-row:hover{background:#f0f0f0}",
-    "body.theme-light #ct-histmodal .ct-hist-sub{color:#777}",
+    "#ct-histmodal .ct-hist-sub{font-size:11px;color:var(--ct-text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
     // external-networks modal (shares the histmodal card look)
     "#ct-connmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;background:rgba(0,0,0,.5);backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px)}",
     // applying overlay: covers the dialog with a spinner while a change is being applied
@@ -945,80 +992,70 @@
     "#ct-connmodal .ct-conn{position:relative}",
     "#ct-connmodal .ct-applying{position:absolute;inset:0;z-index:2;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(30,30,30,.82);backdrop-filter:blur(2px);border-radius:10px;text-align:center;padding:20px}",
     "#ct-connmodal.applying .ct-applying{display:flex}",
-    "#ct-connmodal .ct-applying .sp{width:34px;height:34px;border-radius:50%;border:3px solid #4a4a4a;border-top-color:#7C3AED;animation:ct-spin .8s linear infinite}",
+    "#ct-connmodal .ct-applying .sp{width:34px;height:34px;border-radius:50%;border:3px solid #4a4a4a;border-top-color:var(--ct-accent);animation:ct-spin .8s linear infinite}",
     "#ct-connmodal .ct-applying .msg{font-size:13px;color:#d6d6d6;max-width:80%}",
     "@keyframes ct-spin{to{transform:rotate(360deg)}}",
     "@media (prefers-reduced-motion: reduce){#ct-connmodal .ct-applying .sp{animation-duration:2s}}",
-    "body.theme-light #ct-connmodal .ct-applying{background:rgba(255,255,255,.85)}",
-    "body.theme-light #ct-connmodal .ct-applying .msg{color:#333}",
-    "#ct-connmodal .ct-conn{margin-top:" + (BAR_H + 12) + "px;width:min(640px,94vw);max-height:82vh;display:flex;flex-direction:column;background:#1e1e1e;color:#e6e6e6;border:1px solid #383838;border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.55);font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}",
-    "#ct-connmodal .ct-conn-err{margin:0 0 10px;padding:9px 11px;border-radius:8px;font-size:12.5px;line-height:1.4;color:#fca5a5;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.4)}", // ct-connerr
-    "#ct-connmodal .ct-conn-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #383838;font-weight:600}",
-    "#ct-connmodal .ct-conn-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;padding:0 4px}",
-    "#ct-connmodal .ct-conn-close:hover{opacity:1}",
+    "body.theme-light ~ #ct-connmodal .ct-applying{background:rgba(255,255,255,.85)}",
+    "body.theme-light ~ #ct-connmodal .ct-applying .msg{color:#333}",
+    "#ct-connmodal .ct-conn{margin-top:" + (BAR_H + 12) + "px;width:min(640px,94vw);max-height:82vh;display:flex;flex-direction:column;background:var(--ct-panel);color:var(--ct-text);border:1px solid var(--ct-line);border-radius:10px;overflow:hidden;box-shadow:0 12px 44px rgba(0,0,0,.4);font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-connmodal .ct-conn-err{margin:0 0 10px;padding:9px 11px;border-radius:8px;font-size:12.5px;line-height:1.4;color:var(--ct-danger);background:rgba(224,104,95,.12);border:1px solid rgba(224,104,95,.4)}", // ct-connerr
+    "body.theme-light ~ #ct-connmodal .ct-conn-err{background:rgba(192,57,43,.1);border-color:rgba(192,57,43,.35)}",
+    "#ct-connmodal .ct-conn-head{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--ct-line-2);font-weight:600}",
+    "#ct-connmodal .ct-conn-close{cursor:pointer;opacity:.6;font-size:19px;line-height:1;width:32px;height:32px;display:flex;align-items:center;justify-content:center;border-radius:8px}",
+    "#ct-connmodal .ct-conn-close:hover{opacity:1;background:var(--ct-bg-3)}",
     "#ct-connmodal .ct-conn-body{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:10px 12px}",
-    "#ct-connmodal .ct-conn-note{font-size:11px;color:#9a9a9a;margin:0 0 8px}",
-    "#ct-connmodal .ct-tun{border:1px solid #333;border-radius:8px;padding:9px 10px;margin-bottom:8px}",
+    "#ct-connmodal .ct-conn-note{font-size:11px;color:var(--ct-text-2);margin:0 0 8px}",
+    "#ct-connmodal .ct-tun{border:1px solid var(--ct-line);border-radius:8px;padding:9px 10px;margin-bottom:8px}",
     "#ct-connmodal .ct-tun-top{display:flex;align-items:center;gap:8px}",
     "#ct-connmodal .ct-tun-name{font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-    "#ct-connmodal .ct-badge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:2px 6px;border-radius:5px;background:#2b2b2b;color:#bbb}",
-    "#ct-connmodal .ct-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:#6b7280}",
+    "#ct-connmodal .ct-badge{font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:2px 6px;border-radius:5px;background:var(--ct-bg-3);color:var(--ct-text-2)}",
+    "#ct-connmodal .ct-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--ct-text-3)}",
     "#ct-connmodal .ct-dot.up{background:#22c55e}",
-    "#ct-connmodal .ct-dot.down{background:#ef4444}",
+    "#ct-connmodal .ct-dot.down{background:var(--ct-danger)}",
     "#ct-connmodal .ct-dot.wait{background:#f59e0b}",
-    "#ct-connmodal .ct-tun-sub{font-size:11px;color:#9a9a9a;margin-top:5px;word-break:break-word}",
-    "#ct-connmodal .ct-tun-sub code{color:#cfcfcf}",
-    "#ct-connmodal .ct-ic{cursor:pointer;opacity:.6;padding:3px 6px;border-radius:5px;font-size:12px}",
+    "#ct-connmodal .ct-tun-status{font-size:11px;color:var(--ct-text-2)}",
+    "#ct-connmodal .ct-tun-sub{font-size:11px;color:var(--ct-text-2);margin-top:5px;word-break:break-word}",
+    "#ct-connmodal .ct-tun-sub code{color:var(--ct-text)}",
+    "#ct-connmodal .ct-ic{cursor:pointer;opacity:.6;padding:5px 7px;border-radius:6px;font-size:12px}",
     "#ct-connmodal .ct-ic:hover{opacity:1;background:rgba(255,255,255,.12)}",
-    "#ct-connmodal .ct-login{display:inline-block;margin-top:6px;padding:5px 10px;border-radius:6px;background:#7C3AED;color:#fff;text-decoration:none;font-weight:600}",
+    "body.theme-light ~ #ct-connmodal .ct-ic:hover{background:rgba(0,0,0,.08)}",
+    "#ct-connmodal .ct-login{display:inline-block;margin-top:6px;padding:5px 10px;border-radius:6px;background:var(--ct-accent);color:#fff;text-decoration:none;font-weight:600}",
     "#ct-connmodal .ct-add-row{display:flex;gap:8px;margin:6px 0 12px}",
-    "#ct-connmodal .ct-btn{cursor:pointer;padding:7px 11px;border-radius:7px;border:1px solid #3a3a3a;background:#262626;color:#e6e6e6;font:13px system-ui,sans-serif;font-weight:600}",
-    "#ct-connmodal .ct-btn:hover{background:#2f2f2f}",
-    "#ct-connmodal .ct-btn.primary{background:#7C3AED;border-color:#7C3AED;color:#fff}",
-    "#ct-connmodal .ct-form{border:1px dashed #3a3a3a;border-radius:8px;padding:10px;margin-bottom:12px;display:none}",
+    "#ct-connmodal .ct-btn{cursor:pointer;padding:8px 12px;border-radius:8px;border:1px solid var(--ct-line);background:var(--ct-bg-3);color:var(--ct-text);font:13px system-ui,sans-serif;font-weight:600}",
+    "#ct-connmodal .ct-btn:hover{background:var(--ct-line)}",
+    "#ct-connmodal .ct-btn.primary{background:var(--ct-accent);border-color:var(--ct-accent);color:#fff}",
+    "#ct-connmodal .ct-form{border:1px dashed var(--ct-line);border-radius:8px;padding:10px;margin-bottom:12px;display:none}",
     "#ct-connmodal .ct-form.open{display:block}",
-    "#ct-connmodal .ct-form label{display:block;font-size:11px;color:#9a9a9a;margin:8px 0 3px}",
-    "#ct-connmodal .ct-form input,#ct-connmodal .ct-form textarea{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:6px;border:1px solid #3a3a3a;background:#161616;color:#e6e6e6;font:12px ui-monospace,Menlo,Consolas,monospace;outline:none}",
-    "#ct-connmodal .ct-form input:focus,#ct-connmodal .ct-form textarea:focus{border-color:#7C3AED}",
+    "#ct-connmodal .ct-form label{display:block;font-size:11px;color:var(--ct-text-2);margin:8px 0 3px}",
+    "#ct-connmodal .ct-form input,#ct-connmodal .ct-form textarea{width:100%;box-sizing:border-box;padding:8px 9px;border-radius:8px;border:1px solid var(--ct-line);background:var(--ct-bg-3);color:var(--ct-text);font:12px ui-monospace,Menlo,Consolas,monospace;outline:none}",
+    "#ct-connmodal .ct-form input:focus,#ct-connmodal .ct-form textarea:focus{border-color:var(--ct-accent)}",
     "#ct-connmodal .ct-form textarea{resize:vertical;min-height:90px}",
-    "body.theme-light #ct-connmodal .ct-conn{background:#fff;color:#1f1f1f;border-color:#dcdcdc}",
-    "body.theme-light #ct-connmodal .ct-conn-head{border-color:#ececec}",
-    "body.theme-light #ct-connmodal .ct-tun{border-color:#e2e2e2}",
-    "body.theme-light #ct-connmodal .ct-badge{background:#eee;color:#555}",
-    "body.theme-light #ct-connmodal .ct-btn{background:#f2f2f2;border-color:#dcdcdc;color:#1f1f1f}",
-    "body.theme-light #ct-connmodal .ct-form input,body.theme-light #ct-connmodal .ct-form textarea{background:#f6f6f6;border-color:#dcdcdc;color:#1f1f1f}",
     // hamburger (mobile only) + left drawer with the full tab list
     "#claude-tabbar .ctab-ham{display:none}",
     "@media (max-width:600px){#claude-tabbar .ctab-ham{display:flex}#claude-tabbar .ctab-list .ctab:not(.active){display:none}#claude-tabbar .ctab{max-width:60vw}#claude-tabbar .ctab .ctab-label{max-width:44vw}}",
     "#ct-drawer{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.5)}",
-    "#ct-drawer .ct-draw{position:absolute;top:0;left:0;bottom:0;width:min(300px,84vw);background:#1e1e1e;color:#e6e6e6;border-right:1px solid #383838;display:flex;flex-direction:column;box-shadow:2px 0 26px rgba(0,0,0,.5);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
-    "#ct-drawer .ct-draw-head{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid #383838;font-weight:600}",
+    "#ct-drawer .ct-draw{position:absolute;top:0;left:0;bottom:0;width:min(300px,84vw);background:var(--ct-panel);color:var(--ct-text);border-right:1px solid var(--ct-line);display:flex;flex-direction:column;box-shadow:2px 0 26px rgba(0,0,0,.4);font:13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}",
+    "#ct-drawer .ct-draw-head{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid var(--ct-line-2);font-weight:600}",
     "#ct-drawer .ct-draw-list{overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:6px}",
-    "#ct-drawer .ct-draw-row{display:flex;align-items:center;gap:9px;padding:11px 10px;border-radius:8px;cursor:pointer}",
-    "#ct-drawer .ct-draw-row:hover{background:#2c2c2c}",
-    "#ct-drawer .ct-draw-row.active{background:#2b3b55}",
+    "#ct-drawer .ct-draw-row{display:flex;align-items:center;gap:9px;padding:12px 10px;border-radius:8px;cursor:pointer}",
+    "#ct-drawer .ct-draw-row:hover{background:var(--ct-bg-3)}",
+    // same accent tint as the active chip, so "the tab you're on" reads the same way here
+    "#ct-drawer .ct-draw-row.active{background:rgba(217,119,87,.16)}",
+    "body.theme-light ~ #ct-drawer .ct-draw-row.active{background:rgba(194,90,60,.12)}",
     "#ct-drawer .ct-draw-row .lbl{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-    "#ct-drawer .ct-draw-row .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:#6b7280}",
+    "#ct-drawer .ct-draw-row .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--ct-text-3)}",
     "#ct-drawer .ct-draw-row .dot.thinking{background:#f59e0b}",
     "#ct-drawer .ct-draw-row .dot.waiting{background:#a855f7}",
     "#ct-drawer .ct-draw-row .dot.done{background:#22c55e}",
-    "#ct-drawer .ct-draw-row .dot.seen{background:#6b7280}",
-    "#ct-drawer .ct-draw-row .ic{display:flex;align-items:center;opacity:.6;padding:4px;border-radius:5px}",
+    "#ct-drawer .ct-draw-row .dot.seen{background:var(--ct-text-3)}",
+    "#ct-drawer .ct-draw-row .ic{display:flex;align-items:center;opacity:.6;padding:5px;border-radius:6px}",
     "#ct-drawer .ct-draw-row .ic:hover{opacity:1;background:rgba(255,255,255,.14)}",
+    "body.theme-light ~ #ct-drawer .ct-draw-row .ic:hover{background:rgba(0,0,0,.08)}",
     "#ct-drawer .ct-draw-row .ic.x{font-size:17px;line-height:1}",
     "#ct-drawer .ct-draw-new{opacity:.85;font-weight:600}",
-    "body.theme-light #ct-drawer .ct-draw{background:#fff;color:#1f1f1f;border-color:#dcdcdc}",
-    "body.theme-light #ct-drawer .ct-draw-head{border-color:#ececec}",
-    "body.theme-light #ct-drawer .ct-draw-row:hover{background:#f0f0f0}",
-    "body.theme-light #ct-drawer .ct-draw-row.active{background:#dce8ff}",
-    "body.theme-light #ct-drawer .ct-draw-row .ic:hover{background:rgba(0,0,0,.08)}",
-    // light theme (ttyd toggles body.theme-light)
-    "body.theme-light #claude-tabbar{background:#f3f3f3;border-bottom-color:#dcdcdc;color:#333}",
-    "body.theme-light #claude-tabbar .ctab{background:#fff;border-color:#d7d7d7}",
-    "body.theme-light #claude-tabbar .ctab:hover{background:#ececec}",
-    "body.theme-light #claude-tabbar .ctab.active{background:#dce8ff;border-color:#3d6cc4;color:#12305e}",
-    "body.theme-light #claude-tabbar .ctab-btn{background:#fff;border-color:#d7d7d7;color:#444}",
-    "body.theme-light #claude-tabbar .ctab-btn:hover{background:#ececec;color:#000}",
+    // #claude-tabbar, .ctab and .ctab-btn no longer need a light override here: their base
+    // rules above are all var(--ct-*), which body.theme-light already redefines.
     // tighter on small screens; theme toggle folds into the drawer on mobile
     "#claude-tabbar .ctab-voice{color:#4ade80}",
     "#claude-tabbar .ctab-voice:hover{background:rgba(74,222,128,.16)}",
@@ -1027,12 +1064,57 @@
     "@media (max-width:600px){#claude-tabbar .ctab-voice{background:rgba(74,222,128,.14);border:1px solid rgba(74,222,128,.45);border-radius:7px;padding:0 9px}}",
     "@media (max-width:600px){#claude-tabbar{gap:4px;padding:0 5px}#claude-tabbar .ctab{max-width:220px}#claude-tabbar .ctab .ctab-label{max-width:170px}#claude-tabbar .ctab-theme,#claude-tabbar .ctab-bell{display:none}}",
     // drawer settings rows (theme + notifications live here on mobile)
-    "#ct-drawer .ct-draw-sep{height:1px;margin:6px 10px;background:#333}",
-    "body.theme-light #ct-drawer .ct-draw-sep{background:#e2e2e2}",
+    "#ct-drawer .ct-draw-sep{height:1px;margin:6px 10px;background:var(--ct-line)}",
     "#ct-drawer .ct-draw-row .ic-lead{display:flex;align-items:center;opacity:.8;flex:0 0 auto}",
     "#ct-drawer .ct-draw-row .sub{font-size:11px;opacity:.6;margin-left:auto;flex:0 0 auto}",
     // hide ttyd's own floating theme toggle; we drive it from the bar
     ".theme-toggle{display:none !important}",
+
+    // #region Windows 95 skin (body.theme-retro — see applyChromeTheme() above).
+    // NOT written as "body.theme-retro ~ selector" the way the theme-light rules above
+    // are, for #claude-tabbar and #ct-safetop specifically: mountBar()'s first call runs
+    // synchronously while the parser is still inside <head> — before <body> exists — so
+    // root.appendChild(bar) makes bar/safeTop PRECEDE body once the parser creates it, and
+    // nothing ever reorders them after, which defeats "~" (it only matches a LATER
+    // sibling). That's a pre-existing bug — the drawer and both modals are appended at
+    // open time, well after body exists, so their own "body.theme-light ~ ..." rules above
+    // are unaffected by it. :has() sidesteps the whole question by reading body's class
+    // from up at <html>, which doesn't care which sibling comes first, so it is used for
+    // every rule in this block rather than mixing the two approaches.
+    // Same vars every other component here already reads, repointed at the classic silver
+    // Win95 face: a chip is the SAME color as the bar it sits on in real Win95, told apart
+    // only by its bevel, which is why --ct-bg-3 (chip face) equals --ct-panel (bar face)
+    // below rather than getting its own shade the way the dark/light themes give it one.
+    "html:has(body.theme-retro) *{--ct-bg:#c0c0c0;--ct-bg-2:#c0c0c0;--ct-bg-3:#c0c0c0;--ct-panel:#c0c0c0;--ct-line:#808080;--ct-line-2:#808080;--ct-text:#000;--ct-text-2:#000;--ct-text-3:#404040;--ct-accent:#000080;--ct-accent-2:#1084d0;--ct-danger:#aa0000}",
+    "html:has(body.theme-retro) #claude-tabbar,html:has(body.theme-retro) #claude-tabbar *,html:has(body.theme-retro) #ct-drawer *,html:has(body.theme-retro) #ct-histmodal *,html:has(body.theme-retro) #ct-connmodal *{font-family:Tahoma,\"MS Sans Serif\",Verdana,\"Segoe UI\",sans-serif;border-radius:0 !important}",
+    // Focus rings go dotted (square corners' usual companion), not the accent-colored
+    // solid ring the base rule (#claude-tabbar *:focus-visible, above) uses everywhere
+    // else — --ct-accent is navy here already, so only the style needs overriding.
+    "html:has(body.theme-retro) #claude-tabbar *:focus-visible,html:has(body.theme-retro) #ct-histmodal *:focus-visible,html:has(body.theme-retro) #ct-connmodal *:focus-visible,html:has(body.theme-retro) #ct-drawer *:focus-visible{outline-style:dotted}",
+    // Two concentric 1px rings simulate the classic 2px Win95 bevel: a crisp white/black
+    // pair right at the edge, sitting on top of (so partly masking) a second dfdfdf/808080
+    // pair offset one pixel further in — raised reads light-top-left/dark-bottom-right,
+    // sunken (the two ":active"/".active" rules below) is the same pair reversed.
+    "html:has(body.theme-retro) #claude-tabbar{border-bottom:2px solid #000;box-shadow:inset 1px 1px 0 #fff,inset -1px -1px 0 #000,inset 2px 2px 0 #dfdfdf,inset -2px -2px 0 #808080}",
+    // chips are raised buttons; the active one presses in and goes navy, like a pressed
+    // taskbar button holding the foreground window
+    "html:has(body.theme-retro) #claude-tabbar .ctab{border:none;box-shadow:inset 1px 1px 0 #fff,inset -1px -1px 0 #000,inset 2px 2px 0 #dfdfdf,inset -2px -2px 0 #808080}",
+    "html:has(body.theme-retro) #claude-tabbar .ctab.active{background:#000080;color:#fff;box-shadow:inset 1px 1px 0 #000,inset -1px -1px 0 #fff,inset 2px 2px 0 #808080,inset -2px -2px 0 #dfdfdf}",
+    "html:has(body.theme-retro) #claude-tabbar .ctab.active .ctab-label{color:#fff}",
+    "html:has(body.theme-retro) #claude-tabbar .ctab-btn{border:none;box-shadow:inset 1px 1px 0 #fff,inset -1px -1px 0 #000,inset 2px 2px 0 #dfdfdf,inset -2px -2px 0 #808080}",
+    "html:has(body.theme-retro) #claude-tabbar .ctab-btn:active{box-shadow:inset 1px 1px 0 #000,inset -1px -1px 0 #fff,inset 2px 2px 0 #808080,inset -2px -2px 0 #dfdfdf}",
+    // drawer + both modals: a raised Win95 window with a hard drop shadow, not a soft blur
+    "html:has(body.theme-retro) #ct-drawer .ct-draw,html:has(body.theme-retro) #ct-histmodal .ct-hist,html:has(body.theme-retro) #ct-connmodal .ct-conn{border:none;box-shadow:inset 1px 1px 0 #fff,inset -1px -1px 0 #000,inset 2px 2px 0 #dfdfdf,inset -2px -2px 0 #808080,4px 4px 0 rgba(0,0,0,.35)}",
+    // title bars: the same navy-to-blue gradient every retro-desktop window uses
+    "html:has(body.theme-retro) #ct-drawer .ct-draw-head,html:has(body.theme-retro) #ct-histmodal .ct-hist-head,html:has(body.theme-retro) #ct-connmodal .ct-conn-head{background:linear-gradient(90deg,#000080,#1084d0);color:#fff;font-weight:bold;border-bottom:1px solid #000}",
+    // active drawer row: same navy selection as the active chip
+    "html:has(body.theme-retro) #ct-drawer .ct-draw-row.active{background:#000080;color:#fff}",
+    "html:has(body.theme-retro) #ct-drawer .ct-draw-row.active .lbl{color:#fff}",
+    // form fields and buttons inside the connections modal: square, sunken like a real
+    // Win95 text field; the primary button reads as the navy default-button it would be
+    "html:has(body.theme-retro) #ct-connmodal .ct-btn,html:has(body.theme-retro) #ct-histmodal .ct-hist-search,html:has(body.theme-retro) #ct-connmodal .ct-form input,html:has(body.theme-retro) #ct-connmodal .ct-form textarea{border:none;box-shadow:inset 1px 1px 0 #000,inset -1px -1px 0 #fff,inset 2px 2px 0 #808080,inset -2px -2px 0 #dfdfdf}",
+    "html:has(body.theme-retro) #ct-connmodal .ct-btn.primary{background:#000080;color:#fff}",
+    // #endregion
   ].join("");
   (document.head || document.documentElement).appendChild(barStyle);
 
@@ -1184,6 +1266,7 @@
     // it. document.documentElement is never a Preact render root here, so a
     // fixed-position bar parked there survives every ttyd render. (Both injected <style>
     // blocks already live in <head> for exactly this reason.)
+    if (IS_EMBED) return; // no bar in an embedded frame — the retro desktop owns tab chrome
     const root = document.documentElement;
     if (!root) return;
     // #ct-safetop is fixed chrome for the same reason the bar is, so it has to live
@@ -1197,10 +1280,13 @@
   // Insurance: if the bar is ever detached from <html> (a future full-document rewrite,
   // some other script), re-mount it on the next tick. childList on documentElement only
   // (no subtree), so this fires on the rare add/remove of a direct child of <html> —
-  // never on ttyd's terminal output — keeping it effectively free.
-  new MutationObserver(() => {
-    if (!bar.isConnected) mountBar();
-  }).observe(document.documentElement, { childList: true });
+  // never on ttyd's terminal output — keeping it effectively free. Skipped embedded: the
+  // bar is never mounted there (mountBar() no-ops), so there is nothing to insure.
+  if (!IS_EMBED) {
+    new MutationObserver(() => {
+      if (!bar.isConnected) mountBar();
+    }).observe(document.documentElement, { childList: true });
+  }
 
   function switchTo(id) {
     const p = new URLSearchParams(location.search);
@@ -1278,7 +1364,7 @@
     open.title = "Open in new browser tab";
     open.addEventListener("click", (e) => {
       e.stopPropagation();
-      window.open("/?arg=" + encodeURIComponent(s.id), "_blank");
+      window.open("/tty/?arg=" + encodeURIComponent(s.id), "_blank");
     });
     chip.appendChild(open);
 
@@ -1518,8 +1604,7 @@
       /* ignore */
     }
   }
-  refreshUsage();
-  setInterval(refreshUsage, 60000);
+  if (!IS_EMBED) { refreshUsage(); setInterval(refreshUsage, 60000); } // feeds the bar's usage chip only
   // #endregion
 
   // #region conversation history dialog (resume, like /resume)
@@ -1698,7 +1783,7 @@
       const dot = document.createElement("span"); dot.className = "ct-dot " + cls;
       const name = document.createElement("span"); name.className = "ct-tun-name"; name.textContent = t.name;
       const badge = document.createElement("span"); badge.className = "ct-badge"; badge.textContent = t.type === "tailscale" ? "tailscale" : "openvpn";
-      const status = document.createElement("span"); status.style.cssText = "font-size:11px;color:#9a9a9a"; status.textContent = txt;
+      const status = document.createElement("span"); status.className = "ct-tun-status"; status.textContent = txt;
       top.appendChild(dot); top.appendChild(name); top.appendChild(badge); top.appendChild(status);
       if (t.type === "openvpn") {
         const tog = document.createElement("span"); tog.className = "ct-ic";
@@ -1886,7 +1971,7 @@
       const dot = document.createElement("span"); dot.className = "dot " + state;
       const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = label;
       const open = document.createElement("span"); open.className = "ic"; open.innerHTML = SVG_OPEN; open.title = "Open in new tab";
-      open.addEventListener("click", (e) => { e.stopPropagation(); window.open("/?arg=" + encodeURIComponent(s.id), "_blank"); });
+      open.addEventListener("click", (e) => { e.stopPropagation(); window.open("/tty/?arg=" + encodeURIComponent(s.id), "_blank"); });
       const close = document.createElement("span");
       close.className = "ic x"; close.textContent = "×";
       close.title = "Close";
@@ -2110,6 +2195,7 @@
   const dismissInstall = () => { try { localStorage.setItem("ct-install-dismissed", "1"); } catch {} hideInstallBanner(); };
   function hideInstallBanner() { if (installBanner) { installBanner.remove(); installBanner = null; } }
   function showInstallBanner(opts) {
+    if (IS_EMBED) return; // no install prompt inside the desktop's terminal window
     opts = opts || {};
     if (installBanner || isStandalone()) return;
     if (!opts.force && installDismissed()) return;
@@ -2246,7 +2332,10 @@
     bar.style.transform = vv.offsetTop ? "translateY(" + Math.round(vv.offsetTop) + "px)" : "";
     positionKeybar(kb);
   }
-  if (vv && isMobile()) {
+  // Embedded, this whole path (the keyboard-shift transform AND the phone key bar it
+  // drives) stays off: the desktop window has no bar to slide clear of, and #terminal-container
+  // is already pinned top:0/height:100% by the embed CSS rule above.
+  if (vv && isMobile() && !IS_EMBED) {
     vv.addEventListener("resize", applyKeyboardShift);
     vv.addEventListener("scroll", applyKeyboardShift);
   }
@@ -2274,8 +2363,16 @@
 
   mountBar(); // <html> always exists, so mount now — no DOMContentLoaded wait (that
               // fired AFTER ttyd's render, which is precisely when the bar got wiped).
-  seedFromCache(); // show cached tabs immediately so a switch never blanks the bar
-  refresh();
-  setInterval(refresh, 3000);
+              // No-ops embedded (see mountBar()'s own IS_EMBED guard).
+  if (!IS_EMBED) {
+    // Also skipped embedded: paintBar() (called from both of these) marks a "done" tab
+    // "seen" via POST on its first live poll, with no focus check — fine for a real
+    // top-level tab (you're looking at it by definition), wrong for a desktop window
+    // that's minimised or behind another one, which would self-mark seen just for
+    // having its iframe loaded and defeat the desktop's own done indicator.
+    seedFromCache(); // show cached tabs immediately so a switch never blanks the bar
+    refresh();
+    setInterval(refresh, 3000);
+  }
   // #endregion
 })();
