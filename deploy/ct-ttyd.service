@@ -1,0 +1,27 @@
+[Unit]
+Description=ttyd terminal
+Wants=network-online.target
+After=network-online.target
+[Service]
+# Stop only ttyd itself. The tmux server was started from a ttyd connection, so it lives in
+# this cgroup; the default control-group mode would kill every terminal session on restart.
+KillMode=process
+User=ctuser
+# setup-token issues a bearer token rather than writing .credentials.json, so the
+# terminal gets it from here. systemd reads this as root before dropping privileges,
+# which is why the file can stay 0600 root:root.
+EnvironmentFile=/etc/claude-terminal/claude.env
+Environment=PATH=/home/ctuser/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=RT_HOME_CWD=/home/ctuser/work
+ExecStart=/usr/local/bin/ttyd --port 7681 --interface 127.0.0.1 --base-path /tty --url-arg --writable \
+  -t disableResizeOverlay=true -t rendererType=webgl -P 30 \
+  -I /srv/claude-terminal/ttyd/index.html \
+  /bin/bash /usr/local/bin/rt-entry
+Restart=always
+RestartSec=2
+# PrivateTmp must stay off: /tmp holds the tmux socket the sidecar enumerates
+# (server.ts:278) and /tmp/claude-paste (server.ts:34).
+PrivateTmp=no
+[Install]
+WantedBy=multi-user.target

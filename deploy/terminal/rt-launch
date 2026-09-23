@@ -1,0 +1,7 @@
+#!/bin/bash
+# what runs inside the tmux pane.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+resume="${1:-}"
+[ -n "$resume" ] && exec claude --resume "$resume" --dangerously-skip-permissions
+exec claude --dangerously-skip-permissions

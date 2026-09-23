@@ -229,3 +229,17 @@ Host claude-vps
 ```
 
 Then in VS Code: Remote-SSH: Connect to Host → `claude-vps`, open `/home/ctuser/claude.code-workspace`.
+
+## Terminal launch files
+
+Copies of the files that run each terminal tab, which live outside the repo on the box:
+
+| Repo copy | Installed at | What it does |
+|---|---|---|
+| `deploy/ct-ttyd.service` | `/etc/systemd/system/ct-ttyd.service` | ttyd under `/tty` (`--base-path /tty`); `KillMode=process` so a restart keeps tmux and its sessions |
+| `deploy/terminal/rt-entry` | `/usr/local/bin/rt-entry` | what ttyd runs per connection: validates `?arg=`, attaches or creates the tmux session |
+| `deploy/terminal/rt-launch` | `/usr/local/bin/rt-launch` | what runs inside the tmux pane: `claude`, or `claude --resume <id>` |
+| `deploy/terminal/ct-hook` | `/usr/local/bin/ct-hook` | Claude Code hook that records each tab's state (thinking / waiting / done) for the tab dots and timers |
+
+Install with `sudo install -m 755 deploy/terminal/* /usr/local/bin/` and
+`sudo install -m 644 deploy/ct-ttyd.service /etc/systemd/system/ && sudo systemctl daemon-reload`.

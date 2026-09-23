@@ -1,0 +1,23 @@
+#!/bin/bash
+# ct-hook <session|thinking|waiting|done>
+# Writes the tab-registry files server.ts:308-321 reads and fires the push that
+# server.ts:582-598 expects. Hook JSON arrives on stdin. CT_TAB_ID comes from rt-entry.
+set -uo pipefail
+KIND="${1:?}"; ID="${CT_TAB_ID:-}"; [ -n "$ID" ] || exit 0
+REG="$HOME/.claude/tab-registry"; mkdir -p "$REG"
+PORT="${CT_SIDECAR_PORT:-7682}"
+PAYLOAD="$(cat)"
+
+if [ "$KIND" = "session" ]; then
+  printf '%s' "$PAYLOAD" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+print(json.dumps({k:d.get(k) for k in ("transcript_path","session_id","cwd")}))' > "$REG/$ID.json"
+  echo thinking > "$REG/$ID.state"; exit 0
+fi
+echo "$KIND" > "$REG/$ID.state"
+case "$KIND" in waiting|done)
+  # notifyAllowed() (server.ts:266-272) permits a loopback caller with no Remote-User
+  # header. That is a weaker check than allowed(); the 127.0.0.1 bind is what limits it.
+  curl -fsS -m 5 -X POST "http://127.0.0.1:$PORT/notify/session" \
+    -H 'content-type: application/json' -d "{\"id\":\"$ID\",\"kind\":\"$KIND\"}" >/dev/null || true ;;
+esac

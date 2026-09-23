@@ -1,0 +1,32 @@
+#!/bin/bash
+# ttyd execs this once per browser connection.
+# ttyd --url-arg appends ?arg=<x> as $1, so $1 is attacker-controlled. Whitelist it.
+set -uo pipefail
+export TMUX_TMPDIR=/tmp                 # must match server.ts:278
+
+id="${1:-1}"; id="${id//[^A-Za-z0-9_-]/}"; id="${id:0:32}"; [ -n "$id" ] || id=1
+reg="$HOME/.claude/tab-registry"; mkdir -p "$reg"
+resume=""; cwd="${RT_HOME_CWD:-$HOME/work}"
+
+# server.ts:655-658 writes "<sessionId>\t<cwd>" here with no sanitisation when the user
+# picks a row in the history modal. This is the only place it gets validated.
+if [ -f "$reg/$id.resume" ]; then
+  IFS=$'\t' read -r resume cwd < "$reg/$id.resume" || true
+  rm -f "$reg/$id.resume"
+  resume="${resume//[^A-Za-z0-9-]/}"
+  case "$cwd" in "$HOME"/*) : ;; *) cwd="$HOME/work" ;; esac
+fi
+[ -d "$cwd" ] || cwd="${RT_HOME_CWD:-$HOME/work}"
+
+# -e CT_TAB_ID puts the tab id in the pane environment so ct-hook can identify the tab.
+# Naming /bin/bash explicitly matters: tmux execs a multi-arg command directly, but
+# routes a single token through the login shell, which is the nologin trap.
+# tmux does NOT copy the caller's environment into a new session: a session inherits the
+# tmux SERVER's environment, which was set by whichever connection started the server.
+# The subscription token reaches ttyd through the unit's EnvironmentFile, so it has to be
+# handed to the session explicitly or the pane lands on a login prompt.
+env_args=(-e "CT_TAB_ID=$id")
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && env_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+
+exec tmux new-session -A -s "$id" -c "$cwd" "${env_args[@]}" \
+     /bin/bash /usr/local/bin/rt-launch "$resume"
