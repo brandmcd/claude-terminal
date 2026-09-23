@@ -24,6 +24,10 @@
   },
   "appModels": [
     {
+      "id": "claude-opus-5-5",
+      "label": "Opus 5.5"
+    },
+    {
       "id": "claude-opus-5",
       "label": "Opus 5"
     },

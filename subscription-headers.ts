@@ -11,16 +11,21 @@
 //   anthropic-ratelimit-unified-7d-utilization: 0.02      <- the weekly window
 //   anthropic-ratelimit-unified-7d-reset:       1788462000
 //
-// So this samples them with the cheapest request that exists: max_tokens 1 on Haiku, which the
-// server answers (and charges) as roughly a dozen tokens. That is ~16k tokens a day at the 60s
-// collector cadence, against a box that moves billions — but it is not nothing, so the result is
-// cached and the sampler is only ever called by the collector, never per page view.
+// So this samples them with a max_tokens 1 request. It goes to Fable because only Fable responses
+// carry the Fable weekly bucket (`unified-7d_oi-*`, absent on Opus, Sonnet and Haiku responses as
+// of 2026-09-22; treated here as the Fable window). That costs about 33 input + 1 output Fable
+// tokens per sample, ~47k Fable input tokens a day at the 60s collector cadence. Fable rejects
+// OAuth requests without the Claude Code system prompt (HTTP 429, no headers), so the probe sends
+// it. If the Fable probe yields no headers, the sampler falls back to Haiku for the 5h/7d windows.
+// The sampler is only ever called by the collector, never per page view.
 //
 // The credential is the same subscription OAuth token the terminal and the sidecar already run on
 // (`sk-ant-oat01-…` from `claude setup-token`), read from the environment. OAuth tokens go on
 // `Authorization: Bearer` with the oauth beta header — NOT `x-api-key`, which rejects them.
 const ENDPOINT = "https://api.anthropic.com/v1/messages";
-const PROBE_MODEL = "claude-haiku-4-5";
+const PROBE_MODEL = "claude-fable-5-1";
+const FALLBACK_MODEL = "claude-haiku-4-5";
+const SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 const TTL_MS = 60_000;
 
 export interface LimitWindow {
@@ -32,6 +37,7 @@ export interface Limits {
   subscription: string | null;
   five_hour: LimitWindow | null;
   seven_day: LimitWindow | null;
+  fable: LimitWindow | null;
   overage_status: string | null;
   fetched_at: number;
 }
@@ -54,7 +60,7 @@ function iso(raw: string | null): string | null {
   return new Date(v * 1000).toISOString().replace(/\.\d+Z$/, "+00:00");
 }
 
-async function probe(): Promise<Limits | null> {
+async function probe(model: string): Promise<Limits | null> {
   const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   if (!token) return null;
   try {
@@ -66,7 +72,7 @@ async function probe(): Promise<Limits | null> {
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ model: PROBE_MODEL, max_tokens: 1, messages: [{ role: "user", content: "." }] }),
+      body: JSON.stringify({ model, max_tokens: 1, system: SYSTEM, messages: [{ role: "user", content: "." }] }),
       signal: AbortSignal.timeout(15_000),
     });
     // A 429 still carries the headers, and is exactly when they matter most — so read them on any
@@ -76,7 +82,7 @@ async function probe(): Promise<Limits | null> {
     const seven = h.get("anthropic-ratelimit-unified-7d-utilization");
     if (five == null && seven == null) {
       if (!res.ok) console.error(`subscription headers: HTTP ${res.status}, no unified headers`);
-      return { available: false, subscription: null, five_hour: null, seven_day: null, overage_status: null, fetched_at: Date.now() };
+      return { available: false, subscription: null, five_hour: null, seven_day: null, fable: null, overage_status: null, fetched_at: Date.now() };
     }
     return {
       available: true,
@@ -85,6 +91,13 @@ async function probe(): Promise<Limits | null> {
       subscription: null,
       five_hour: { utilization: pct(five), resets_at: iso(h.get("anthropic-ratelimit-unified-5h-reset")) },
       seven_day: { utilization: pct(seven), resets_at: iso(h.get("anthropic-ratelimit-unified-7d-reset")) },
+      fable:
+        h.get("anthropic-ratelimit-unified-7d_oi-utilization") == null
+          ? null
+          : {
+              utilization: pct(h.get("anthropic-ratelimit-unified-7d_oi-utilization")),
+              resets_at: iso(h.get("anthropic-ratelimit-unified-7d_oi-reset")),
+            },
       overage_status: h.get("anthropic-ratelimit-unified-overage-status"),
       fetched_at: Date.now(),
     };
@@ -98,7 +111,8 @@ async function probe(): Promise<Limits | null> {
 export async function getLimitsFromHeaders(): Promise<Limits | null> {
   if (cache && Date.now() - cache.fetched_at < TTL_MS) return cache;
   if (inflight) return inflight;
-  inflight = probe()
+  inflight = probe(PROBE_MODEL)
+    .then((r) => (r && r.available ? r : probe(FALLBACK_MODEL)))
     .then((r) => {
       if (r) cache = r;
       return cache;

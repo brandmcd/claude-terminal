@@ -138,6 +138,7 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
   let five = sub && sub.available !== false ? sub.fiveHour || null : null;
   let seven = sub && sub.available !== false ? sub.sevenDay || null : null;
   let subType = sub && sub.available !== false ? sub.subscription : null;
+  let modelScoped: any[] = Array.isArray(sub?.modelScoped) ? sub.modelScoped : [];
   if (!five && !seven) {
     const h = await getLimitsFromHeaders();
     if (!h || !h.available) return;
@@ -148,6 +149,9 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
     five = norm(h.five_hour);
     seven = norm(h.seven_day);
     subType = h.subscription;
+    // Header path: the Fable bucket arrives as its own header pair. The name must match /fable/i
+    // for server.ts to surface it.
+    if (h.fable) modelScoped = [{ displayName: "Fable", utilization: h.fable.utilization, resetsAt: h.fable.resets_at }];
   }
   if (!five && !seven) return;
 
@@ -200,7 +204,6 @@ export async function sampleSubscriptionUsage(configPath: string): Promise<void>
     const oauthApps = sub.sevenDayOauthApps || null;
     const opus = sub.sevenDayOpus || null;
     const sonnet = sub.sevenDaySonnet || null;
-    const modelScoped = Array.isArray(sub.modelScoped) ? sub.modelScoped : [];
 
     db.query(
       `INSERT OR REPLACE INTO subscription_samples
