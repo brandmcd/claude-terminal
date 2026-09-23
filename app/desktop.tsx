@@ -884,14 +884,15 @@ export function Desktop(props: {
         title={winTitle(id)}
         rect={{ x: w.x, y: w.y, w: w.w, h: w.h }}
         z={w.z}
-        min={w.min}
+        min={w.min || !w.open}
         max={w.max}
         focused={focusedId === id}
         closable={closable}
         bodyClassName={id === "claude" ? "dk-body-visible" : undefined}
         frameRef={(el) => { frameRefs.current[id] = el; }}
         onFocus={() => focus(id)}
-        onClose={() => closeWin(id)}
+        // A terminal's X ends the tab, as the old tab bar's X did; "Close window" in its menu only hides it.
+        onClose={() => (isTerm(id) ? endSession(termSid(id)) : closeWin(id))}
         onMinimize={() => minimizeWin(id)}
         onMaxToggle={() => maxToggle(id)}
         onMenu={(e) => { e.stopPropagation(); focus(id); setWinMenu({ id, x: (e as React.MouseEvent).clientX, y: (e as React.MouseEvent).clientY }); }}
