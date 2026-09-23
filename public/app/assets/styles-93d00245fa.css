@@ -751,9 +751,11 @@ body.theme-retro .cmd-search input, body.theme-retro .composer, body.theme-retro
 body.theme-retro .composer.drag-over {
   box-shadow: var(--win-sunken), 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
 }
+/* No focus rectangle on text fields: as on Win95 the caret shows focus, and a dotted box drawn
+   inside the field ran through the text. */
 body.theme-retro .composer:focus-within, body.theme-retro .topbar-title-input:focus,
 body.theme-retro .sb-search input:focus, body.theme-retro .cmd-search input:focus {
-  outline: 1px dotted #000; outline-offset: -3px;
+  outline: none;
 }
 body.theme-retro .toggle {
   background: var(--bg); box-shadow: var(--win-sunken);
@@ -809,9 +811,10 @@ body.theme-retro ::-webkit-scrollbar-corner { background: var(--bg); }
 body.theme-retro { scrollbar-color: #808080 var(--bg); scrollbar-width: auto; }
 
 /* Dotted Win95 focus rect, in place of the accent outline the other themes use. */
-body.theme-retro :focus-visible {
+body.theme-retro :focus-visible:not(input):not(textarea):not(select):not([contenteditable]) {
   outline: 1px dotted #000; outline-offset: -4px;
 }
+body.theme-retro input:focus-visible, body.theme-retro textarea:focus-visible, body.theme-retro select:focus-visible { outline: none; }
 /* Retro: code blocks are square like every other surface. */
 body.theme-retro .md pre, body.theme-retro .ct-code, body.theme-retro .tool-body pre { border-radius: 0; }
 
