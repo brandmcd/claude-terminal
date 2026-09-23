@@ -13,7 +13,7 @@ export type DesktopTerminal = { id: string; title: string; state: string; since?
 
 type Rect = { x: number; y: number; w: number; h: number };
 type WinState = Rect & { open: boolean; min: boolean; max: boolean; z: number; prev?: Rect };
-type Layout = { wins: Record<string, WinState>; nextZ: number };
+type Layout = { wins: Record<string, WinState>; nextZ: number; v?: number };
 // #endregion
 
 // #region ids + small pure helpers
@@ -45,13 +45,37 @@ function clampRect(r: Rect, minW: number, minH: number, vw: number, vh: number):
   return { x, y, w, h };
 }
 
+// Tiling. Windows never overlap unless the user drags them: the Claude window takes the left side of
+// the work area (clear of the desktop-icon column) and every other open window stacks in a column on
+// the right. Re-run whenever a window opens, closes, minimizes or restores, and on viewport resize.
+// Clawd.exe and the Recycle Bin are small and float where they are.
+const ICON_COL = 88;
+const FLOATING = new Set(["clawd", "recycle"]);
+function tile(l: Layout, vw: number, vh: number): Layout {
+  const g = 6, x0 = ICON_COL, y0 = g, W = vw - x0 - g, H = vh - TASKBAR_H - 2 * g;
+  const vis = Object.keys(l.wins).filter((id) => { const w = l.wins[id]; return w.open && !w.min && !w.max && !FLOATING.has(id); });
+  const side = vis.filter((id) => id !== "claude").sort((a, b) => l.wins[a].z - l.wins[b].z);
+  const wins = { ...l.wins };
+  const hasClaude = vis.includes("claude");
+  if (!side.length) {
+    if (hasClaude) wins.claude = { ...wins.claude, x: x0, y: y0, w: W, h: H };
+    return { ...l, wins, v: 2 };
+  }
+  const leftW = hasClaude ? Math.max(DEFAULTS.claude.minW, Math.round(W * 0.56)) : 0;
+  if (hasClaude) wins.claude = { ...wins.claude, x: x0, y: y0, w: leftW, h: H };
+  const rx = hasClaude ? x0 + leftW + g : x0, rw = hasClaude ? W - leftW - g : W;
+  const each = Math.floor((H - g * (side.length - 1)) / side.length);
+  side.forEach((id, i) => { wins[id] = { ...wins[id], x: rx, y: y0 + i * (each + g), w: rw, h: each }; });
+  return { ...l, wins, v: 2 };
+}
+
 const LS_KEY = "ct-desk-layout";
 function defaultLayout(vw: number, vh: number): Layout {
   const d = DEFAULTS.claude;
   // x starts clear of the desktop-icon column (icons sit at 6..82px) so a first-run user can still
   // see and use them; the window is still "on the left" and near-full-height per spec.
   const rect = clampRect({ x: 92, y: 14, w: Math.round(vw * 0.62), h: vh - TASKBAR_H - 28 }, d.minW, d.minH, vw, vh);
-  return { wins: { claude: { ...rect, open: true, min: false, max: false, z: 1 } }, nextZ: 1 };
+  return tile({ wins: { claude: { ...rect, open: true, min: false, max: false, z: 1 } }, nextZ: 1 }, vw, vh);
 }
 function loadLayout(vw: number, vh: number): Layout {
   try {
@@ -78,7 +102,10 @@ function loadLayout(vw: number, vh: number): Layout {
         // (it is persisted and bumped on every focus change).
         const ids = Object.keys(wins).sort((a, b) => wins[a].z - wins[b].z);
         ids.forEach((id, i) => { wins[id].z = i + 1; });
-        if (wins.claude) return { wins, nextZ: ids.length };
+        if (wins.claude) {
+          const l = { wins, nextZ: ids.length, v: p.v };
+          return p.v === 2 ? l : tile(l, vw, vh); // layouts saved before tiling overlapped; tile them once
+        }
       }
     }
   } catch { /* corrupt or unavailable storage: fall back to defaults */ }
@@ -135,7 +162,7 @@ const CSS = `
 .dk-taskbar{position:absolute;left:0;right:0;bottom:0;height:calc(${TASKBAR_H}px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom);background:#c0c0c0;box-shadow:inset 0 1px 0 #fff;display:flex;align-items:center;gap:6px;padding-left:4px;padding-right:4px;z-index:5000;}
 .dk-start{flex:0 0 auto;display:flex;align-items:center;gap:5px;height:26px;padding:0 8px;font-weight:700;font-size:12.5px;background:#c0c0c0;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);color:#000;}
 .dk-start.dk-pressed,.dk-start:active{box-shadow:var(--win-sunken,inset -1px -1px 0 #fff,inset 1px 1px 0 #0a0a0a,inset -2px -2px 0 #dfdfdf,inset 2px 2px 0 #808080);}
-.dk-tasklist{flex:1;min-width:0;display:flex;gap:3px;overflow-x:auto;height:26px;align-items:center;}
+.dk-tasklist{flex:0 1 auto;min-width:0;display:flex;gap:3px;overflow-x:auto;height:26px;align-items:center;}
 .dk-taskbtn{flex:0 1 160px;min-width:80px;max-width:160px;height:24px;display:flex;align-items:center;gap:5px;padding:0 6px;font-size:12px;background:#c0c0c0;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);color:#000;overflow:hidden;}
 .dk-taskbtn.dk-focused{box-shadow:var(--win-sunken,inset -1px -1px 0 #fff,inset 1px 1px 0 #0a0a0a,inset -2px -2px 0 #dfdfdf,inset 2px 2px 0 #808080);}
 .dk-taskbtn-ic{flex:0 0 auto;font-size:12px;line-height:0;display:flex;}
@@ -146,9 +173,6 @@ const CSS = `
 .dk-well{height:22px;display:flex;align-items:center;gap:5px;padding:0 7px;font-size:11.5px;background:#c0c0c0;box-shadow:var(--win-sunken,inset -1px -1px 0 #fff,inset 1px 1px 0 #0a0a0a,inset -2px -2px 0 #dfdfdf,inset 2px 2px 0 #808080);color:#000;white-space:nowrap;}
 .dk-well.dk-well-btn{cursor:pointer;}
 .dk-clock{font-variant-numeric:tabular-nums;}
-.dk-busy-pop{position:absolute;right:4px;bottom:${TASKBAR_H + 6}px;min-width:180px;background:#c0c0c0;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);padding:4px;z-index:6000;}
-.dk-busy-row{width:100%;display:flex;justify-content:space-between;gap:10px;padding:4px 6px;font-size:12px;color:#000;}
-.dk-busy-row:hover{background:#000080;color:#fff;}
 
 /* ---------- context menus (window menu, start menu, taskbar right-click) ---------- */
 .dk-menu{position:absolute;background:#c0c0c0;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);padding:2px;min-width:150px;z-index:9000;}
@@ -167,7 +191,8 @@ const CSS = `
 .dk-startmenu-items{flex:1;padding:2px;min-width:0;}
 
 /* ---------- pet ---------- */
-.dk-pet{position:absolute;left:24px;bottom:calc(${TASKBAR_H}px + env(safe-area-inset-bottom));z-index:4000;line-height:0;}
+.dk-petlane{flex:1 1 48px;min-width:0;align-self:stretch;position:relative;}
+.dk-pet{position:absolute;left:0;bottom:6px;line-height:0;}px + env(safe-area-inset-bottom));z-index:4000;line-height:0;}
 .dk-pet-flip{display:inline-block;}
 .dk-pet-bubble{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);margin-bottom:4px;background:#ffffe1;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);padding:4px 8px;font-size:11.5px;white-space:nowrap;color:#000;}
 
@@ -319,6 +344,7 @@ function Menu({ items, style, embedded, onClose }: { items: MenuItem[]; style?: 
 // #endregion
 
 // #region the pet: a Clawd walking the taskbar edge
+const PET_SIZE = 1.3; // 29 x 20 px: fits inside the 36 px taskbar
 function Pet({ mood, danceKey }: { mood: ClawdMood; danceKey: number }) {
   const outerRef = useRef<HTMLDivElement | null>(null);
   const flipRef = useRef<HTMLDivElement | null>(null);
@@ -334,13 +360,15 @@ function Pet({ mood, danceKey }: { mood: ClawdMood; danceKey: number }) {
     let raf = 0;
     let last = performance.now();
     const SPEED = 30; // px/s at full walk
-    const W = 22 * 2.4;
+    const W = 22 * PET_SIZE;
     const step = (t: number) => {
       raf = requestAnimationFrame(step);
       const dt = Math.min(0.05, (t - last) / 1000);
       last = t;
       if (document.hidden || dancingRef.current || moodRef.current === "sleep") return;
-      const max = Math.max(0, window.innerWidth - W - 4);
+      const lane = outerRef.current?.parentElement?.clientWidth ?? 0;
+      if (outerRef.current) outerRef.current.style.visibility = lane < W + 8 ? "hidden" : "";
+      const max = Math.max(0, lane - W - 4);
       const rate = moodRef.current === "walk" ? 1 : 0.35;
       let x = posRef.current + SPEED * rate * dt * dirRef.current;
       let flipped = dirRef.current === -1;
@@ -376,7 +404,7 @@ function Pet({ mood, danceKey }: { mood: ClawdMood; danceKey: number }) {
     <div ref={outerRef} className="dk-pet" onPointerDownCapture={onTap}>
       {bubble && <div className="dk-pet-bubble">{bubble}</div>}
       <div ref={flipRef} className="dk-pet-flip">
-        <Clawd size={2.4} mood={mood} danceKey={danceKey} move="d-hop" />
+        <Clawd size={PET_SIZE} mood={mood} danceKey={danceKey} move="d-hop" />
       </div>
     </div>
   );
@@ -516,16 +544,24 @@ export function Desktop(props: {
       const d = sizeFor(id);
       const base = cur ?? clampRect({ x: 120 + (cascade % 6) * 26, y: 70 + (cascade % 6) * 24, w: d.w, h: d.h }, d.minW, d.minH, vw, vh);
       const z = l.nextZ + 1;
-      const next = { wins: { ...l.wins, [id]: { ...base, open: true, min: false, max: cur?.max ?? false, z } }, nextZ: z };
+      const next = tile({ ...l, wins: { ...l.wins, [id]: { ...base, open: true, min: false, max: cur?.max ?? false, z } }, nextZ: z }, vw, vh);
       persist(next);
       return next;
     });
     setOrder((o) => (o.includes(id) ? o : [...o, id]));
   }, [persist]);
 
-  const closeWin = useCallback((id: string) => { patchWin(id, { open: false, min: false }); }, [patchWin]);
-  const minimizeWin = useCallback((id: string) => { patchWin(id, { min: true }); }, [patchWin]);
-  const restoreWin = useCallback((id: string) => { focus(id); patchWin(id, { min: false }, false); }, [focus, patchWin]);
+  const retile = useCallback(() => {
+    setLayout((l) => { const next = tile(l, window.innerWidth, window.innerHeight); persist(next); return next; });
+  }, [persist]);
+  const closeWin = useCallback((id: string) => { patchWin(id, { open: false, min: false }); retile(); }, [patchWin, retile]);
+  const minimizeWin = useCallback((id: string) => { patchWin(id, { min: true }); retile(); }, [patchWin, retile]);
+  const restoreWin = useCallback((id: string) => {
+    focus(id);
+    const w = layout.wins[id];
+    patchWin(id, { min: false }, false);
+    if (w?.min) retile();
+  }, [focus, patchWin, retile, layout]);
   const maxToggle = useCallback((id: string) => {
     setLayout((l) => {
       const cur = l.wins[id];
@@ -625,7 +661,7 @@ export function Desktop(props: {
           if (w.max) wins[id] = { ...w, x: 0, y: 0, w: vw, h: vh - TASKBAR_H };
           else wins[id] = { ...w, ...clampRect(w, size.minW, size.minH, vw, vh) };
         }
-        const next = { ...l, wins };
+        const next = tile({ ...l, wins }, vw, vh);
         persist(next);
         return next;
       });
@@ -713,11 +749,10 @@ export function Desktop(props: {
   const [shutdown, setShutdown] = useState(false);
   const [winMenu, setWinMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [taskMenu, setTaskMenu] = useState<{ id: string; x: number; y: number } | null>(null);
-  const [busyPop, setBusyPop] = useState(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setStartOpen(false); setWinMenu(null); setTaskMenu(null); setBusyPop(false); }
+      if (e.key === "Escape") { setStartOpen(false); setWinMenu(null); setTaskMenu(null); }
       else if (e.ctrlKey && e.altKey && (e.key === "t" || e.key === "T")) { e.preventDefault(); void newTerminal(); }
     };
     window.addEventListener("keydown", onKey);
@@ -868,6 +903,7 @@ export function Desktop(props: {
     { label: "Morning brief", icon: "📰", onClick: () => openWinSafe("brief") },
     { label: "VS Code", icon: "</>", onClick: () => openWinSafe("code") },
     { label: "Clawd.exe", icon: <Clawd size={0.8} title="" />, onClick: () => openWinSafe("clawd") },
+    { label: "Tile windows", icon: "🪟", onClick: () => retile() },
     {
       label: "Theme", icon: "🎨",
       sub: [
@@ -882,7 +918,7 @@ export function Desktop(props: {
   const openClaudeThenModelClick = () => { restoreWin("claude"); props.onModelClick(); };
 
   return (
-    <div className={"dk-desktop" + (interacting ? " dk-interacting" : "")} onPointerDown={() => { setStartOpen(false); setWinMenu(null); setTaskMenu(null); setBusyPop(false); }}>
+    <div className={"dk-desktop" + (interacting ? " dk-interacting" : "")} onPointerDown={() => { setStartOpen(false); setWinMenu(null); setTaskMenu(null); }}>
       <div className="dk-icons">
         <DesktopIcon icon="💬" label="Claude" onOpen={() => onTaskbarClick("claude")} />
         <DesktopIcon icon="⌨" label="Terminal" onOpen={() => void newTerminal()} />
@@ -894,8 +930,6 @@ export function Desktop(props: {
       </div>
 
       {order.map((id) => renderWindow(id))}
-
-      <Pet mood={petMood} danceKey={props.finishedKey} />
 
       {winMenu && (
         <Menu items={openWindowMenuItems(winMenu.id)} style={{ left: winMenu.x, top: winMenu.y }} onClose={() => setWinMenu(null)} />
@@ -941,31 +975,28 @@ export function Desktop(props: {
                 : isTerm(id) ? <BusyBadge state={sessions.find((s) => s.id === termSid(id))?.state || "seen"} since={sessions.find((s) => s.id === termSid(id))?.since} /> : null}
             </button>
           ))}
+          {/* Everything else that is running or waiting, even without an open window: other chats
+              (tap to open in the Claude window) and terminal tabs (tap to open their window). */}
+          {props.otherBusy.map((b) => (
+            <button key={"chat:" + b.id} type="button" className="dk-taskbtn dk-taskbtn-active" title={b.title}
+              onClick={() => { props.onOpenChat(b.id); restoreWin("claude"); }}>
+              <span className="dk-taskbtn-ic">💬</span>
+              <span className="dk-taskbtn-label">{b.title}</span>
+              <TinyClawd mood="walk" /><Elapsed since={b.since ?? null} className="dk-taskbtn-elapsed" />
+            </button>
+          ))}
+          {sessions.filter((t) => (t.state === "thinking" || t.state === "waiting") && !openIds.includes(winIdFor(t.id))).map((t) => (
+            <button key={"tty:" + t.id} type="button" className="dk-taskbtn dk-taskbtn-active" title={t.title} onClick={() => openTerminal(t.id)}>
+              <span className="dk-taskbtn-ic">⌨</span>
+              <span className="dk-taskbtn-label">{t.title}</span>
+              <BusyBadge state={t.state} since={t.since} />
+            </button>
+          ))}
         </div>
+        {/* Clawd walks in the empty stretch of the taskbar, so he never covers a window. */}
+        <div className="dk-petlane"><Pet mood={petMood} danceKey={props.finishedKey} /></div>
         <div className="dk-tray">
-          <button type="button" className="dk-well dk-well-btn" onClick={openClaudeThenModelClick}>{props.modelLabel}</button>
-          {props.otherBusy.length > 0 && (
-            <div style={{ position: "relative" }}>
-              <button
-                type="button"
-                className="dk-well dk-well-btn"
-                onClick={() => setBusyPop((b) => !b)}
-                title={props.otherBusy.map((b) => b.title + (b.since ? " (" + fmtElapsed(Date.now() - b.since) + ")" : "")).join("\n")}
-              >
-                {props.otherBusy.length} running
-              </button>
-              {busyPop && (
-                <div className="dk-busy-pop" onPointerDown={(e) => e.stopPropagation()}>
-                  {props.otherBusy.map((b) => (
-                    <button key={b.id} type="button" className="dk-busy-row" onClick={() => { props.onOpenChat(b.id); setBusyPop(false); }}>
-                      <span>{b.title}</span>
-                      <Elapsed since={b.since ?? null} />
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          <button type="button" className="dk-well dk-well-btn" onClick={openClaudeThenModelClick} title="Model and effort">{props.modelLabel}</button>
           <div className="dk-well dk-clock">{clockLabel}</div>
         </div>
       </div>

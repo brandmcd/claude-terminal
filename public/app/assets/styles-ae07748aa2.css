@@ -621,8 +621,9 @@ a { color: var(--accent-2); }
 /* ---------- mobile ---------- */
 @media (max-width: 820px) {
   .icon-btn { display: inline-flex; }
-  .sidebar { position: fixed; z-index: 40; height: var(--app-h, 100dvh); transform: translateX(-100%); box-shadow: 0 0 40px var(--shadow); }
-  .app.drawer-open .sidebar { transform: translateX(0); }
+  /* The shadow only while open: on a light theme a closed drawer's 40px shadow showed as a grey strip down the left edge. */
+  .sidebar { position: fixed; z-index: 40; height: var(--app-h, 100dvh); transform: translateX(-100%); }
+  .app.drawer-open .sidebar { transform: translateX(0); box-shadow: 0 0 40px var(--shadow); }
   .app.drawer-open .scrim { display: block; position: fixed; inset: 0; background: var(--scrim); z-index: 35; }
   .thread { padding: 18px 14px; }
   .composer-wrap { padding: 8px 12px calc(12px + env(safe-area-inset-bottom)); }
@@ -813,3 +814,11 @@ body.theme-retro :focus-visible {
 }
 /* Retro: code blocks are square like every other surface. */
 body.theme-retro .md pre, body.theme-retro .ct-code, body.theme-retro .tool-body pre { border-radius: 0; }
+
+/* Retro readability. Silver stays on the chrome (title strips, toolbars, buttons, the taskbar);
+   anything you read sits on white, as in a Win95 list or document window. */
+body.theme-retro { --bg-2: #ececec; --text-2: #111; --text-3: #333; font-size: 14px; }
+body.theme-retro .conv-list { background: #fff; box-shadow: var(--win-sunken); margin: 0 10px 8px; padding: 4px; }
+body.theme-retro .conv-group-label { color: #000; }
+body.theme-retro .conv-item { color: #000; }
+body.theme-retro .tool, body.theme-retro .tool-group, body.theme-retro .ct-code-head { background: #f4f4f4; color: #000; }
