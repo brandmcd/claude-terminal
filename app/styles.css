@@ -318,7 +318,8 @@ a { color: var(--accent-2); }
   .pk-seg button { padding: 10px 2px; font-size: 13px; }
   .pk-select { padding: 10px 12px; }
 }
-.composer-foot { display: flex; align-items: center; gap: 8px; padding: 8px 2px 0; }
+/* Same width and centring as .composer, so the model pill and usage sit under the box, not at the window edges. */
+.composer-foot { display: flex; align-items: center; gap: 8px; padding: 8px 2px 0; max-width: 760px; margin: 0 auto; }
 .composer-foot .cf-spacer { flex: 1; }
 
 /* model dialog (Other versions) */
@@ -825,3 +826,7 @@ body.theme-retro .conv-list { background: #fff; box-shadow: var(--win-sunken); m
 body.theme-retro .conv-group-label { color: #000; }
 body.theme-retro .conv-item { color: #000; }
 body.theme-retro .tool, body.theme-retro .tool-group, body.theme-retro .ct-code-head { background: #f4f4f4; color: #000; }
+
+/* In the desktop the reload prompt is anchored to the top of the chat window. Fixed to the bottom of
+   the viewport, the taskbar covered half of it, and a window on the right could cover the rest. */
+.dk-desktop .update-toast { position: absolute; top: 10px; bottom: auto; }
