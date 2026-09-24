@@ -1092,22 +1092,13 @@ function parseAgentMessage(text: string): { from: string; body: string } | null 
   return { from: (name?.[1] || "another session").trim(), body: m[2].trim() };
 }
 
-// Google-Messages-style delivery ticks, shown only under the bottom-most turn you sent: one tick while
-// sending, two ticks once the server has it, two FILLED (accent) ticks once the agent reads it + starts.
+// Delivery marker under the bottom-most turn you sent. Only the states that need attention show: a
+// clock while a message waits offline, "!" when a send failed. The sending / delivered / read check
+// marks were removed on 2026-09-24; the busy line under the thread already says the turn started.
 function SendTicks({ state }: { state: ConvStore["sendState"] }) {
-  if (!state) return null;
   if (state === "queued") return <span className="ticks queued" title="Waiting to send" aria-label="Waiting to send">🕘</span>;
   if (state === "failed") return <span className="ticks failed" title="Not sent — will retry" aria-label="Not sent">!</span>;
-  const dbl = state === "delivered" || state === "read";
-  const title = state === "sending" ? "Sending" : state === "delivered" ? "Delivered" : "Read";
-  return (
-    <span className={"ticks" + (state === "read" ? " read" : "")} title={title} aria-label={title}>
-      <svg width={dbl ? 19 : 13} height="12" viewBox={dbl ? "0 0 19 12" : "0 0 13 12"} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M1 6.5L4.3 10L11 2.5" />
-        {dbl && <path d="M7 6.5L10.3 10L17 2.5" />}
-      </svg>
-    </span>
-  );
+  return null;
 }
 
 function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy }: { items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
@@ -1158,7 +1149,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
           {body && <div className="bubble-user-text">{body}</div>}
         </div>
         {raPill}
-        {sendStatus && <div className="send-ticks-row"><SendTicks state={sendStatus} /></div>}
+        {(sendStatus === "queued" || sendStatus === "failed") && <div className="send-ticks-row"><SendTicks state={sendStatus} /></div>}
       </div>
     );
   }
