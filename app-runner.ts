@@ -528,6 +528,7 @@ export class Conversation {
   private bgTasks = new Set<string>();
   get busy(): boolean { return this.phase !== "idle" || this.bgTasks.size > 0; }
   get seq(): number { return this.seqCounter - 1; } // highest _seq handed out so far (-1 = none)
+  get isClosed(): boolean { return this.closed; }
   private curMsgId = ""; // id of the assistant message being streamed: block ids are <msg>:<index>
   private ctxMax = 0;    // context window for this model, fetched once after init
   lastActivity = Date.now();
@@ -706,7 +707,7 @@ export class Conversation {
   }
 
   send(text: string, cid?: string) {
-    if (this.closed) return;
+    if (this.closed) { tlog("dropped", { conv: this.id, why: "closed" }); return; }
     this.lastActivity = Date.now();
     this.currentTurnText = text; // remember it so a subscription-limit rejection can re-run this turn
     // The user is actively driving this conversation, so any auto-resume we had queued for it is
@@ -1288,7 +1289,9 @@ let tmpCounter = 0;
 // a `first` turn to run(); we return the temp key immediately and the real session id
 // arrives on the init event. For an existing chat pass its session id as both key+resume.
 export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
-  if (key && conversations.has(key)) {
+  // A closed conversation is a dead query. It can outlive close() in the map when a viewer reattached
+  // before the one-shot reap, so treat it as absent and build a fresh one that resumes the session.
+  if (key && conversations.has(key) && !conversations.get(key)!.isClosed) {
     const c = conversations.get(key)!;
     c.lastActivity = Date.now();
     return c;
@@ -1298,14 +1301,17 @@ export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
   conversations.set(id, c);
   // once the SDK assigns a real session id, register the conversation under it too
   const unsub = c.onEvent((e) => {
-    if (e.t === "init" && e.sessionId && !conversations.has(e.sessionId)) conversations.set(e.sessionId, c);
+    if (e.t === "init" && e.sessionId && !get(e.sessionId)) conversations.set(e.sessionId, c);
     if (e.t === "closed") setTimeout(() => reapIfIdle(c), 60_000);
   });
   void unsub;
   return c;
 }
 
-export function get(key: string): Conversation | undefined { return conversations.get(key); }
+export function get(key: string): Conversation | undefined {
+  const c = conversations.get(key);
+  return c && !c.isClosed ? c : undefined; // closed -> not live, so the client resumes via /start
+}
 
 // A conversation can also be driven from a TERMINAL tab by the CLI, which this process knows nothing
 // about — it only tracks its own /app conversations. Those CLI sessions publish their own state to
