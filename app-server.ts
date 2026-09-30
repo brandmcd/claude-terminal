@@ -50,6 +50,7 @@ export interface AppCtx {
   claudeDir: string; // ~/.claude — for memory (CLAUDE.md) + skills management
   sttUrl?: string; // local Whisper service base URL (loopback); enables hands-free voice in
   ttsUrl?: string; // local Kokoro service base URL (loopback); enables voice out
+  elevenLabs?: { key: string; model: string; voices: { id: string; label: string }[] }; // when set, replaces Kokoro for voice out
   notifyAsk?: AskNotifier; // push a PWA notification when Claude asks and no client is watching
   ownerUsage?: () => { output5h: number; url: string } | null; // rolling 5h output + link to the usage page
   activeUsers?: () => number | null; // local users active on this box in the last ~15 min (null = unknown, e.g. guest sidecar with no DB)
@@ -420,7 +421,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
         moreModels = ctx.moreModels.filter(survives);
       }
     } catch { /* keep config fallback */ }
-    return jsonRes({ models, moreModels, commands, agents, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && ctx.ttsUrl), voices: ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: "af_heart" }, ctx, req);
+    return jsonRes({ models, moreModels, commands, agents, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && (ctx.ttsUrl || ctx.elevenLabs)), voices: ctx.elevenLabs ? ctx.elevenLabs.voices : ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: ctx.elevenLabs ? ctx.elevenLabs.voices[0].id : "af_heart" }, ctx, req);
   }
 
   // --- MCP server management (the tools the LLM can call in /app chats) ---
@@ -581,6 +582,30 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       return jsonRes({ text }, ctx, req);
     } catch (e: any) {
       return jsonRes({ error: "cleanup: " + (e?.message || e) }, ctx, req, 500);
+    }
+  }
+  if (req.method === "POST" && path === "/app/api/tts" && ctx.elevenLabs) {
+    const el = ctx.elevenLabs;
+    try {
+      const b = await req.json().catch(() => ({})) as { text?: string; voice?: string };
+      // A voice id saved from the Kokoro picker (af_heart etc.) falls back to the first ElevenLabs voice.
+      const voice = el.voices.some((v) => v.id === b.voice) ? b.voice! : el.voices[0].id;
+      const up = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice}?output_format=pcm_24000`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "xi-api-key": el.key },
+        body: JSON.stringify({ text: b.text || "", model_id: el.model }),
+      });
+      if (!up.ok) { const t = await up.text(); return new Response(t, { status: up.status, headers: { ...ctx.cors(req), "Content-Type": "application/json" } }); }
+      // The players label every clip audio/wav, so wrap the raw 16-bit mono PCM in a WAV header.
+      const pcm = new Uint8Array(await up.arrayBuffer());
+      const wav = new Uint8Array(44 + pcm.length), v = new DataView(wav.buffer), rate = 24000;
+      wav.set(new TextEncoder().encode("RIFF"), 0); v.setUint32(4, 36 + pcm.length, true);
+      wav.set(new TextEncoder().encode("WAVEfmt "), 8); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+      wav.set(new TextEncoder().encode("data"), 36); v.setUint32(40, pcm.length, true); wav.set(pcm, 44);
+      return new Response(wav, { status: 200, headers: { ...ctx.cors(req), "Content-Type": "audio/wav", "Cache-Control": "no-store" } });
+    } catch (e: any) {
+      return jsonRes({ error: "tts upstream: " + (e?.message || e) }, ctx, req, 502);
     }
   }
   if (req.method === "POST" && path === "/app/api/tts") {
@@ -1007,6 +1032,34 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       }
     }
     return jsonRes({ error: "not found" }, ctx, req, 404);
+  }
+
+  // Save a text file edited in the viewer's Edit tab. Same roots as the download route, limited to
+  // existing .md/.markdown/.txt files so the editor cannot create files or rewrite code or config.
+  // The client sends the ETag it read the file with; a mismatch means another writer (a Claude
+  // session, the vault pull timer) changed the file since, and the save is refused unless forced.
+  if (req.method === "POST" && path === "/app/api/save") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const id = String(b.id || "");
+    const rel = String(b.path || "");
+    const content = typeof b.content === "string" ? b.content : null;
+    if (content == null) return jsonRes({ error: "no content" }, ctx, req, 400);
+    if (content.length > 2_000_000) return jsonRes({ error: "file too large" }, ctx, req, 413);
+    if (!/\.(md|markdown|txt)$/i.test(rel)) return jsonRes({ error: "only .md and .txt files can be edited" }, ctx, req, 400);
+    const conv = id ? get(id) : undefined;
+    let base = conv?.cwd || undefined;
+    if (!base && /^[A-Za-z0-9-]{6,}$/.test(id)) { const t = findTranscript(ctx, id); if (t) base = (await convMeta(t.path)).cwd || undefined; }
+    base = base || ctx.defaultCwd;
+    const relPath = /^~(\/|$)/.test(rel) ? join(process.env.HOME || homedir(), rel.slice(1)) : rel;
+    const target = resolve(relPath.startsWith("/") ? relPath : join(base, relPath));
+    const under = (root: string) => target === root || target.startsWith(root.replace(/\/+$/, "") + "/");
+    if (!under(base) && !ctx.downloadRoots.some(under)) return jsonRes({ error: "path outside conversation" }, ctx, req, 403);
+    const tagOf = () => { const st = statSync(target); return `"${Math.round(st.mtimeMs).toString(36)}-${st.size.toString(36)}"`; };
+    let current: string;
+    try { if (!statSync(target).isFile()) throw new Error(); current = tagOf(); } catch { return jsonRes({ error: "not found" }, ctx, req, 404); }
+    if (b.etag && !b.force && b.etag !== current) return jsonRes({ error: "changed on disk since it was opened", conflict: true }, ctx, req, 409);
+    try { await Bun.write(target, content); } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 500); }
+    return jsonRes({ ok: true, path: target, etag: tagOf() }, ctx, req);
   }
 
   if (req.method === "GET" && path === "/app/api/download") {

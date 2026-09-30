@@ -7,14 +7,15 @@ import { marked } from "marked";
 import { extractMath } from "./mathrender";
 import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { useDictation } from "./dictation";
-import { AskCard } from "./askcard";
+import { AskCard, type EmailDraft } from "./askcard";
 import * as offline from "./offline";
-import { AssistantContent, ArtifactViewer, type Artifact } from "./artifacts";
+import { AssistantContent, ArtifactViewer, noteFromText, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { ConnectionsModal } from "./connections";
 import { Clawd, Elapsed } from "./clawd";
 import { Desktop } from "./desktop";
+import { APPS } from "./apps";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -104,7 +105,7 @@ type AppEvent =
   | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string; _seq?: number }
   | { t: "compact"; trigger: string; preTokens?: number; postTokens?: number; durationMs?: number; _seq?: number }
   | { t: "compacting"; active: boolean; _seq?: number }
-  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; _seq?: number }
+  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
   | { t: "user"; text: string; cid?: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
@@ -133,7 +134,7 @@ type Item =
   | { kind: "assistant"; text: string; usage?: TurnUsage; bid?: string }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }; done?: "completed" | "failed" | "stopped" }
-  | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; answered?: string }
+  | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft; answered?: string }
   | { kind: "notice"; noticeKind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string }
   | { kind: "compact"; savedTokens?: number; durationMs?: number; pctBefore?: number; pctAfter?: number };
 // #endregion
@@ -170,6 +171,8 @@ const effortName = (lv: string) => (lv === "xhigh" ? "X-high" : lv.charAt(0).toU
 
 // #region api
 const J = (r: Response) => r.json();
+// Cloudflare rejects request bodies over 100 MB on this plan; nginx's client_max_body_size matches.
+const MAX_UPLOAD_MB = 100;
 // Reject a request that hasn't resolved within `ms`. A hung POST on a weak link never rejects on its
 // own, so without this a send would sit "sending" forever and never fall back to the offline queue.
 function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
@@ -278,7 +281,13 @@ const api = {
   interrupt: (id: string) => fetch("/app/api/interrupt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }),
   upload: (id: string | null, file: File) => {
     const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
-    return fetch("/app/api/upload", { method: "POST", body: fd }).then(J);
+    // A 413 from nginx or Cloudflare is an HTML page, not JSON, so check the status before parsing.
+    return fetch("/app/api/upload", { method: "POST", body: fd }).then(async (r) => {
+      if (r.status === 413) throw new Error(`${file.name} is over the ${MAX_UPLOAD_MB} MB upload limit`);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j?.path) throw new Error(`${file.name} failed to upload: ${j?.error || `HTTP ${r.status}`}`);
+      return j;
+    });
   },
   reads: () => withTimeout(fetch("/app/api/reads").then(J)),
   pushReads: (reads: Record<string, number>) =>
@@ -461,7 +470,7 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
     }
     case "ask": {
       if (items.some((it) => it.kind === "ask" && it.askId === e.askId)) return items; // de-dupe (transcript + live)
-      return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText }];
+      return [...items, { kind: "ask", askId: e.askId, question: e.question, options: e.options, multiSelect: e.multiSelect, allowText: e.allowText, email: e.email }];
     }
     case "ask_done": {
       const idx = items.findIndex((it) => it.kind === "ask" && it.askId === e.askId);
@@ -602,8 +611,10 @@ class ConvStore {
         return;
       case "status": {
         this.phase = e.phase; this.phaseSince = e.since; this.phaseDetail = e.detail;
+        // An idle phase ends the foreground turn but not necessarily busy: background subagents keep the
+        // runner busy after it, and the server's own busy event is what clears it.
         const b = e.phase !== "idle";
-        if (b !== this.busy) this.busy = b;
+        if (b && !this.busy) this.busy = true;
         if (!b) { this.items = freezeOpen(this.items); this.touch(); } else this.signal();
         return;
       }
@@ -641,7 +652,7 @@ class ConvStore {
         this.mgr.hooks?.onResult(this); this.mgr.hooks?.onContext(this); return;
       case "error":
         this.busy = false; this.items = [...freezeOpen(this.items), { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]; this.touch(); return;
-      case "closed": this.items = freezeOpen(this.items); this.phase = "idle"; this.touch(); this.disconnect(); return;
+      case "closed": this.items = freezeOpen(this.items); this.phase = "idle"; this.busy = false; this.touch(); this.disconnect(); return;
       default: this.items = applyEvent(this.items, e); this.touch(); return;
     }
   }
@@ -1026,6 +1037,7 @@ function BusyLine({ phase, detail, since, waiting }: { phase: Phase; detail?: st
     : phase === "compacting" ? "Compacting"
     : phase === "thinking" ? "Thinking"
     : phase === "writing" ? "Writing"
+    : phase === "idle" ? "Background agents running"
     : "Working";
   return (
     <div className="msg bubble-assistant">
@@ -1296,7 +1308,12 @@ function App() {
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
+  const [uploadError, setUploadError] = useState("");
   const [drawer, setDrawer] = useState(false);
+  // Wide screens: the menu button hides the sidebar instead of opening the drawer. Persisted.
+  const [sbHidden, setSbHidden] = useState<boolean>(() => { try { return localStorage.getItem("ct-sidebar-hidden") === "1"; } catch { return false; } });
+  useEffect(() => { try { localStorage.setItem("ct-sidebar-hidden", sbHidden ? "1" : "0"); } catch { /* */ } }, [sbHidden]);
+  const toggleSidebar = () => { if (matchMedia("(max-width: 820px)").matches) setDrawer((d) => !d); else setSbHidden((h) => !h); };
   const [menuOpen, setMenuOpen] = useState(false);
   const [showOlder, setShowOlder] = useState(false); // "Older versions" group inside the picker panel
   const [updateAvail, setUpdateAvail] = useState(false);
@@ -1304,6 +1321,7 @@ function App() {
   const [favorites, setFavorites] = useState<Set<string>>(() => loadFavsLocal()); // seed from cache so it shows instantly + offline
   const [hasMore, setHasMore] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [appsOpen, setAppsOpen] = useState(false);
   const [theme, setThemeState] = useState<ThemePref>(loadThemePref);
   // The retro theme on a wide screen is the desktop shell. Inside an iframe (a desktop window showing
   // /app) the plain layout renders, so the shell never nests.
@@ -1617,6 +1635,10 @@ function App() {
     syncReads();
     const c = new URLSearchParams(location.search).get("c");
     if (c) void loadConv(c);
+    // "?q=<text>" opens a new chat with the composer filled in, unsent. The morning brief's
+    // action buttons link here. The param is stripped so a reload does not refill it.
+    const q = new URLSearchParams(location.search).get("q");
+    if (q && !c) { setInput(q); history.replaceState(null, "", "/app"); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1773,7 +1795,12 @@ function App() {
   // PWA update check: poll the server build id; if it changed since load, offer a reload.
   // Content-hashed assets + no-store index mean the reload gets everything fresh.
   useEffect(() => {
-    let baseline: string | null = null;
+    // Baseline is the build this page is actually running, read from its own bundle URL
+    // (main-<build>.js, the same id as version.txt). Seeding it from the first poll instead
+    // missed every update on a cold PWA launch: the service worker serves the cached (old)
+    // shell, the first poll returns the new id, and old == "baseline" forever.
+    const own = document.querySelector<HTMLScriptElement>('script[src*="/app/assets/main-"]')?.src.match(/main-([A-Za-z0-9]+)\.js/)?.[1];
+    let baseline: string | null = own || null;
     let stop = false;
     const check = async (foreground = false) => {
       try {
@@ -2074,7 +2101,7 @@ function App() {
       // swap any unanswered asks for the server's real pending asks.
       if (d.live && Array.isArray(d.pendingAsks) && d.pendingAsks.length) {
         for (let i = serverItems.length - 1; i >= 0; i--) if (serverItems[i].kind === "ask" && (serverItems[i] as any).answered === undefined) serverItems.splice(i, 1);
-        for (const a of d.pendingAsks) serverItems.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText });
+        for (const a of d.pendingAsks) serverItems.push({ kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText, email: a.email });
       }
       s.reconcile(serverItems, { busy: !!d.busy, cwd: d.cwd || defaultCwd, evCount: d.evTotal });
       if (d.live) s.connect(true); // stream follow-up events; connect() is a no-op if already connected
@@ -2483,11 +2510,13 @@ function App() {
   };
 
   const addFiles = async (files: File[]) => {
+    setUploadError("");
     for (const f of files) {
+      if (f.size > MAX_UPLOAD_MB * 1024 * 1024) { setUploadError(`${f.name} is over the ${MAX_UPLOAD_MB} MB upload limit`); continue; }
       const isImage = f.type.startsWith("image/");
       const preview = isImage ? URL.createObjectURL(f) : undefined; // local thumbnail, no server round-trip
-      try { const r = await api.upload(activeId, f); if (r?.path) setAttachments((a) => [...a, { name: f.name, path: r.path, isImage, preview }]); }
-      catch { if (preview) URL.revokeObjectURL(preview); }
+      try { const r = await api.upload(activeId, f); setAttachments((a) => [...a, { name: f.name, path: r.path, isImage, preview }]); }
+      catch (e: any) { if (preview) URL.revokeObjectURL(preview); setUploadError(String(e?.message || e)); }
     }
   };
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -2694,7 +2723,7 @@ function App() {
   }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, openArtifact]);
 
   const ui = (
-    <div className={"app" + (drawer ? " drawer-open" : "")} onTouchStart={onAppTouchStart} onTouchMove={onAppTouchMove} onTouchEnd={onAppTouchEnd}>
+    <div className={"app" + (drawer ? " drawer-open" : "") + (sbHidden ? " sb-hidden" : "")} onTouchStart={onAppTouchStart} onTouchMove={onAppTouchMove} onTouchEnd={onAppTouchEnd}>
       {updateAvail && (
         <div className="update-toast" role="status">
           <span>A new version is available.</span>
@@ -2738,6 +2767,26 @@ function App() {
             {agents.length > 0 && (
               <div className="cmd-foot">{agents.length} subagents available — name one in a prompt, or use /list-agents.</div>
             )}
+          </div>
+        </div>
+      )}
+      {/* Launcher for everything this box serves (app/apps.ts). Same-origin pages replace /app and come
+          back through their own Back bar; other hosts open in a new tab. */}
+      {appsOpen && (
+        <div className="modal-scrim" onClick={() => setAppsOpen(false)}>
+          <div className="modal apps-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">Apps<button className="modal-x" onClick={() => setAppsOpen(false)} aria-label="Close">×</button></div>
+            <div className="apps-grid">
+              {APPS.map((a) => (
+                <a key={a.id} className="apps-tile" href={a.href}
+                  {...(a.external ? { target: "_blank", rel: "noopener" } : {})}
+                  onClick={a.id === "chat" ? (e) => { e.preventDefault(); setAppsOpen(false); setDrawer(false); } : undefined}>
+                  <span className="apps-ic" aria-hidden>{a.icon}</span>
+                  <span className="apps-label">{a.label}{a.external && <span className="apps-ext" aria-label="opens in a new tab"> ↗</span>}</span>
+                  <span className="apps-desc">{a.desc}</span>
+                </a>
+              ))}
+            </div>
           </div>
         </div>
       )}
@@ -2889,16 +2938,16 @@ function App() {
           )}
         </div>
         <div className="sb-foot">
-          <a className="term-link" href="/tty/">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" strokeWidth="1.6" /><path d="M8 10l2.5 2L8 14M12.5 14H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
-            Terminal
-          </a>
+          <button type="button" className="term-link" onClick={() => setAppsOpen(true)}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="4" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5" /><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5" /></svg>
+            Apps
+          </button>
         </div>
       </aside>
 
       <main className="main">
         <div className="topbar">
-          <button className="icon-btn" onClick={() => setDrawer((d) => !d)} aria-label="Menu">
+          <button className="icon-btn" onClick={toggleSidebar} aria-label="Menu" title="Show or hide conversations">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
           </button>
           {editingTitle ? (
@@ -2969,6 +3018,12 @@ function App() {
             </div>
           )}
           <div className={"composer" + (dragOver ? " drag-over" : "")} onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragOver(false)}>
+            {uploadError && (
+              <div className="attach-err" role="alert">
+                <span>{uploadError}</span>
+                <button onClick={() => setUploadError("")} aria-label="Dismiss">×</button>
+              </div>
+            )}
             {attachments.length > 0 && (
               <div className="attach-row">
                 {attachments.map((a, i) => (
@@ -3107,16 +3162,16 @@ function App() {
       </main>
       {artifact && (
         window.matchMedia("(max-width: 820px)").matches
-          ? <ArtifactViewer artifact={artifact} mode="sheet" onClose={closeArtifact} onBack={artifactTrail.length > 1 ? backArtifact : undefined} onOpen={openArtifact} />
+          ? <ArtifactViewer key={artifact.id} artifact={artifact} mode="sheet" onClose={closeArtifact} onBack={artifactTrail.length > 1 ? backArtifact : undefined} onOpen={openArtifact} />
           : <div className="artifact-panel" style={{ flex: `0 0 ${artifactW}px` }}>
               <div className="artifact-resizer" onPointerDown={onArtifactResizeDown} onPointerMove={onArtifactResizeMove} onPointerUp={onArtifactResizeUp} onPointerCancel={onArtifactResizeUp} title="Drag to resize" aria-label="Resize artifact panel" />
-              <ArtifactViewer artifact={artifact} mode="panel" onClose={closeArtifact} onBack={artifactTrail.length > 1 ? backArtifact : undefined} onOpen={openArtifact} />
+              <ArtifactViewer key={artifact.id} artifact={artifact} mode="panel" onClose={closeArtifact} onBack={artifactTrail.length > 1 ? backArtifact : undefined} onOpen={openArtifact} />
             </div>
       )}
       {msgMenu && (
         <>
           <div className="ctx-scrim" onClick={() => setMsgMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMsgMenu(null); }} />
-          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 160), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
+          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 200), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
             {speaking ? (
               <button onClick={() => { stopReadAloud(); setReading(null); setMsgMenu(null); }}>Stop reading</button>
             ) : (
@@ -3132,6 +3187,7 @@ function App() {
               }}>Read aloud</button>
             )}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
+            <button onClick={() => { openArtifact(noteFromText(msgMenu.text, activeId)); setMsgMenu(null); }}>Open in editor</button>
             {msgMenu.kind === "user" && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
           </div>
         </>
@@ -3161,6 +3217,8 @@ function App() {
       modelLabel={modelBtnLabel}
       onModelClick={() => setMenuOpen(true)}
       onOpenChat={(id) => void loadConv(id)}
+      chats={convs.slice(0, 12).map((c) => ({ id: c.sessionId, title: titleOf(c.sessionId), busy: !!statuses[c.sessionId]?.busy, waiting: !!statuses[c.sessionId]?.waiting }))}
+      onNewChat={newChat}
       finishedKey={finishedKey}
       openTerminalId={termArg}
       onTheme={(t) => setTheme(t)}

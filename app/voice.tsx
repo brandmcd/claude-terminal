@@ -38,11 +38,19 @@ type Phase = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "
 // commentary" mode. content_block_start for the tool arrives within a few tens of ms of the text
 // ending, so this only has to cover the gap; it is also the extra delay on first audio.
 const HOLD_MS = 350;
-// "still working" cue: a quiet blip while the turn is in flight (see the cue region below).
-const CUE_HZ = 600;
-const CUE_MS = 70;
+// Audio cues (see the cue region below), so the mode can be used without looking at the screen.
+// Each note is [hz, start ms, length ms]. The "still working" pulse is one slow, low swell every few
+// seconds; the old 70 ms 600 Hz blip every 1.2 s read as a car's turn signal.
+type Note = [number, number, number];
 const CUE_GAIN = 0.05;
-const CUE_EVERY_MS = 1200;
+const CUE_EVERY_MS = 2800;
+const PULSE: Note[] = [[330, 0, 480]];
+const LISTEN_NOTES: Note[] = [[523, 0, 170], [784, 120, 280]]; // rising: the mic is open, talk now
+const ACK_NOTES: Note[] = [[659, 0, 160], [494, 110, 260]];    // falling: got it, sending
+const ERR_NOTES: Note[] = [[330, 0, 240], [247, 200, 360]];    // low falling: nothing came back
+// The VAD ignores this long at the start of a listening segment, so the mic-open chime leaking back
+// through the speakers can't register as speech and send an empty clip.
+const LISTEN_GUARD_MS = 450;
 // If the user echo never comes back (a decorated turn, a backend restart), arm anyway rather than
 // sitting silent in "thinking" forever with the answer already on screen.
 const ARM_FALLBACK_MS = 4000;
@@ -415,34 +423,44 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
 
   const clearRaf = () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current); rafRef.current = null; };
 
-  // #region "still working" cue
-  // A short blip every CUE_EVERY_MS from the moment the mic closes until the reply starts speaking,
-  // so the user hears that the turn is in flight and stops talking into a dead mic. Pulsed rather
-  // than a held tone on purpose: the barge-in loop below keeps sampling the mic during "thinking",
-  // and a continuous tone leaking back through the speakers would cross its threshold and cut off
-  // the first spoken sentence. Between pulses its `loud` counter decays.
+  // #region audio cues
+  // A two-note chime when the mic closes, then a slow swell every CUE_EVERY_MS until the reply starts
+  // speaking, so the user hears that the turn is in flight and stops talking into a dead mic. Pulsed
+  // rather than a held tone on purpose: the barge-in loop below keeps sampling the mic during
+  // "thinking", and a continuous tone leaking back through the speakers would cross its threshold and
+  // cut off the first spoken sentence. Between pulses its `loud` counter decays.
   const clearCue = () => { if (cueTimerRef.current) { clearInterval(cueTimerRef.current); cueTimerRef.current = null; } };
-  const blip = (ctx: AudioContext) => {
+  // Soft mallet-like notes: a sine plus a quiet octave, slow attack, exponential decay.
+  const chime = (ctx: AudioContext | null, notes: Note[]) => {
+    if (!ctx) return;
     try {
-      const t = ctx.currentTime, dur = CUE_MS / 1000;
-      const osc = ctx.createOscillator(), gain = ctx.createGain();
-      osc.type = "sine"; osc.frequency.value = CUE_HZ;
-      gain.gain.setValueAtTime(0, t);
-      gain.gain.linearRampToValueAtTime(CUE_GAIN, t + 0.012);
-      gain.gain.linearRampToValueAtTime(0, t + dur);
-      osc.connect(gain); gain.connect(ctx.destination);
-      osc.start(t); osc.stop(t + dur + 0.02);
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      const t0 = ctx.currentTime + 0.02;
+      for (const [hz, at, len] of notes) {
+        const t = t0 + at / 1000, dur = len / 1000, attack = Math.min(0.08, dur / 4);
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.0001, t);
+        gain.gain.linearRampToValueAtTime(CUE_GAIN, t + attack);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        gain.connect(ctx.destination);
+        for (const [mult, level] of [[1, 1], [2, 0.22]]) {
+          const osc = ctx.createOscillator(), g = ctx.createGain();
+          osc.type = "sine"; osc.frequency.value = hz * mult; g.gain.value = level;
+          osc.connect(g); g.connect(gain);
+          osc.start(t); osc.stop(t + dur + 0.05);
+        }
+      }
     } catch { /* the cue is cosmetic; never break a turn over it */ }
   };
+  const prevPhaseRef = useRef<Phase>("idle");
   useEffect(() => {
+    const prev = prevPhaseRef.current; prevPhaseRef.current = phase;
     if (phase !== "transcribing" && phase !== "thinking") { clearCue(); return; }
-    const ctx = ctxRef.current;
-    if (!ctx) return;
-    if (ctx.state === "suspended") { try { ctx.resume(); } catch { /* */ } }
-    blip(ctx);
-    cueTimerRef.current = setInterval(() => { const c = ctxRef.current; if (c) blip(c); }, CUE_EVERY_MS);
-    return clearCue;
+    if (prev === "listening") chime(ctxRef.current, ACK_NOTES);
+    // transcribing -> thinking keeps the same pulse running instead of restarting it
+    if (!cueTimerRef.current) cueTimerRef.current = setInterval(() => chime(ctxRef.current, PULSE), CUE_EVERY_MS);
   }, [phase]);
+  useEffect(() => clearCue, []);
   // #endregion
 
   // --- teardown everything ---
@@ -468,6 +486,9 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     const stream = streamRef.current, ctx = ctxRef.current, analyser = analyserRef.current;
     if (!stream || !ctx || !analyser) return;
     setHeard(""); setCaption("");
+    // chime only on entering listening, not when a silence-only segment restarts
+    const fresh = phaseRef.current !== "listening";
+    if (fresh) chime(ctx, LISTEN_NOTES);
     setPhaseR("listening");
 
     // fresh recorder capturing the whole listening segment (webm chunks aren't
@@ -501,6 +522,7 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
       const rms = Math.sqrt(sum / data.length);
       setLevel(Math.min(1, rms * 6));
       const now = performance.now();
+      if (fresh && now - segStart < LISTEN_GUARD_MS) { rafRef.current = requestAnimationFrame(tick); return; }
       if (floorN < 12) { floor = (floor * floorN + rms) / (floorN + 1); floorN++; } // ambient calibration
       const thr = Math.max(0.05, floor * 2.2);
       if (rms > thr) { if (!speech) speech = true; lastVoice = now; }
@@ -681,7 +703,7 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
       // we are still showing "thinking". That means this turn produced no speech (TTS down, or an empty
       // reply). Hand the mic back instead of sitting on a dead screen with the answer already visible.
       if (phaseRef.current === "thinking" && turnDoneRef.current && !player.isActive && ttsPendingRef.current === 0 && turnDoneAtRef.current && Date.now() - turnDoneAtRef.current > 1500) {
-        if (!spokeRef.current) setErr("nothing was read back for that reply");
+        if (!spokeRef.current) { setErr("nothing was read back for that reply"); chime(ctxRef.current, ERR_NOTES); }
         if (pttRef.current) setPhaseR("idle"); else startListening();
         return;
       }
@@ -774,8 +796,9 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
         <span className="voice-badge">Voice{ptt ? " · tap" : ""}</span>
         <button className="voice-x" onClick={onClose} aria-label="Exit voice mode">Done</button>
       </div>
-      <div className="voice-center">
-        <div className={"voice-orb voice-" + phase + (ptt ? " voice-orb-tap" : "")} onClick={ptt ? () => void pttTap() : undefined} role={ptt ? "button" : undefined} aria-label={ptt ? label : undefined}>
+      {/* tap-to-talk: the whole middle of the screen is the talk button, so a glance-free tap lands */}
+      <div className={"voice-center" + (ptt ? " voice-orb-tap" : "")} onClick={ptt ? () => void pttTap() : undefined} role={ptt ? "button" : undefined} aria-label={ptt ? label : undefined}>
+        <div className={"voice-orb voice-" + phase}>
           <span className="vo-ring vo-ring1" />
           <span className="vo-ring vo-ring2" />
           <div className="voice-orb-blob" style={{ transform: `scale(${1 + (phase === "listening" ? level * 0.5 : phase === "speaking" ? 0.14 : 0)})` }}>
@@ -813,7 +836,7 @@ function injectVoiceCss() {
   .voice-overlay{position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;background:radial-gradient(120% 90% at 50% 12%,#1c1c22 0%,#0d0d10 62%);color:#ececf1;padding:env(safe-area-inset-top) 16px 24px;overflow:hidden}
   .voice-top{display:flex;align-items:center;justify-content:space-between;padding:14px 4px 0}
   .voice-badge{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#8f8fa3;font-weight:600}
-  .voice-x{background:rgba(255,255,255,.08);border:none;color:#ececf1;border-radius:999px;padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer}
+  .voice-x{background:rgba(255,255,255,.08);border:none;color:#ececf1;border-radius:999px;padding:13px 24px;font-size:16px;font-weight:600;cursor:pointer}
   .voice-x:active{background:rgba(255,255,255,.16)}
   .voice-center{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px}
   /* --- morphing voice orb: an organic blob that morphs shape + spins an inner sheen,

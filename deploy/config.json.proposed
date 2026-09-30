@@ -2,6 +2,7 @@
   "owner": "brandon",
   "host": "127.0.0.1",
   "port": 7682,
+  "vapidSubject": "https://claude.brandmcd.com",
   "db": "/var/lib/claude-terminal/usage.db",
   "dataDir": "/home/ctuser/.claude/projects",
   "spawnHelper": "/srv/claude-terminal/bin/claude-spawn",
@@ -14,13 +15,20 @@
   "bgColor": "#111318",
   "collectSeconds": 60,
   "names": {
-    "brandon": "Brandon"
+    "brandon": "Brandon",
+    "sam": "Sam",
+    "ishan": "Ishan",
+    "yak": "Yik Yak bot"
   },
   "hosts": [
-    "brandon"
+    "brandon",
+    "yak"
   ],
   "colors": {
-    "brandon": "#4ADE80"
+    "brandon": "#4ADE80",
+    "sam": "#F59E0B",
+    "ishan": "#60A5FA",
+    "yak": "#A78BFA"
   },
   "appModels": [
     {
@@ -30,6 +38,10 @@
     {
       "id": "claude-opus-5",
       "label": "Opus 5"
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "label": "Sonnet 5.5"
     },
     {
       "id": "claude-sonnet-5",
@@ -57,6 +69,11 @@
   "voice": true,
   "sttUrl": "http://127.0.0.1:7801",
   "ttsUrl": "http://127.0.0.1:7802",
+  "elevenLabs": {
+    "keyFile": "/etc/claude-terminal/elevenlabs.key",
+    "model": "eleven_v4_turbo",
+    "voices": []
+  },
   "externalPeers": [
     {
       "name": "laptop",
@@ -66,5 +83,16 @@
   ],
   "exportName": "brandon",
   "exportTokenFile": "/etc/claude-terminal/export.token",
-  "exportCombinePeers": true
+  "exportCombinePeers": true,
+  "extraUsers": {
+    "sam": [
+      "/var/lib/claude-terminal/guests/sam/projects"
+    ],
+    "ishan": [
+      "/var/lib/claude-terminal/guests/ishan/projects"
+    ],
+    "yak": [
+      "/home/ctuser/.claude/projects/-home-ctuser--local-share-yak-claude-runs"
+    ]
+  }
 }

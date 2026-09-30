@@ -8,7 +8,7 @@
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
 import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
-import { mkdirSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -58,7 +58,7 @@ export type AppEvent =
   | { t: "agent_progress"; id: string; tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string; subagentType?: string; description?: string } // live subagent progress, keyed by the Task tool_use id
   | { t: "compact"; trigger: "manual" | "auto"; preTokens?: number; postTokens?: number; durationMs?: number } // a compaction finished; metadata drives the "freed Nk" card
   | { t: "compacting"; active: boolean } // compaction started/stopped (drives the progress banner, incl. auto-compaction)
-  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean } // Claude asks with tappable options (optionally multi-select / free-text)
+  | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
   | { t: "user"; text: string; cid?: string } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly
   // Real token accounting for the turn (from the SDK result message): output = tokens Claude
@@ -454,7 +454,69 @@ export type SessionSettings = {
 };
 
 // Metadata for a still-open ask_user prompt, so a reconnecting client can re-render it.
-export type PendingAsk = { askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean };
+export type PendingAsk = { askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft };
+
+// An email draft shown as an editable compose card (ask_user with `email`). When the user presses
+// Send, emailAnswerText() writes the edited fields to EMAIL_APPROVALS, and the email-gate PreToolUse
+// hook in ~/.claude/hooks lets one matching Gmail send through without its "ask" prompt, which the
+// /app chat cannot answer. canonEmail() must stay identical to canon() in that hook.
+export type EmailDraft = { from?: string; fromOptions?: string[]; signatures?: Record<string, string>; to: string; cc?: string; bcc?: string; subject: string; body: string };
+// Per-account signatures the card appends below the body, keyed by address. Edit the file to change them.
+const EMAIL_SIGNATURES = join(homedir(), ".config", "ct-email", "signatures.json");
+function emailSignatures(): Record<string, string> {
+  try {
+    const o = JSON.parse(readFileSync(EMAIL_SIGNATURES, "utf8"));
+    return Object.fromEntries(Object.entries(o || {}).filter(([k]) => k.includes("@")).map(([k, v]) => [k.toLowerCase(), String(v)]));
+  } catch { return {}; }
+}
+// Display name for the From header ("name" in the same file), so mail reads "Name <addr>" like Gmail's.
+function emailFromName(): string {
+  try { return String(JSON.parse(readFileSync(EMAIL_SIGNATURES, "utf8"))?.name || ""); } catch { return ""; }
+}
+// The same HTML Gmail's composer produces: one ltr div, <br> per line. Plain-text-only mail renders
+// smaller and in a different style in Gmail.
+const escHtml = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const gmailHtml = (body: string) => `<div dir="ltr">${escHtml(body.replace(/\r\n/g, "\n").replace(/\s+$/, "")).split("\n").join("<br>")}</div>`;
+// Google accounts that can send: enabled workspace-mcp servers not started with --read-only.
+type EmailSender = { email: string; server: string };
+function emailSenders(stored: Record<string, any>): EmailSender[] {
+  const out: EmailSender[] = [];
+  for (const [server, cfg] of Object.entries(stored || {})) {
+    const args: string[] = Array.isArray(cfg?.args) ? cfg.args : [];
+    const email = cfg?.env?.USER_GOOGLE_EMAIL;
+    if (email && args.includes("workspace-mcp") && !args.includes("--read-only")) out.push({ email: String(email).toLowerCase(), server });
+  }
+  return out;
+}
+const EMAIL_APPROVALS = join(homedir(), ".local", "state", "email-approvals");
+const canonAddrs = (v?: string) => (v || "").split(",").map((a) => a.trim().toLowerCase()).filter(Boolean).sort().join(",");
+function canonEmail(d: Partial<EmailDraft>) {
+  return {
+    from: (d.from || "").trim().toLowerCase(),
+    to: canonAddrs(d.to), cc: canonAddrs(d.cc), bcc: canonAddrs(d.bcc),
+    subject: (d.subject || "").trim(),
+    body: (d.body || "").replace(/\r\n/g, "\n").split("\n").map((l) => l.replace(/\s+$/, "")).join("\n").replace(/\n+$/, ""),
+  };
+}
+// Tool result for an answer to an email ask. The card answers with {"action":"send"|"cancel",...};
+// anything else was typed in the composer and is a revision request.
+function emailAnswerText(answer: string, draft: EmailDraft, senders: EmailSender[]): string {
+  let a: any = null;
+  try { a = JSON.parse(answer); } catch { /* typed text */ }
+  if (a?.action === "cancel") return "The user cancelled this email. Do not send it.";
+  if (a?.action !== "send") return `The user did not send the email and asked for changes: ${answer}`;
+  const from = String(a.from || draft.from || "").toLowerCase();
+  const sender = senders.find((x) => x.email === from);
+  if (!sender) return `The user pressed Send with from = ${from || "(none)"}, but no connected account can send as that address. Do not send; tell the user.`;
+  const sent: EmailDraft = { from, to: String(a.to || ""), cc: a.cc || undefined, bcc: a.bcc || undefined, subject: String(a.subject || ""), body: gmailHtml(String(a.body || "")) };
+  const fromName = emailFromName();
+  try {
+    mkdirSync(EMAIL_APPROVALS, { recursive: true, mode: 0o700 });
+    const f = join(EMAIL_APPROVALS, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+    writeFileSync(f, JSON.stringify({ ...canonEmail(sent), expires: Date.now() + 15 * 60_000 }), { mode: 0o600 });
+  } catch (e) { return `The user pressed Send, but the approval could not be recorded (${e}). Do not send; tell the user.`; }
+  return `The user approved this email and pressed Send. Send it now, once, with mcp__${sender.server}__send_gmail_message, using exactly these field values unchanged, with user_google_email set to \`from\`, include_signature false, body_format html${fromName ? `, from_name "${fromName}"` : ""}:\n` + JSON.stringify(sent, null, 2);
+}
 
 // What Claude Code injects as the user turn when it resumes a session whose last turn was cut off.
 // Its default is the bare "Continue from where you left off.", which after a service restart got the
@@ -905,21 +967,31 @@ export class Conversation {
             options: z.array(z.object({ label: z.string().describe("Short option label the user taps"), description: z.string().optional().describe("Optional one-line clarification") })).max(6).optional().describe("Up to 6 tappable options. Required unless allowText is true (a pure free-text prompt)."),
             multiSelect: z.boolean().optional().describe("Let the user select multiple options, then submit. The answer comes back as the chosen labels, comma-separated."),
             allowText: z.boolean().optional().describe("Show a free-text field so the user can type an answer instead of, or in addition to, tapping an option."),
+            email: z.object({ from: z.string().optional().describe("Default sending account; the user can switch to any connected Google account that can send"), to: z.string(), cc: z.string().optional(), bcc: z.string().optional(), subject: z.string(), body: z.string() }).optional().describe("Before sending ANY email, pass the draft here (options not needed; question is a one-line note above it). The user gets an editable compose card (to, cc, subject, body) with Send and Cancel. On Send the result holds the final fields; send exactly those. Leave the sign-off name and signature out of body: the card appends the chosen account's signature. This tool never sends by itself."),
           },
-          async (args: { question: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean }) => {
+          async (args: { question: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft }) => {
             if (this.closed) return { content: [{ type: "text" as const, text: "(conversation closed)" }] };
             const options = args.options ?? [];
-            if (!options.length && !args.allowText) return { content: [{ type: "text" as const, text: "(ask_user needs at least one option, or allowText: true)" }] };
+            if (!options.length && !args.allowText && !args.email) return { content: [{ type: "text" as const, text: "(ask_user needs at least one option, or allowText: true)" }] };
             const askId = `${this.id}-ask-${this.askCounter++}`;
-            const meta: PendingAsk = { askId, question: args.question, options, multiSelect: args.multiSelect, allowText: args.allowText };
+            let email = args.email;
+            let senders: EmailSender[] = [];
+            if (email) {
+              try { senders = emailSenders(this.mcpFile ? await mcpServersForQuery(this.mcpFile) : {}); } catch {}
+              const opts = senders.map((x) => x.email);
+              const want = (email.from || "").toLowerCase();
+              const sigs = emailSignatures();
+              email = { ...email, fromOptions: opts, from: opts.includes(want) ? want : opts[0] || want, signatures: Object.fromEntries(opts.filter((o) => sigs[o]).map((o) => [o, sigs[o]])) };
+            }
+            const meta: PendingAsk = { askId, question: args.question, options, multiSelect: args.multiSelect, allowText: args.allowText, ...(email ? { email } : {}) };
             const answer = await new Promise<string>((resolve) => {
               this.pendingAsks.set(askId, resolve);
               this.pendingAskMeta.set(askId, meta);
-              this.emit({ t: "ask", askId, question: args.question, options, multiSelect: args.multiSelect, allowText: args.allowText });
+              this.emit({ t: "ask", askId, question: args.question, options, multiSelect: args.multiSelect, allowText: args.allowText, ...(email ? { email } : {}) });
               // No one is streaming this conversation -> ping the owner so the turn doesn't hang unseen.
               if (!this.hasSubscribers()) { try { this.notifier?.({ sessionId: this.id, question: args.question, multiSelect: args.multiSelect, allowText: args.allowText }); } catch {} }
             });
-            return { content: [{ type: "text" as const, text: answer }] };
+            return { content: [{ type: "text" as const, text: email ? emailAnswerText(answer, email, senders) : answer }] };
           },
         ),
       ],
@@ -1023,6 +1095,7 @@ export class Conversation {
       // Superseded by a refork -> stay silent; the new run owns the stream now.
       if (myGen === this.runGen) {
         this.running = false;
+        this.bgTasks.clear(); // background tasks die with the subprocess
         this.setPhase("idle"); // emits busy:false itself if it was busy
         tlog("closed", { conv: this.id, listeners: this.subs.size });
         this.emit({ t: "closed" });
@@ -1133,7 +1206,7 @@ export class Conversation {
           for (const t of (anyM.tasks as any[]) || []) if (t && !t.ambient && t.task_id) next.add(String(t.task_id));
           const wasBusy = this.busy;
           this.bgTasks = next;
-          if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy });
+          if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy, ...(this.busy ? { since: this.busySince() } : {}) });
         }
         // Background subagent activity + cross-session messages, surfaced inline so the thread
         // shows work spun off to other agents (Claude Code's task/notification stream).
@@ -1498,7 +1571,7 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
           // tool_result later becomes its ask_done. Avoids a raw, resultless tool card.
           const inp: any = b.input || {};
           askToolIds.add(b.id);
-          out.push({ t: "ask", askId: b.id, question: String(inp.question || ""), options: Array.isArray(inp.options) ? inp.options : [], multiSelect: !!inp.multiSelect, allowText: !!inp.allowText });
+          out.push({ t: "ask", askId: b.id, question: String(inp.question || ""), options: Array.isArray(inp.options) ? inp.options : [], multiSelect: !!inp.multiSelect, allowText: !!inp.allowText, ...(inp.email ? { email: inp.email } : {}) });
         } else if (b?.type === "tool_use") out.push({ t: "tool_use", id: b.id, name: b.name, input: b.input });
       }
       // Stamp the turn's token usage from the transcript so historical turns show the same footer as

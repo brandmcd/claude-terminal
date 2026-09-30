@@ -55,7 +55,28 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
      VALUES (?, ?, ?, ?, ?, ?)`,
   );
 
-  const num = (v: any) => (typeof v === "number" && isFinite(v) ? Math.max(0, Math.trunc(v)) : 0);
+  // A token count past 2^53 cannot be real; a peer's corrupt row once sent 9.96e22 output
+  // tokens for a single hour, which SQLite stored as REAL and the boards printed as-is.
+  const num = (v: any) => {
+    if (typeof v !== "number" || !isFinite(v)) return 0;
+    const n = Math.trunc(v);
+    if (Number.isSafeInteger(n)) return Math.max(0, n);
+    console.error(`external peer: dropping implausible token count ${v}`);
+    return 0;
+  };
+
+  // Output and input per hour are capped too. One stream writes roughly 100 tokens/s, about
+  // 360k an hour, and this box's busiest hour so far wrote 1.1M output. 50M allows for ~140
+  // parallel streams. The laptop once reported 6.02e9 output for 2026-09-23T18, which fits
+  // under 2^53 and so passed num(). Cache reads legitimately reach hundreds of millions an
+  // hour, so they stay uncapped. Totals are rebuilt from the kept parts.
+  const HOURLY_TOKEN_CAP = 50_000_000;
+  const hourPart = (v: any, what: string, hour: string) => {
+    const n = num(v);
+    if (n <= HOURLY_TOKEN_CAP) return n;
+    console.error(`external peer: dropping implausible ${what} ${n} for hour ${hour}`);
+    return 0;
+  };
 
   for (const p of peers) {
     if (!p?.url) continue;
@@ -94,8 +115,12 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
             if (!h?.hour_utc) continue;
             // a peer on the older export shape sends no parts; num() makes those 0,
             // which keeps the row loadable rather than dropping the hour entirely
-            insHours.run(peerName, user, String(h.hour_utc), num(h.total), num(h.output),
-                         num(h.input), num(h.cache_creation), num(h.cache_read));
+            const hour = String(h.hour_utc);
+            const output = hourPart(h.output, "output", hour), input = hourPart(h.input, "input", hour);
+            const cc = num(h.cache_creation), cr = num(h.cache_read);
+            // an older peer sends only total, so fall back to it when there are no parts
+            const total = output + input + cc + cr || num(h.total);
+            insHours.run(peerName, user, hour, total, output, input, cc, cr);
           }
           // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
           for (const mm of Array.isArray(u.models) ? u.models : []) {

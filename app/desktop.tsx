@@ -7,6 +7,11 @@
 // fallbacks, so the shell matches the chat window it wraps even if that stylesheet is absent.
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Clawd, Elapsed, confetti, fmtElapsed, type ClawdMood, type ClawdMove } from "./clawd";
+import { APPS } from "./apps";
+
+// The other vhosts on this box (survivor, parlay, umichresources). They open in a new tab, not a window.
+const SITES = APPS.filter((a) => a.external);
+const openSite = (href: string) => window.open(href, "_blank", "noopener");
 
 // #region types (the contract main.tsx wires against)
 export type DesktopTerminal = { id: string; title: string; state: string; since?: number };
@@ -29,6 +34,7 @@ const DEFAULTS: Record<string, { w: number; h: number; minW: number; minH: numbe
   claude: { w: 900, h: 720, minW: 420, minH: 320 },
   usage: { w: 760, h: 560, minW: 340, minH: 260 },
   brief: { w: 760, h: 560, minW: 340, minH: 260 },
+  yak: { w: 760, h: 560, minW: 340, minH: 260 },
   code: { w: 900, h: 640, minW: 420, minH: 300 },
   clawd: { w: 300, h: 260, minW: 240, minH: 220 },
   recycle: { w: 260, h: 150, minW: 220, minH: 130 },
@@ -125,7 +131,7 @@ const CSS = `
 .dk-sunken{box-shadow:var(--win-sunken,inset -1px -1px 0 #fff,inset 1px 1px 0 #0a0a0a,inset -2px -2px 0 #dfdfdf,inset 2px 2px 0 #808080);}
 
 /* ---------- desktop icons ---------- */
-.dk-icons{position:absolute;left:6px;top:6px;display:flex;flex-direction:column;gap:2px;}
+.dk-icons{position:absolute;left:6px;top:6px;bottom:calc(${TASKBAR_H}px + 6px + env(safe-area-inset-bottom));display:flex;flex-direction:column;flex-wrap:wrap;align-content:flex-start;gap:2px;}
 .dk-icon{width:76px;background:transparent;border:1px dotted transparent;padding:5px 2px;display:flex;flex-direction:column;align-items:center;gap:4px;color:#fff;font-size:11.5px;line-height:1.25;text-shadow:1px 1px 0 #004040,-1px -1px 0 #004040,1px -1px 0 #004040,-1px 1px 0 #004040;}
 .dk-icon-sel{background:rgba(0,0,128,.55);border-color:#fff;text-shadow:none;}
 .dk-icon-glyph{width:34px;height:34px;display:flex;align-items:center;justify-content:center;font-size:20px;line-height:0;}
@@ -142,7 +148,7 @@ const CSS = `
 .dk-tb-btns{flex:0 0 auto;display:flex;gap:2px;}
 .dk-tbtn{width:16px;height:14px;padding:0;line-height:1;font-size:10px;font-weight:700;background:#c0c0c0;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);display:flex;align-items:center;justify-content:center;color:#000;}
 .dk-tbtn:active{box-shadow:var(--win-sunken,inset -1px -1px 0 #fff,inset 1px 1px 0 #0a0a0a,inset -2px -2px 0 #dfdfdf,inset 2px 2px 0 #808080);}
-.dk-body{flex:1;min-height:0;position:relative;overflow:hidden;background:#fff;}
+.dk-body{flex:1;min-height:0;position:relative;overflow:hidden;background:#fff;-webkit-user-select:text;user-select:text;}
 .dk-body-visible{overflow:visible;}
 .dk-body iframe{display:block;width:100%;height:100%;border:0;}
 .dk-body-pad{padding:14px;font-size:12.5px;line-height:1.5;}
@@ -178,6 +184,7 @@ const CSS = `
 .dk-menu{position:absolute;background:#c0c0c0;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);padding:2px;min-width:150px;z-index:9000;}
 .dk-menu.dk-menu-embed{position:static;box-shadow:none;padding:0;min-width:0;}
 .dk-mi{width:100%;display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:12.5px;text-align:left;color:#000;position:relative;}
+.dk-mi>span:nth-child(2){min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .dk-mi:hover,.dk-mi.dk-mi-open{background:#000080;color:#fff;}
 .dk-mi-ic{flex:0 0 16px;display:flex;justify-content:center;font-size:13px;line-height:0;}
 .dk-mi-arrow{margin-left:auto;font-size:10px;}
@@ -192,9 +199,8 @@ const CSS = `
 
 /* ---------- pet ---------- */
 .dk-petlane{flex:1 1 48px;min-width:0;align-self:stretch;position:relative;}
-.dk-pet{position:absolute;left:0;bottom:6px;line-height:0;}px + env(safe-area-inset-bottom));z-index:4000;line-height:0;}
+.dk-pet{position:absolute;left:0;bottom:6px;line-height:0;cursor:pointer;}
 .dk-pet-flip{display:inline-block;}
-.dk-pet-bubble{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);margin-bottom:4px;background:#ffffe1;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);padding:4px 8px;font-size:11.5px;white-space:nowrap;color:#000;}
 
 /* ---------- shut down screen ---------- */
 .dk-shutdown{position:fixed;inset:0;background:#ff8c00;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:20000;cursor:pointer;text-align:center;font-size:15px;}
@@ -358,16 +364,16 @@ function Menu({ items, style, embedded, onClose }: { items: MenuItem[]; style?: 
 
 // #region the pet: a Clawd walking the taskbar edge
 const PET_SIZE = 1.3; // 29 x 20 px: fits inside the 36 px taskbar
-function Pet({ mood, danceKey }: { mood: ClawdMood; danceKey: number }) {
+function Pet({ mood, danceKey, paused, onOpen }: { mood: ClawdMood; danceKey: number; paused: boolean; onOpen: (r: DOMRect) => void }) {
   const outerRef = useRef<HTMLDivElement | null>(null);
   const flipRef = useRef<HTMLDivElement | null>(null);
   const posRef = useRef(24);
   const dirRef = useRef<1 | -1>(1);
   const dancingRef = useRef(false); // pauses the walk loop; Clawd overlays its own dance visuals via danceKey
-  const [bubble, setBubble] = useState<string | null>(null);
-  const bubbleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const moodRef = useRef(mood);
   moodRef.current = mood;
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   useEffect(() => {
     let raf = 0;
@@ -378,7 +384,7 @@ function Pet({ mood, danceKey }: { mood: ClawdMood; danceKey: number }) {
       raf = requestAnimationFrame(step);
       const dt = Math.min(0.05, (t - last) / 1000);
       last = t;
-      if (document.hidden || dancingRef.current || moodRef.current === "sleep") return;
+      if (document.hidden || dancingRef.current || pausedRef.current || moodRef.current === "sleep") return;
       const lane = outerRef.current?.parentElement?.clientWidth ?? 0;
       if (outerRef.current) outerRef.current.style.visibility = lane < W + 8 ? "hidden" : "";
       const max = Math.max(0, lane - W - 4);
@@ -405,17 +411,9 @@ function Pet({ mood, danceKey }: { mood: ClawdMood; danceKey: number }) {
     return () => clearTimeout(t);
   }, [danceKey]);
 
-  const LINES = ["shipping it", "tests pass!", "one more tool call", "reading 40 files…", "need anything?"];
-  const onTap = useCallback(() => {
-    setBubble(LINES[Math.floor(Math.random() * LINES.length)]);
-    if (bubbleTimer.current) clearTimeout(bubbleTimer.current);
-    bubbleTimer.current = setTimeout(() => setBubble(null), 2200);
-  }, []);
-  useEffect(() => () => { if (bubbleTimer.current) clearTimeout(bubbleTimer.current); }, []);
-
   return (
-    <div ref={outerRef} className="dk-pet" onPointerDownCapture={onTap}>
-      {bubble && <div className="dk-pet-bubble">{bubble}</div>}
+    // Capture phase: Clawd's own click handler stops propagation after starting its dance.
+    <div ref={outerRef} className="dk-pet" title="Chats" onClickCapture={() => { if (outerRef.current) onOpen(outerRef.current.getBoundingClientRect()); }}>
       <div ref={flipRef} className="dk-pet-flip">
         <Clawd size={PET_SIZE} mood={mood} danceKey={danceKey} move="d-hop" />
       </div>
@@ -507,6 +505,8 @@ export function Desktop(props: {
   chatBusySince: number | null;
   chatWaiting: boolean;
   otherBusy: { id: string; title: string; since?: number }[];
+  chats: { id: string; title: string; busy: boolean; waiting: boolean }[]; // most recent first, for Clawd's menu
+  onNewChat: () => void;
   modelLabel: string;
   onModelClick: () => void;
   onOpenChat: (id: string) => void;
@@ -761,7 +761,7 @@ export function Desktop(props: {
   const [startOpen, setStartOpen] = useState(false);
   const [shutdown, setShutdown] = useState(false);
   const [winMenu, setWinMenu] = useState<{ id: string; x: number; y: number } | null>(null);
-  const [taskMenu, setTaskMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [taskMenu, setTaskMenu] = useState<{ id: string; x: number; y: number; up?: boolean } | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -816,6 +816,7 @@ export function Desktop(props: {
     if (id === "claude") return props.chatTitle || "Claude";
     if (id === "usage") return "Usage";
     if (id === "brief") return "Morning brief";
+    if (id === "yak") return "Yak picks";
     if (id === "code") return "VS Code";
     if (id === "clawd") return "Clawd.exe";
     if (id === "recycle") return "Recycle Bin";
@@ -826,6 +827,7 @@ export function Desktop(props: {
     if (id === "claude") return "💬";
     if (id === "usage") return "📊";
     if (id === "brief") return "📰";
+    if (id === "yak") return "🐐";
     if (id === "code") return "</>";
     if (id === "clawd") return <Clawd size={0.55} mood="idle" title="" />;
     if (id === "recycle") return "🗑️";
@@ -835,6 +837,14 @@ export function Desktop(props: {
 
   const openWindowMenuItems = (id: string): MenuItem[] => {
     // Taskbar buttons for work with no open window: another chat ("chat:<id>") or a busy terminal tab.
+    if (id === "pet") return [
+      { label: "New chat", icon: "✏️", onClick: () => { props.onNewChat(); restoreWin("claude"); } },
+      ...props.chats.map((c) => ({
+        label: c.title,
+        icon: c.busy ? <TinyClawd mood="walk" /> : c.waiting ? <TinyClawd mood="needs" /> : "💬",
+        onClick: () => { props.onOpenChat(c.id); restoreWin("claude"); },
+      })),
+    ];
     if (id.startsWith("chat:")) return [{ label: "Open", onClick: () => { props.onOpenChat(id.slice(5)); restoreWin("claude"); } }];
     const w = layout.wins[id];
     if (isTerm(id) && !w?.open) return [
@@ -855,6 +865,7 @@ export function Desktop(props: {
     if (id === "claude") return props.chat;
     if (id === "usage") return <iframe ref={(el) => { iframeRefs.current[id] = el; }} src="/usage/" title="Usage" />;
     if (id === "brief") return <iframe ref={(el) => { iframeRefs.current[id] = el; }} src="/brief/" title="Morning brief" />;
+    if (id === "yak") return <iframe ref={(el) => { iframeRefs.current[id] = el; }} src="/yak/" title="Yak picks" />;
     if (id === "code") return <iframe ref={(el) => { iframeRefs.current[id] = el; }} src="/code/" title="VS Code" />;
     if (id === "clawd") return <ClawdExeBody />;
     if (id === "recycle") return <div className="dk-recycle"><span style={{ fontSize: 28 }}>🗑️</span><span>The Recycle Bin is empty.</span></div>;
@@ -921,7 +932,9 @@ export function Desktop(props: {
     },
     { label: "Usage", icon: "📊", onClick: () => openWinSafe("usage") },
     { label: "Morning brief", icon: "📰", onClick: () => openWinSafe("brief") },
+    { label: "Yak picks", icon: "🐐", onClick: () => openWinSafe("yak") },
     { label: "VS Code", icon: "</>", onClick: () => openWinSafe("code") },
+    { label: "Sites", icon: "🌐", sub: SITES.map((a) => ({ label: a.label, icon: a.icon, onClick: () => openSite(a.href) })) },
     { label: "Clawd.exe", icon: <Clawd size={0.8} title="" />, onClick: () => openWinSafe("clawd") },
     { label: "Tile windows", icon: "🪟", onClick: () => retile() },
     {
@@ -944,7 +957,9 @@ export function Desktop(props: {
         <DesktopIcon icon="⌨" label="Terminal" onOpen={() => void newTerminal()} />
         <DesktopIcon icon="📊" label="Usage" onOpen={() => openWinSafe("usage")} />
         <DesktopIcon icon="📰" label="Morning brief" onOpen={() => openWinSafe("brief")} />
+        <DesktopIcon icon="🐐" label="Yak picks" onOpen={() => openWinSafe("yak")} />
         <DesktopIcon icon="</>" label="VS Code" onOpen={() => openWinSafe("code")} />
+        {SITES.map((a) => <DesktopIcon key={a.id} icon={a.icon} label={a.label} onOpen={() => openSite(a.href)} />)}
         <DesktopIcon icon={<Clawd size={1.4} title="" />} label="Clawd.exe" onOpen={() => openWinSafe("clawd")} />
         <DesktopIcon icon="🗑️" label="Recycle Bin" onOpen={() => openWinSafe("recycle")} />
       </div>
@@ -955,7 +970,7 @@ export function Desktop(props: {
         <Menu items={openWindowMenuItems(winMenu.id)} style={{ left: winMenu.x, top: winMenu.y }} onClose={() => setWinMenu(null)} />
       )}
       {taskMenu && (
-        <Menu items={openWindowMenuItems(taskMenu.id)} style={{ left: taskMenu.x, top: taskMenu.y }} onClose={() => setTaskMenu(null)} />
+        <Menu items={openWindowMenuItems(taskMenu.id)} style={taskMenu.up ? { left: taskMenu.x, bottom: window.innerHeight - taskMenu.y + 4, maxWidth: 320 } : { left: taskMenu.x, top: taskMenu.y }} onClose={() => setTaskMenu(null)} />
       )}
 
       {startOpen && (
@@ -1016,7 +1031,8 @@ export function Desktop(props: {
           ))}
         </div>
         {/* Clawd walks in the empty stretch of the taskbar, so he never covers a window. */}
-        <div className="dk-petlane"><Pet mood={petMood} danceKey={props.finishedKey} /></div>
+        <div className="dk-petlane"><Pet mood={petMood} danceKey={props.finishedKey} paused={taskMenu?.id === "pet"}
+          onOpen={(r) => setTaskMenu((m) => (m?.id === "pet" ? null : { id: "pet", x: r.left, y: r.top, up: true }))} /></div>
         <div className="dk-tray">
           <button type="button" className="dk-well dk-well-btn" onClick={openClaudeThenModelClick} title="Model and effort">{props.modelLabel}</button>
           <div className="dk-well dk-clock">{clockLabel}</div>

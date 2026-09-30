@@ -34,6 +34,11 @@ export interface Artifact {
   // directory so refs inside it resolve next to the note instead of in the chat's cwd.
   convId?: string | null;
   baseDir?: string | null;
+  // Set when the text lives in a file the Edit tab can save back to: the path as the server
+  // resolved it, and the ETag it was read with, so a save can detect a change made in between.
+  path?: string;
+  etag?: string;
+  edit?: boolean; // open straight into the Edit tab (a chat message sent to the editor)
 }
 
 export type Segment =
@@ -542,43 +547,90 @@ export function ArtifactCard({ artifact, onOpen }: { artifact: Artifact; onOpen:
 // #endregion
 
 // #region ArtifactViewer
-type Tab = "preview" | "source";
+type Tab = "preview" | "source" | "edit";
+
+// A chat message opened in the editor. The id hashes the text, so reopening the same message brings
+// back the draft kept in localStorage.
+export function noteFromText(text: string, convId: string | null): Artifact {
+  return { id: `note-${shortHash(text)}`, kind: "markdown", lang: "markdown", code: text, title: "Note", convId, baseDir: null, edit: true };
+}
 
 // The live renderer. Works as an embedded right-hand panel (mode="panel", fills its container) or as
 // a full-screen sheet (mode="sheet"). main.tsx chooses which based on viewport width.
 export function ArtifactViewer({ artifact, mode, onClose, onBack, onOpen }: { artifact: Artifact; mode: ArtifactViewerMode; onClose: () => void; onBack?: () => void; onOpen?: (a: Artifact) => void }) {
-  const [tab, setTab] = useState<Tab>("preview");
+  const [tab, setTab] = useState<Tab>(artifact.edit ? "edit" : "preview");
+  // The Edit tab's text; Preview, Source, Copy and Download all read it, so they show the edits.
+  // A file-backed note saves to disk. Anything else keeps its draft in localStorage until it
+  // matches the original again. main.tsx keys the viewer by artifact id, so this resets per artifact.
+  const draftKey = artifact.path ? null : `ct-note-${artifact.id}`;
+  const [draft, setDraft] = useState<string>(() => (draftKey && localStorage.getItem(draftKey)) ?? artifact.code);
+  const [savedText, setSavedText] = useState(artifact.code);
+  const [etag, setEtag] = useState(artifact.etag || "");
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const dirty = !!artifact.path && draft !== savedText;
+  const shown = useMemo<Artifact>(() => (draft === artifact.code ? artifact : { ...artifact, code: draft }), [artifact, draft]);
+  useEffect(() => {
+    if (!draftKey) return;
+    try { if (draft === artifact.code) localStorage.removeItem(draftKey); else localStorage.setItem(draftKey, draft); } catch { /* storage full or blocked */ }
+  }, [draftKey, draft, artifact.code]);
   const [doc, setDoc] = useState<string>("");
   const [err, setErr] = useState<string | null>(null);
   const [building, setBuilding] = useState(true);
   const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (tab === "edit") return; // no rebuild per keystroke; the preview catches up when shown
     let live = true;
     setBuilding(true); setErr(null);
-    if (bodyRef.current) bodyRef.current.scrollTop = 0; // a note opened from a link starts at its top, not where the last one was scrolled to
-    buildArtifactDoc(artifact)
+    buildArtifactDoc(shown)
       .then((d) => { if (live) { setDoc(d); setBuilding(false); } })
       .catch((e: unknown) => { if (live) { setErr(e instanceof Error ? e.message : String(e)); setBuilding(false); } });
     return () => { live = false; };
-  }, [artifact.id, artifact.code, artifact.kind]);
+  }, [shown.id, shown.code, shown.kind, tab === "edit"]);
+  useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }, [artifact.id]); // a note opened from a link starts at its top
+
+  const save = useCallback(async (force = false): Promise<void> => {
+    if (!artifact.path) return;
+    setSaving(true); setSaveMsg(null);
+    try {
+      const r = await fetch("/app/api/save", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: artifact.convId || "", path: artifact.path, content: draft, etag, force }) });
+      const j = (await r.json().catch(() => ({}))) as { etag?: string; error?: string };
+      if (r.status === 409 && !force) {
+        if (window.confirm("This file changed on disk after you opened it. Overwrite it with your version?")) return save(true);
+        setSaveMsg("Not saved: changed on disk");
+        return;
+      }
+      if (!r.ok) { setSaveMsg("Not saved: " + (j.error || `HTTP ${r.status}`)); return; }
+      setEtag(j.etag || ""); setSavedText(draft); setSaveMsg("Saved");
+    } catch (e: unknown) {
+      setSaveMsg("Not saved: " + (e instanceof Error ? e.message : String(e)));
+    } finally { setSaving(false); }
+  }, [artifact.path, artifact.convId, draft, etag]);
+
+  // Leaving a file with unsaved edits asks first; the draft is not kept anywhere else.
+  const guard = useCallback((fn: () => void) => () => { if (!dirty || window.confirm("Discard unsaved changes?")) fn(); }, [dirty]);
 
   // Esc closes the full-screen sheet.
   useEffect(() => {
     if (mode !== "sheet") return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") (onBack || onClose)(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") guard(onBack || onClose)(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mode, onClose, onBack]);
+  }, [mode, onClose, onBack, guard]);
 
   const download = useCallback(() => {
-    const blob = new Blob([artifact.code], { type: "text/plain;charset=utf-8" });
+    const blob = new Blob([draft], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = `${(artifact.title || "artifact").replace(/[^\w.-]+/g, "_").slice(0, 40) || "artifact"}.${DOWNLOAD_EXT[artifact.kind]}`;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-  }, [artifact]);
+  }, [artifact, draft]);
+
+  const onEditKey = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") { e.preventDefault(); if (artifact.path) void save(); else download(); }
+  }, [artifact.path, save, download]);
 
   const openInTab = useCallback(() => {
     if (!doc) return;
@@ -594,29 +646,36 @@ export function ArtifactViewer({ artifact, mode, onClose, onBack, onOpen }: { ar
         {/* A note that links to another note replaces what is on screen, and an installed PWA draws
             no browser chrome, so without this there is no way back to the note you came from. */}
         {onBack && (
-          <button className="ct-av-back" onClick={onBack} title="Back" aria-label="Back">
+          <button className="ct-av-back" onClick={guard(onBack)} title="Back" aria-label="Back">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M15 5l-7 7 7 7" /></svg>
           </button>
         )}
         <div className="ct-av-tabs">
           <button className={"ct-av-tab" + (tab === "preview" ? " on" : "")} onClick={() => setTab("preview")}>Preview</button>
           <button className={"ct-av-tab" + (tab === "source" ? " on" : "")} onClick={() => setTab("source")}>Source</button>
+          <button className={"ct-av-tab" + (tab === "edit" ? " on" : "")} onClick={() => setTab("edit")}>Edit</button>
         </div>
-        <div className="ct-av-title" title={artifact.title}>{artifact.title}</div>
+        <div className="ct-av-title" title={artifact.path || artifact.title}>{dirty ? "• " : ""}{artifact.title}</div>
         <div className="ct-av-actions">
-          <CopyButton text={artifact.code} className="ct-av-btn" />
-          <button className="ct-av-btn" onClick={download} title="Download source"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>Save</button>
+          {saveMsg && <span className={"ct-av-savemsg" + (saveMsg === "Saved" ? "" : " err")}>{saveMsg}</span>}
+          {artifact.path && (
+            <button className="ct-av-btn ct-av-save" onClick={() => void save()} disabled={!dirty || saving} title={`Write to ${artifact.path} (Ctrl+S)`}>{saving ? "Saving…" : "Save"}</button>
+          )}
+          <CopyButton text={draft} className="ct-av-btn" />
+          <button className="ct-av-btn" onClick={download} title="Download a copy"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>{artifact.path ? null : "Save"}</button>
           <button className="ct-av-btn" onClick={openInTab} disabled={!doc} title="Open preview in a new tab"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M14 4h6v6" /><path d="M20 4l-9 9" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg></button>
-          <button className="ct-av-close" onClick={onClose} title="Close">
+          <button className="ct-av-close" onClick={guard(onClose)} title="Close">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
       </div>
       <div ref={bodyRef} className={"ct-av-body" + (artifact.kind === "markdown" && tab === "preview" ? " ct-av-mdbody" : "")}>
-        {tab === "preview" && artifact.kind === "markdown" ? (
+        {tab === "edit" ? (
+          <textarea className="ct-av-edit" value={draft} onChange={(e) => { setDraft(e.target.value); setSaveMsg(null); }} onKeyDown={onEditKey} spellCheck autoFocus={!!artifact.edit} aria-label="Edit text" />
+        ) : tab === "preview" && artifact.kind === "markdown" ? (
           // Rendered with the app's own markdown styles: dark theme, KaTeX, and .md links inside the
           // note open the next note in this same viewer.
-          <div className="ct-av-md md-root"><Markdown text={artifact.code} convId={artifact.convId ?? null} baseDir={artifact.baseDir} variant="note" onOpenArtifact={onOpen} /></div>
+          <div className="ct-av-md md-root"><Markdown text={draft} convId={artifact.convId ?? null} baseDir={artifact.baseDir} variant="note" onOpenArtifact={onOpen} /></div>
         ) : tab === "preview" ? (
           err ? (
             <div className="ct-av-error"><b>Could not render this artifact</b><pre>{err}</pre></div>
@@ -631,7 +690,7 @@ export function ArtifactViewer({ artifact, mode, onClose, onBack, onOpen }: { ar
             />
           )
         ) : (
-          <div className="ct-av-source"><CodeBlock code={artifact.code} lang={artifact.lang || artifact.kind} /></div>
+          <div className="ct-av-source"><CodeBlock code={draft} lang={artifact.lang || artifact.kind} /></div>
         )}
       </div>
     </div>
@@ -645,9 +704,11 @@ export function ArtifactViewer({ artifact, mode, onClose, onBack, onOpen }: { ar
 // back to the download: on iOS a download throws you out of the installed app.
 async function openNote(path: string, convId: string | null, open: (a: Artifact) => void): Promise<void> {
   const name = path.split("/").pop() || "note.md";
+  let etag = "";
   const read = async (p: string): Promise<string> => {
-    const r = await fetch(downloadUrl(convId, p));
+    const r = await fetch(downloadUrl(convId, p), { cache: "no-cache" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    etag = r.headers.get("etag") || "";
     return r.text();
   };
   let code: string | null = null;
@@ -668,7 +729,7 @@ async function openNote(path: string, convId: string | null, open: (a: Artifact)
   }
   open({
     id: `md-${shortHash(resolved)}`, kind: "markdown", lang: "markdown", code,
-    title: resolved.split("/").pop() || name, convId,
+    title: resolved.split("/").pop() || name, convId, path: resolved, etag,
     baseDir: resolved.includes("/") ? resolved.replace(/\/[^/]*$/, "") : null,
   });
 }
@@ -780,6 +841,10 @@ function injectArtifactCss() {
   .ct-av-frame{flex:1;width:100%;height:100%;border:none;background:#fff}
   .ct-av-source{flex:1;min-height:0;overflow:auto;background:var(--panel);padding:12px}
   /* viewer — markdown file preview (app theme, not the white iframe) */
+  .ct-av-edit{flex:1;min-height:0;width:100%;resize:none;border:none;outline:none;background:var(--panel);color:var(--text);font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:14px 16px 40px;tab-size:4}
+  .ct-av-savemsg{font-size:12px;color:var(--text-3);white-space:nowrap}
+  .ct-av-savemsg.err{color:var(--danger,#e0685f)}
+  .ct-av-save:not(:disabled){color:var(--text);border-color:var(--accent,var(--line))}
   .ct-av-mdbody{background:var(--panel);display:block;overflow:auto;-webkit-overflow-scrolling:touch}
   .ct-av-md{max-width:46rem;margin:0 auto;padding:16px 18px 40px}
   /* Obsidian callouts — > [!note]- Title becomes a <details>. The colour on the left edge is the

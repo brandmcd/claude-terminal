@@ -47,7 +47,7 @@ const HOME = process.env.HOME || `/home/${OWNER}`;
 const REG_DIR = join(HOME, ".claude", "tab-registry");
 const COUNTER_FILE = join(REG_DIR, ".counter");
 const SETTINGS = join(HOME, ".claude", "settings.json");
-const UPLOAD_DIR = "/tmp/claude-paste";
+const UPLOAD_DIR: string = cfg.uploadDir || "/tmp/claude-paste"; // one per Unix user when several share a box
 const MAX_BYTES = 20 * 1024 * 1024;
 const PUBLIC_DIR = join(import.meta.dir, "public");
 const overlayPath = join(import.meta.dir, "overlay.js");
@@ -176,6 +176,7 @@ const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 //   Fable 5   / Mythos 5     10    12.50      20         1.00        50
 //   Opus 5.5                  4     5.00       8         0.20        20     <- 0.05x read, not 0.1x
 //   Opus 5 / 4.8 / 4.7 / 4.6  5     6.25      10         0.50        25
+//   Sonnet 5.5                2     2.50       4         0.20        10
 //   Sonnet 5                  2     2.50       4         0.20        10     <- $2/$10 is now the standard price
 //   Sonnet 4.6                3     3.75       6         0.30        15
 //   Haiku 4.5                 1     1.25       2         0.10         5
@@ -200,6 +201,7 @@ const MODEL_PRICES: Record<string, Price> = {
   "claude-opus-4-7":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
   "claude-opus-4-6":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
   "claude-opus-4-5":   { input: 5, output: 25, write5m: 6.25, write1h: 10, read: 0.5 },
+  "claude-sonnet-5-5": { input: 2, output: 10, write5m: 2.5, write1h: 4, read: 0.2 },
   "claude-sonnet-5":   { input: 2, output: 10, write5m: 2.5, write1h: 4, read: 0.2 },
   "claude-sonnet-4-6": { input: 3, output: 15, write5m: 3.75, write1h: 6, read: 0.3 },
   "claude-sonnet-4-5": { input: 3, output: 15, write5m: 3.75, write1h: 6, read: 0.3 },
@@ -965,6 +967,7 @@ const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
   { id: "claude-opus-5", label: "Opus 5" },
   { id: "claude-opus-4-8", label: "Opus 4.8" },
   { id: "claude-opus-4-7", label: "Opus 4.7" },
+  { id: "claude-sonnet-5-5", label: "Sonnet 5.5" },
   { id: "claude-sonnet-5", label: "Sonnet 5" },
   { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
   { id: "claude-haiku-4-5", label: "Haiku 4.5" },
@@ -1022,6 +1025,14 @@ const appCtx: AppCtx = {
   // configured, so a vanilla install (and guest sidecars) simply never show the mic.
   sttUrl: cfg.sttUrl || (cfg.voice ? "http://127.0.0.1:7801" : undefined),
   ttsUrl: cfg.ttsUrl || (cfg.voice ? "http://127.0.0.1:7802" : undefined),
+  // ElevenLabs replaces Kokoro for voice out once `elevenLabs.keyFile` is readable and at least
+  // one voice is listed. The key stays in a root:ctuser file for the same reason as EXPORT_TOKEN.
+  elevenLabs: (() => {
+    const el = cfg.elevenLabs;
+    if (!el?.keyFile || !el.voices?.length) return undefined;
+    try { return { key: readFileSync(el.keyFile, "utf8").trim(), model: el.model || "eleven_v4_turbo", voices: el.voices }; }
+    catch (e) { console.error(`elevenLabs.keyFile ${el.keyFile} unreadable, using Kokoro:`, e); return undefined; }
+  })(),
   // Claude asked a question with no client streaming that conversation: push the owner so the
   // turn doesn't hang unseen. Suppressed when a device is actively watching that session.
   notifyAsk: (info) => {
