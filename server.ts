@@ -309,6 +309,30 @@ function externalModelMonthQuery() {
 // weight table to the model ids we export, so the export carries ids and raw output, not weights.
 const outputWeight = (model: string) => priceFor(model).output / BASELINE;
 
+// Weighted output per local user since a limit window opened (resets_at minus its length), so the
+// page can split each limit bar by who used it. Local transcripts only: claude.ai web/phone use
+// and external peers have no per-minute model split here, so they are not attributed.
+let qWindow: any = null, qWindowChecked = false;
+function windowShares(resetsAt: string | null, windowSec: number): Record<string, number> | null {
+  if (!db || !resetsAt) return null;
+  if (!qWindowChecked) {
+    qWindowChecked = true;
+    try {
+      if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get())
+        qWindow = db.query("SELECT user, model, SUM(output) AS output FROM model_usage WHERE minute_utc >= ? GROUP BY user, model");
+    } catch { qWindow = null; }
+  }
+  const end = Date.parse(resetsAt);
+  if (!qWindow || !isFinite(end)) return null;
+  const since = new Date(end - windowSec * 1000).toISOString().slice(0, 16);
+  const out: Record<string, number> = {};
+  try {
+    for (const r of qWindow.all(since) as any[]) out[r.user] = (out[r.user] || 0) + (r.output || 0) * outputWeight(r.model);
+  } catch { return null; }
+  for (const u of Object.keys(out)) out[u] = Math.round(out[u]);
+  return out;
+}
+
 // Latest claude.ai subscription rate-limit snapshot (the SHARED session + weekly limit everyone
 // on this box draws down, written by subscription-collector.ts). Prepared lazily because
 // subscription_samples only exists once a collector carrying that schema has run; a vanilla/old
@@ -338,8 +362,10 @@ function latestSubscription() {
     } catch { /* malformed JSON -> no fable window */ }
     return {
       subscription: r.subscription ?? null,
-      five_hour: { utilization: r.five_hour_util ?? null, resets_at: r.five_hour_reset ?? null },
-      seven_day: { utilization: r.seven_day_util ?? null, resets_at: r.seven_day_reset ?? null },
+      five_hour: { utilization: r.five_hour_util ?? null, resets_at: r.five_hour_reset ?? null,
+        by_user: windowShares(r.five_hour_reset, 5 * 3600) },
+      seven_day: { utilization: r.seven_day_util ?? null, resets_at: r.seven_day_reset ?? null,
+        by_user: windowShares(r.seven_day_reset, 7 * 86400) },
       fable,
       active_users: r.active_users ?? null,
       sampled_at: r.ts ?? null,
@@ -397,6 +423,7 @@ function buildExport() {
   // machine. Off by default -- the no-chaining rule above still holds for ordinary peers.
   if (cfg.exportCombinePeers) mergePeersIntoOwner(users, cutoff);
   coverModelGaps(users);
+  mergeExportGroups(users);
   return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(), users };
 }
 
@@ -454,6 +481,46 @@ function mergePeersIntoOwner(users: any[], cutoff: string): void {
 // weight table knows, which every puller falls back to weight 1 for. Sum of models per month
 // therefore equals the hourly output the same month exports.
 const UNMETERED_MODEL = "unmetered";
+// exportGroups: { "<row id>": { "name": "...", "members": ["sam", ...] } }. Replaces the
+// member rows in the export with one summed row, so a puller sees the group, not each
+// member. The local board keeps one row per member. Runs after coverModelGaps so
+// each member's unmetered gap is already in its models list. Model rows are summed by
+// (month, model) because the puller's INSERT OR REPLACE keeps only the last duplicate.
+function mergeExportGroups(users: any[]): void {
+  for (const [id, g] of Object.entries<any>(cfg.exportGroups || {})) {
+    const members = new Set<string>(g?.members || []);
+    const rows = users.filter((u) => members.has(u.user));
+    if (!rows.length) continue;
+    const cumulative = zeroParts();
+    const byHour = new Map<string, any>();
+    const byModel = new Map<string, { mk: string; model: string; output: number }>();
+    const models = new Set<string>();
+    const meta = { sessions: 0, models: "[]", last_activity: null as string | null };
+    for (const r of rows) {
+      addParts(cumulative, r.cumulative);
+      for (const h of r.hourly) {
+        let b = byHour.get(h.hour_utc);
+        if (!b) { b = { hour_utc: h.hour_utc, ...zeroParts() }; byHour.set(h.hour_utc, b); }
+        addParts(b, h);
+      }
+      for (const m of r.models || []) {
+        const k = `${m.mk}\u0000${m.model}`;
+        const acc = byModel.get(k);
+        if (acc) acc.output += m.output || 0;
+        else byModel.set(k, { mk: m.mk, model: m.model, output: m.output || 0 });
+      }
+      meta.sessions += r.meta.sessions || 0;
+      for (const m of JSON.parse(r.meta.models || "[]")) models.add(m);
+      if (r.meta.last_activity && (!meta.last_activity || r.meta.last_activity > meta.last_activity))
+        meta.last_activity = r.meta.last_activity;
+    }
+    meta.models = JSON.stringify([...models].sort());
+    const hourly = [...byHour.values()].sort((a, b) => (a.hour_utc < b.hour_utc ? -1 : 1));
+    const row = { user: id, name: g.name || titleCase(id), cumulative, meta, hourly, models: [...byModel.values()] };
+    users.splice(0, users.length, ...users.filter((u) => !members.has(u.user)), row);
+  }
+}
+
 function coverModelGaps(users: any[]): void {
   for (const row of users) {
     const models: { mk: string; model: string; output: number }[] = row.models || [];
@@ -989,6 +1056,11 @@ const appCtx: AppCtx = {
   downloadRoots: (cfg.downloadRoots as string[] | undefined) || [HOME],
   models: APP_MODELS,
   moreModels: APP_MORE_MODELS,
+  // Guest instances (the FTC team accounts): no Fable, a fixed default model, chat-only UI.
+  guest: !!cfg.appGuest,
+  defaultModel: typeof cfg.appDefaultModel === "string" ? cfg.appDefaultModel : undefined,
+  maxEffort: typeof cfg.appMaxEffort === "string" ? cfg.appMaxEffort : undefined,
+  board: !!cfg.appBoard, // the team to-do board window and /app/api/board (board.ts)
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
   readsFile: join(STATE_DIR, "claude-app-reads.json"),
@@ -1271,10 +1343,15 @@ const server = Bun.serve({
       if (kind !== "waiting" && isWatched(id)) {
         return Response.json({ ok: true, suppressed: true });
       }
-      const t = (await titleForSession(id)) || `Session ${id}`;
+      // `app: true` comes from ct-hook in an /app chat: `id` is then the conversation id, and the hook
+      // sends the chat title and the start of the reply, since there is no tab-registry entry to read.
+      const app = body.app === true;
+      const t = app
+        ? [body.chat, body.reply].filter(Boolean).map(String).join(": ").slice(0, 300) || "Chat"
+        : (await titleForSession(id)) || `Session ${id}`;
       const title = kind === "waiting" ? "⏳ Waiting for input" : "✅ Turn finished";
       const res = await pushAll({
-        title, body: t, url: "/app?arg=" + encodeURIComponent(id),
+        title, body: t, url: (app ? "/app?c=" : "/app?arg=") + encodeURIComponent(id),
         tag: "sess-" + id, sessionId: id, requireInteraction: kind === "waiting",
       });
       return Response.json({ ok: true, ...res });

@@ -384,6 +384,11 @@ const APP_UI_SYSTEM_APPEND = [
   "  user asks for a webpage, diagram, chart, SVG, or a small interactive component, return it as one",
   "  of those fenced blocks rather than only describing it.",
   "Keep normal prose in plain markdown; only reach for an artifact when a live preview genuinely helps.",
+  "- The UI shows your TodoWrite list in a task panel the user can read and edit while you work. When a",
+  "  task has three or more distinct steps or will take more than a few minutes, write a TodoWrite list",
+  "  before starting and keep it current as you go (load it first with ToolSearch \"select:TodoWrite\" if",
+  "  it is not in your tool list). Skip it for quick questions and one-step edits. If",
+  "  the user sends back an edited list from the panel, adopt it with TodoWrite and follow it.",
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.
@@ -1063,7 +1068,9 @@ export class Conversation {
         cwd: this.cwd,
         // Replace Claude Code's bare "Continue from where you left off." with a prompt that says a
         // restart interrupted the turn and to pick the work back up (see RESUME_PROMPT).
-        env: { ...(process.env as Record<string, string>), CLAUDE_CODE_RESUME_PROMPT: RESUME_PROMPT },
+        // The bundled CLI only offers its todo tools to older models. These two turn TodoWrite on for
+        // every model (and the TaskCreate family off), since the desktop task panel reads TodoWrite.
+        env: { ...(process.env as Record<string, string>), CLAUDE_CODE_RESUME_PROMPT: RESUME_PROMPT, CLAUDE_CODE_ENABLE_TODO_TOOLS: "1", CLAUDE_CODE_ENABLE_TASKS: "0" },
         ...(this.model ? { model: this.model } : {}),
         ...(this.resume ? { resume: this.resume } : {}),
         ...forkOpts,

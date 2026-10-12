@@ -330,9 +330,23 @@ a { color: var(--accent-2); }
   .pk-seg button { padding: 10px 2px; font-size: 13px; }
   .pk-select { padding: 10px 12px; }
 }
-/* Same width and centring as .composer, so the model pill and usage sit under the box, not at the window edges. */
-.composer-foot { display: flex; align-items: center; gap: 8px; padding: 8px 2px 0; max-width: 760px; margin: 0 auto; }
-.composer-foot .cf-spacer { flex: 1; }
+/* Composer row: model and effort stacked to the left of the box, usage to the right. The side columns
+   never shrink below their content; the box gives up width instead. */
+.composer-row { display: grid; grid-template-columns: minmax(max-content, 1fr) minmax(0, 760px) minmax(max-content, 1fr); gap: 12px; align-items: center; }
+.composer-row .composer { max-width: none; margin: 0; min-width: 0; }
+.cside { display: flex; align-items: center; gap: 8px; }
+.cside-left { justify-self: end; flex-direction: column; align-items: stretch; gap: 6px; }
+.cside-left .model-btn { width: 100%; justify-content: space-between; }
+.composer-row.narrow .cside-left .model-btn { width: auto; }
+.cside-right { justify-self: start; }
+.cside-nums { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+/* Narrow: the old layout, box on top and one line under it, pills left and usage right. */
+.composer-row.narrow { display: flex; flex-wrap: wrap; gap: 8px; }
+.composer-row.narrow .composer { order: -1; flex: 1 1 100%; }
+.composer-row.narrow .cside { padding: 0 2px; }
+.composer-row.narrow .cside-left { flex-direction: row; align-items: center; }
+.composer-row.narrow .cside-right { margin-left: auto; }
+.composer-row.narrow .cside-nums { flex-direction: row; align-items: center; gap: 8px; }
 
 /* model dialog (Other versions) */
 .modal-scrim { position: fixed; inset: 0; z-index: 70; background: var(--scrim); display: flex; align-items: center; justify-content: center; padding: 20px; }
@@ -541,6 +555,13 @@ a { color: var(--accent-2); }
   font-family: inherit; font-size: 15px; line-height: 1.5; max-height: 220px; padding: 6px 0; width: 100%;
 }
 .composer textarea::placeholder { color: var(--text-3); }
+.ta-wrap { position: relative; display: flex; }
+.ta-mirror {
+  position: absolute; inset: 0; overflow: hidden; pointer-events: none; color: var(--text);
+  font-family: inherit; font-size: 15px; line-height: 1.5; padding: 6px 0; white-space: pre-wrap; overflow-wrap: break-word;
+}
+.ta-mirror .ultra-word { font-weight: inherit; } /* bold would widen the word and push the caret out of line */
+.composer textarea.ta-hl { position: relative; color: transparent; caret-color: var(--text); }
 .composer-actions { display: flex; align-items: center; gap: 6px; }
 .composer-actions .spacer { flex: 1; }
 .act-btn { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 9px; background: transparent; border: none; color: var(--text-2); }
@@ -644,6 +665,7 @@ a { color: var(--accent-2); }
 .email-body:focus { outline: none; border-color: var(--accent); }
 .email-actions { gap: 8px; }
 .email-sig-label { margin-top: 10px; font-size: 12px; color: var(--text-3); }
+.email-sig-mode { margin-left: 6px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font-size: 12px; padding: 2px 6px; }
 .email-sig { margin-top: 4px; font-size: 13px; color: var(--text-3); }
 .email-cancel { background: transparent; color: var(--text-3); border: 1px solid var(--line); border-radius: 9px; padding: 8px 14px; font-size: 14px; }
 .email-cancel:hover { color: var(--text); border-color: var(--text-3); }
@@ -703,7 +725,7 @@ a { color: var(--accent-2); }
    everywhere a caret can land is the whole fix — maximum-scale=1 would "work" by disabling pinch
    zoom for good, which is worse. */
 @media (pointer: coarse) {
-  .composer textarea,
+  .composer textarea, .ta-mirror,
   .topbar-title-input,
   .sb-search input,
   .settings-select,
@@ -869,3 +891,78 @@ body.theme-retro .tool, body.theme-retro .tool-group, body.theme-retro .ct-code-
 /* In the desktop the reload prompt is anchored to the top of the chat window. Fixed to the bottom of
    the viewport, the taskbar covered half of it, and a window on the right could cover the rest. */
 .dk-desktop .update-toast { position: absolute; top: 10px; bottom: auto; }
+
+/* Ultrathink / ultracode / ultraresearch. Each mode gets its own palette and speed, from a slow violet
+   shimmer to a fast full-spectrum spin; the composer border, the effort pill, the send button and the
+   keyword in sent messages all pick it up. */
+@property --ua { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+.composer { --u-grad: linear-gradient(90deg, #ff5f6d, #ffc371, #f9f871, #47e891, #4facfe, #a166ff, #ff5f6d); }
+.ultra-think { --u-grad: linear-gradient(90deg, #a166ff, #ff7eb3, #4facfe, #a166ff); --u-cone: conic-gradient(from var(--ua), #a166ff, #ff7eb3, #4facfe, #a166ff); --u-speed: 5s; }
+.ultra-code { --u-grad: linear-gradient(90deg, #ff5f6d, #ffc371, #f9f871, #47e891, #4facfe, #a166ff, #ff5f6d); --u-cone: conic-gradient(from var(--ua), #ff5f6d, #ffc371, #f9f871, #47e891, #4facfe, #a166ff, #ff5f6d); --u-speed: 2.6s; }
+.ultra-research { --u-grad: linear-gradient(90deg, #ffd700, #ff5f6d, #a166ff, #4facfe, #47e891, #ffd700); --u-cone: conic-gradient(from var(--ua), #ffd700, #ff5f6d, #a166ff, #4facfe, #47e891, #ffd700); --u-speed: 1.5s; }
+@keyframes ultra-spin { to { --ua: 360deg; } }
+@keyframes ultra-shift { to { background-position: 200% center; } }
+@keyframes ultra-glow { 0%, 100% { box-shadow: 0 0 18px -4px rgba(161,102,255,.55); } 33% { box-shadow: 0 0 18px -4px rgba(79,172,254,.55); } 66% { box-shadow: 0 0 18px -4px rgba(255,95,109,.55); } }
+.ultra-word, .ultra-btn > span:first-child, .pk-ultra-btn.on .pk-ultra-name {
+  background: var(--u-grad); background-size: 200% auto; -webkit-background-clip: text; background-clip: text;
+  color: transparent; font-weight: 650; animation: ultra-shift var(--u-speed, 3s) linear infinite;
+}
+.ultra-chip { display: inline-block; padding: 0 9px; margin-top: 4px; border: 1px solid var(--line); border-radius: 999px; cursor: help; }
+.composer.ultra-on { position: relative; border-color: transparent; animation: ultra-glow calc(var(--u-speed) * 2) linear infinite; }
+.composer.ultra-on::before {
+  content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 2px; pointer-events: none;
+  background: var(--u-cone);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  animation: ultra-spin var(--u-speed) linear infinite;
+}
+.composer.ultra-on .send-btn:not(:disabled):not(.stop-btn) { background: var(--u-grad); background-size: 200% auto; color: #fff; animation: ultra-shift var(--u-speed) linear infinite; }
+.effort-btn { position: relative; overflow: visible; }
+.model-btn.ultra-btn { border-color: transparent; animation: ultra-glow calc(var(--u-speed) * 2) linear infinite; }
+/* One-shot sparkle burst from the pill each time a mode switches on. */
+.ultra-burst { position: absolute; left: 50%; top: 50%; width: 0; height: 0; pointer-events: none; }
+.ultra-burst i { position: absolute; left: -3px; top: -3px; width: 6px; height: 6px; border-radius: 50%; background: hsl(var(--a) 90% 62%); opacity: 0; animation: ultra-pop .9s ease-out; }
+@keyframes ultra-pop { 0% { opacity: 1; transform: rotate(var(--a)) translateX(4px) scale(1.2); } 100% { opacity: 0; transform: rotate(var(--a)) translateX(46px) scale(.2); } }
+/* The mode buttons in the effort panel: name over a one-line blurb, lit with the mode's colours. */
+.pk-ultra { display: flex; flex-direction: column; gap: 6px; margin: 0 6px 4px; }
+.model-menu .pk-ultra-btn {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px; padding: 8px 12px; text-align: left;
+  background: var(--bg-3); border: 1px solid var(--line); border-radius: 10px; transition: border-color .15s;
+}
+.model-menu .pk-ultra-btn:hover { border-color: var(--text-3); }
+.model-menu .pk-ultra-btn.on { position: relative; border-color: transparent; animation: ultra-glow calc(var(--u-speed) * 2) linear infinite; }
+.model-menu .pk-ultra-btn.on::before {
+  content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 2px; pointer-events: none; background: var(--u-cone);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0); animation: ultra-spin var(--u-speed) linear infinite;
+}
+.pk-ultra-name { font-size: 13.5px; font-weight: 600; }
+.pk-ultra-blurb { font-size: 12px; color: var(--text-3); line-height: 1.35; }
+
+/* Guest warning before an ultra mode: picture first, one big line, then the buttons. */
+.modal.ultra-warn { max-width: 380px; align-items: center; text-align: center; gap: 10px; padding: 22px 20px 18px; }
+.uw-art { width: 230px; max-width: 80%; color: var(--text); }
+.uw-flame { fill: #ff6a3d; transform-box: fill-box; transform-origin: center bottom; animation: uw-flicker .5s ease-in-out infinite alternate; }
+.uw-charge { transform-box: fill-box; transform-origin: left center; animation: uw-drain 2.2s ease-in infinite; }
+.uw-person { fill: var(--text-2); }
+@keyframes uw-drain { 0% { transform: scaleX(1); fill: #3fbf5f; } 55% { fill: #e8b030; } 85%, 100% { transform: scaleX(.05); fill: #e5484d; } }
+@keyframes uw-flicker { from { transform: scale(1, 1); } to { transform: scale(1.08, .92); } }
+.uw-big { font-size: 21px; font-weight: 750; line-height: 1.25; color: var(--danger); }
+.uw-small { font-size: 13px; line-height: 1.45; color: var(--text-3); }
+.uw-actions { display: flex; gap: 10px; width: 100%; margin-top: 6px; }
+.uw-actions button { flex: 1; padding: 12px 10px; border-radius: 10px; font: inherit; font-size: 15px; font-weight: 600; cursor: pointer; }
+.uw-no { background: var(--accent); color: var(--bg); border: none; }
+.uw-yes { background: transparent; color: var(--text-3); border: 1px solid var(--line); }
+body.theme-retro .model-menu .pk-ultra-btn, body.theme-retro .ultra-chip, body.theme-retro .uw-actions button { border-radius: 0; }
+body.theme-retro .uw-no { color: #000; }
+body.theme-retro .model-btn.ultra-btn, body.theme-retro .model-menu .pk-ultra-btn.on { animation: none; } /* keep the bevel */
+/* Yellow and pale stops vanish on the light and silver backgrounds, so the text darkens there. */
+body.theme-light .ultra-word, body.theme-light .ultra-btn > span:first-child, body.theme-light .pk-ultra-btn.on .pk-ultra-name,
+body.theme-retro .ultra-word, body.theme-retro .ultra-btn > span:first-child, body.theme-retro .pk-ultra-btn.on .pk-ultra-name { filter: brightness(.62) saturate(1.6); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ultra-word, .ultra-btn > span:first-child, .pk-ultra-btn.on .pk-ultra-name, .composer.ultra-on, .composer.ultra-on::before,
+  .composer.ultra-on .send-btn, .model-btn.ultra-btn, .model-menu .pk-ultra-btn.on, .model-menu .pk-ultra-btn.on::before,
+  .uw-flame, .uw-charge { animation: none; }
+  .ultra-burst { display: none; }
+}

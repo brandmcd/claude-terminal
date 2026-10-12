@@ -3,9 +3,39 @@
 # Writes the tab-registry files server.ts:308-321 reads and fires the push that
 # server.ts:582-598 expects. Hook JSON arrives on stdin. CT_TAB_ID comes from rt-entry.
 set -uo pipefail
-KIND="${1:?}"; ID="${CT_TAB_ID:-}"; [ -n "$ID" ] || exit 0
-REG="$HOME/.claude/tab-registry"; mkdir -p "$REG"
+KIND="${1:?}"; ID="${CT_TAB_ID:-}"
 PORT="${CT_SIDECAR_PORT:-7682}"
+
+# An /app chat has no tab id. Only the owner's sidecar (sdk-ts, user ctuser) gets a push, and only
+# for a finished turn: guests run as their own users, cron `claude -p` runs report another
+# entrypoint, and a question in /app is already pushed by the sidecar's notifyAsk. The server
+# suppresses it while a device is showing that chat.
+if [ -z "$ID" ]; then
+  [ "$KIND" = done ] && [ "${CLAUDE_CODE_ENTRYPOINT:-}" = sdk-ts ] && [ "$(id -un)" = ctuser ] \
+    && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || exit 0
+  BODY=$(python3 -c 'import json,sys
+d=json.load(sys.stdin); sid=sys.argv[1]
+reply=d.get("last_assistant_message") or ""; chat=""
+try:
+  f=open(d.get("transcript_path") or "", "rb"); f.seek(0,2); f.seek(max(0,f.tell()-1048576))
+  for line in f.read().decode("utf-8","replace").splitlines():
+    if "\"ai-title\"" in line or "\"custom-title\"" in line:
+      try: o=json.loads(line); chat=o.get("customTitle") or o.get("aiTitle") or chat
+      except Exception: pass
+    elif not d.get("last_assistant_message") and "\"assistant\"" in line:
+      try:
+        o=json.loads(line); t=" ".join(c.get("text","") for c in o["message"]["content"] if c.get("type")=="text").strip()
+        reply=t or reply
+      except Exception: pass
+except Exception: pass
+reply=" ".join(reply.split())[:200]
+print(json.dumps({"id":sid,"kind":"done","app":True,"chat":chat,"reply":reply}))' "$CLAUDE_CODE_SESSION_ID" 2>/dev/null) || exit 0
+  curl -fsS -m 5 -X POST "http://127.0.0.1:$PORT/notify/session" \
+    -H 'content-type: application/json' -d "$BODY" >/dev/null || true
+  exit 0
+fi
+
+REG="$HOME/.claude/tab-registry"; mkdir -p "$REG"
 PAYLOAD="$(cat)"
 
 if [ "$KIND" = "session" ]; then

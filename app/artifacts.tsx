@@ -21,7 +21,7 @@ import hljs from "highlight.js/lib/common";
 marked.setOptions({ gfm: true, breaks: true });
 
 // #region types
-export type ArtifactKind = "html" | "svg" | "react" | "js" | "mermaid" | "markdown";
+export type ArtifactKind = "html" | "svg" | "react" | "js" | "mermaid" | "markdown" | "file";
 
 export interface Artifact {
   id: string;          // stable-ish per message (index + content hash) so React keys/panels are stable
@@ -39,6 +39,10 @@ export interface Artifact {
   path?: string;
   etag?: string;
   edit?: boolean; // open straight into the Edit tab (a chat message sent to the editor)
+  // Set only for "file" artifacts, a local file opened from a chat link: its download URL and how
+  // the viewer shows it. "text" has the contents in code; "blob" is fetched by the viewer itself.
+  url?: string;
+  fileType?: "image" | "media" | "text" | "blob";
 }
 
 export type Segment =
@@ -209,7 +213,9 @@ function rewriteLocalRefs(html: string, convId: string | null, baseDir?: string 
       // so a long-press still offers "download", but no `download`/`target` attribute: on iOS both
       // of those throw you out of the installed PWA into Files or Safari.
       if (isMarkdownHref(href)) return `<a${pre} href="${dl(href)}" data-md="${abs(href).replace(/"/g, "&quot;")}"${post}>`;
-      return `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`; // local file
+      // Any other local file opens in the viewer too, for the same reason: the download route is
+      // inside the PWA's scope, so a new-tab link loads it in the app window with no way back.
+      return `<a${pre} href="${dl(href)}" data-file="${abs(href).replace(/"/g, "&quot;")}"${post}>`;
     });
 }
 
@@ -237,7 +243,7 @@ export function FileCard({ href, name, size }: { href: string; name: string; siz
   const icon = EXT_ICON[ext] || "📎";
   const sz = fmtBytes(size);
   return (
-    <a className="ct-file-card" href={href} target="_blank" rel="noreferrer" download title={`Download ${name}`}>
+    <a className="ct-file-card" href={href} target="_blank" rel="noreferrer" title={`Download ${name}`}>
       <span className="ct-file-ic" aria-hidden>{icon}</span>
       <span className="ct-file-meta">
         <span className="ct-file-name">{name}</span>
@@ -512,10 +518,11 @@ async function buildArtifactDoc(a: Artifact): Promise<string> {
     case "mermaid": return mermaidDoc(a.code);
     case "react": return reactDoc(a.code);
     case "markdown": return mdDoc(a.code);
+    case "file": return "";
   }
 }
 
-const DOWNLOAD_EXT: Record<ArtifactKind, string> = { html: "html", svg: "svg", js: "js", mermaid: "mmd", react: "jsx", markdown: "md" };
+const DOWNLOAD_EXT: Record<ArtifactKind, string> = { html: "html", svg: "svg", js: "js", mermaid: "mmd", react: "jsx", markdown: "md", file: "" };
 // #endregion
 
 // #region ArtifactCard
@@ -529,7 +536,7 @@ function KindIcon({ kind }: { kind: ArtifactKind }) {
   return (<svg {...common}><path d="M8 3L3 12l5 9" /><path d="M16 3l5 9-5 9" /></svg>);
 }
 
-const KIND_LABEL: Record<ArtifactKind, string> = { html: "HTML", svg: "SVG", react: "React", js: "Script", mermaid: "Diagram", markdown: "Markdown" };
+const KIND_LABEL: Record<ArtifactKind, string> = { html: "HTML", svg: "SVG", react: "React", js: "Script", mermaid: "Diagram", markdown: "Markdown", file: "File" };
 
 // Compact inline card. Tap "Open" (or the card) to launch the viewer.
 export function ArtifactCard({ artifact, onOpen }: { artifact: Artifact; onOpen: (a: Artifact) => void }) {
@@ -580,7 +587,7 @@ export function ArtifactViewer({ artifact, mode, onClose, onBack, onOpen }: { ar
   const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (tab === "edit") return; // no rebuild per keystroke; the preview catches up when shown
+    if (tab === "edit" || shown.kind === "file") return; // no rebuild per keystroke; a file has its own body
     let live = true;
     setBuilding(true); setErr(null);
     buildArtifactDoc(shown)
@@ -633,44 +640,53 @@ export function ArtifactViewer({ artifact, mode, onClose, onBack, onOpen }: { ar
   }, [artifact.path, save, download]);
 
   const openInTab = useCallback(() => {
+    if (artifact.url) { window.open(artifact.url, "_blank", "noopener"); return; }
     if (!doc) return;
     const blob = new Blob([doc], { type: "text/html;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     window.open(url, "_blank", "noopener");
     setTimeout(() => URL.revokeObjectURL(url), 30000);
-  }, [doc]);
+  }, [doc, artifact.url]);
+  const isFile = artifact.kind === "file";
+  // On a phone the viewer covers the chat, and an installed PWA draws no browser chrome, so the
+  // sheet always gets a back arrow. With no earlier note in the trail it returns to the chat.
+  const back = onBack || (mode === "sheet" ? onClose : undefined);
 
   return (
     <div className={"ct-av ct-av-" + mode}>
-      <div className="ct-av-head">
+      <div className={"ct-av-head" + (isFile ? " ct-av-head-file" : "")}>
         {/* A note that links to another note replaces what is on screen, and an installed PWA draws
-            no browser chrome, so without this there is no way back to the note you came from. */}
-        {onBack && (
-          <button className="ct-av-back" onClick={guard(onBack)} title="Back" aria-label="Back">
+            no browser chrome, so without this there is no way back to the note or chat you came from. */}
+        {back && (
+          <button className="ct-av-back" onClick={guard(back)} title="Back" aria-label="Back">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M15 5l-7 7 7 7" /></svg>
           </button>
         )}
-        <div className="ct-av-tabs">
+        {!isFile && <div className="ct-av-tabs">
           <button className={"ct-av-tab" + (tab === "preview" ? " on" : "")} onClick={() => setTab("preview")}>Preview</button>
           <button className={"ct-av-tab" + (tab === "source" ? " on" : "")} onClick={() => setTab("source")}>Source</button>
           <button className={"ct-av-tab" + (tab === "edit" ? " on" : "")} onClick={() => setTab("edit")}>Edit</button>
-        </div>
+        </div>}
         <div className="ct-av-title" title={artifact.path || artifact.title}>{dirty ? "• " : ""}{artifact.title}</div>
         <div className="ct-av-actions">
           {saveMsg && <span className={"ct-av-savemsg" + (saveMsg === "Saved" ? "" : " err")}>{saveMsg}</span>}
           {artifact.path && (
             <button className="ct-av-btn ct-av-save" onClick={() => void save()} disabled={!dirty || saving} title={`Write to ${artifact.path} (Ctrl+S)`}>{saving ? "Saving…" : "Save"}</button>
           )}
-          <CopyButton text={draft} className="ct-av-btn" />
-          <button className="ct-av-btn" onClick={download} title="Download a copy"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>{artifact.path ? null : "Save"}</button>
-          <button className="ct-av-btn" onClick={openInTab} disabled={!doc} title="Open preview in a new tab"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M14 4h6v6" /><path d="M20 4l-9 9" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg></button>
+          {!isFile && <CopyButton text={draft} className="ct-av-btn" />}
+          {!isFile && <button className="ct-av-btn" onClick={download} title="Download a copy"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>{artifact.path ? null : "Save"}</button>}
+          {isFile ? (
+            <button className="ct-av-btn" onClick={openInTab} title="Download or open outside the app"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg></button>
+          ) : <button className="ct-av-btn" onClick={openInTab} disabled={!doc} title="Open preview in a new tab"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M14 4h6v6" /><path d="M20 4l-9 9" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg></button>}
           <button className="ct-av-close" onClick={guard(onClose)} title="Close">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
       </div>
       <div ref={bodyRef} className={"ct-av-body" + (artifact.kind === "markdown" && tab === "preview" ? " ct-av-mdbody" : "")}>
-        {tab === "edit" ? (
+        {isFile ? (
+          <FileBody artifact={artifact} />
+        ) : tab === "edit" ? (
           <textarea className="ct-av-edit" value={draft} onChange={(e) => { setDraft(e.target.value); setSaveMsg(null); }} onKeyDown={onEditKey} spellCheck autoFocus={!!artifact.edit} aria-label="Edit text" />
         ) : tab === "preview" && artifact.kind === "markdown" ? (
           // Rendered with the app's own markdown styles: dark theme, KaTeX, and .md links inside the
@@ -734,6 +750,68 @@ async function openNote(path: string, convId: string | null, open: (a: Artifact)
   });
 }
 
+// Open a non-markdown local file in the viewer. The extension picks the display, since Bun's mime
+// guess is wrong for some source files (.ts comes back as video). HTML and SVG reuse the artifact
+// kinds, so they render sandboxed and get a Source tab. Text over MAX_TEXT is cut so highlighting
+// cannot freeze the page.
+const FILE_IMAGE_EXT = /\.(png|jpe?g|gif|webp|avif|bmp|ico|heic)$/i;
+const MEDIA_EXT = /\.(mp4|mov|m4v|webm|mp3|m4a|wav|ogg|flac|aac)$/i;
+const TEXT_EXT = /\.(txt|log|csv|tsv|json|jsonl|ya?ml|toml|ini|cfg|conf|env|xml|tex|bib|rst|py|ts|tsx|js|jsx|mjs|cjs|sh|bash|zsh|c|h|cc|cpp|hpp|rs|go|java|kt|swift|rb|lua|sql|css|scss|diff|patch|urdf|xacro|launch|srt|vtt)$/i;
+const MAX_TEXT = 1_000_000;
+async function openFile(path: string, convId: string | null, open: (a: Artifact) => void): Promise<void> {
+  const name = path.split("/").pop() || "file";
+  const url = downloadUrl(convId, path);
+  const base: Artifact = { id: `file-${shortHash(path)}`, kind: "file", lang: "", code: "", title: name, convId, url };
+  if (FILE_IMAGE_EXT.test(name)) return open({ ...base, fileType: "image" });
+  if (MEDIA_EXT.test(name)) return open({ ...base, fileType: "media" });
+  const ext = (name.match(/\.([A-Za-z0-9]+)$/)?.[1] || "").toLowerCase();
+  const asText = /\.(html?|svg)$/i.test(name) ? (ext === "svg" ? "svg" : "html") : TEXT_EXT.test(name) ? "text" : null;
+  if (!asText) return open({ ...base, fileType: "blob" });
+  let code: string;
+  try {
+    const r = await fetch(url, { cache: "no-cache" });
+    if (!r.ok) throw new Error(r.status === 404 ? "File not found" : `HTTP ${r.status}`);
+    code = await r.text();
+  } catch (e: unknown) {
+    return open({ ...base, fileType: "text", code: `${e instanceof Error ? e.message : String(e)}: ${path}` });
+  }
+  if (asText !== "text") return open({ ...base, kind: asText, lang: asText, code });
+  if (code.length > MAX_TEXT) code = code.slice(0, MAX_TEXT) + `\n\n[cut at ${MAX_TEXT.toLocaleString()} characters; download for the full file]`;
+  open({ ...base, fileType: "text", code, lang: ext });
+}
+
+// The body of a "file" artifact. PDFs and unknown types are fetched as a blob and framed from a
+// blob URL, because the download route sends them as attachments and a framed attachment would
+// download instead of display.
+function FileBody({ artifact }: { artifact: Artifact }) {
+  const [blob, setBlob] = useState<{ url: string; type: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    if (artifact.fileType !== "blob" || !artifact.url) return;
+    let live = true, made = "";
+    fetch(artifact.url, { cache: "no-cache" })
+      .then(async (r) => {
+        if (!r.ok) throw new Error(r.status === 404 ? "File not found" : `HTTP ${r.status}`);
+        const b = await r.blob();
+        if (!live) return;
+        made = URL.createObjectURL(b);
+        setBlob({ url: made, type: b.type || "" });
+      })
+      .catch((e: unknown) => { if (live) setErr(e instanceof Error ? e.message : String(e)); });
+    return () => { live = false; if (made) URL.revokeObjectURL(made); };
+  }, [artifact.url, artifact.fileType]);
+
+  if (artifact.fileType === "image") return <div className="ct-av-file ct-av-file-img"><img src={artifact.url} alt={artifact.title} /></div>;
+  if (artifact.fileType === "media") {
+    return <div className="ct-av-file ct-av-file-img">{/\.(mp3|m4a|wav|ogg|flac|aac)$/i.test(artifact.title) ? <audio controls src={artifact.url} /> : <video controls playsInline src={artifact.url} />}</div>;
+  }
+  if (artifact.fileType === "text") return <div className="ct-av-source"><CodeBlock code={artifact.code} lang={artifact.lang || undefined} /></div>;
+  if (err) return <div className="ct-av-error"><b>Could not open this file</b><pre>{err}</pre></div>;
+  if (!blob) return <div className="ct-av-loading"><span className="ct-av-spin" />Loading…</div>;
+  if (/^(application\/pdf|text\/|image\/)/.test(blob.type)) return <iframe className="ct-av-frame ct-av-file-frame" title={artifact.title} src={blob.url} />;
+  return <div className="ct-av-error"><b>No preview for this file type</b><pre>Use the download button above to save {artifact.title}.</pre></div>;
+}
+
 // #region AssistantContent (drop-in replacement for main.tsx's <Assistant>)
 function Markdown({ text, convId, baseDir, variant, onOpenArtifact }: { text: string; convId: string | null; baseDir?: string | null; variant?: "chat" | "note"; onOpenArtifact?: (a: Artifact) => void }) {
   const html = useMemo(() => {
@@ -745,13 +823,14 @@ function Markdown({ text, convId, baseDir, variant, onOpenArtifact }: { text: st
   // screen, full-screen sheet on a phone). Without this the link is a download, which on iOS leaves
   // the PWA. fetch() ignores the route's Content-Disposition, so no server change is needed to read.
   const onClick = useCallback((e: React.MouseEvent) => {
-    const a = (e.target as HTMLElement).closest?.("a[data-md]") as HTMLAnchorElement | null;
+    const a = (e.target as HTMLElement).closest?.("a[data-md], a[data-file]") as HTMLAnchorElement | null;
     if (!a) return;
     e.preventDefault(); // never navigate the PWA itself to the attachment response
     // No viewer to open into (the spawned-work transcript renderer mounts this without one): a new
     // tab is the old behaviour and keeps the chat where it is.
     if (!onOpenArtifact) { window.open(a.href, "_blank", "noopener"); return; }
-    void openNote(a.getAttribute("data-md") || "", convId, onOpenArtifact);
+    if (a.hasAttribute("data-md")) void openNote(a.getAttribute("data-md") || "", convId, onOpenArtifact);
+    else void openFile(a.getAttribute("data-file") || "", convId, onOpenArtifact);
   }, [onOpenArtifact, convId]);
   return <div className="md" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
@@ -835,6 +914,11 @@ function injectArtifactCss() {
   .ct-av-btn:disabled{opacity:.45;cursor:default}
   .ct-av-back{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;background:transparent;border:1px solid var(--line);color:var(--text-2);border-radius:8px}
   .ct-av-back:hover{background:var(--bg-3);color:var(--text)}
+  .ct-av-file{flex:1;min-width:0;overflow:auto}
+  .ct-av-file-img{display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box}
+  .ct-av-file-img img,.ct-av-file-img video{max-width:100%;max-height:100%;object-fit:contain}
+  .ct-av-file-img audio{width:100%;max-width:480px}
+  .ct-av-file-frame{background:#fff}
   .ct-av-close{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;background:transparent;border:1px solid var(--line);color:var(--text-2);border-radius:8px}
   .ct-av-close:hover{background:var(--bg-3);color:var(--text)}
   .ct-av-body{flex:1;min-height:0;position:relative;display:flex;background:#fff}
@@ -902,6 +986,7 @@ function injectArtifactCss() {
   :is(body.theme-light,body.theme-retro) .hljs-tag,:is(body.theme-light,body.theme-retro) .hljs-punctuation{color:#6b6259}
   @media (max-width:820px){
     .ct-av-head{gap:6px;padding:8px}.ct-av-title{display:none}.ct-av-btn span{display:none}
+    .ct-av-head-file .ct-av-title{display:block;text-align:left}
     .ct-av-sheet .ct-av-head{padding:calc(8px + env(safe-area-inset-top,0px)) calc(8px + env(safe-area-inset-right,0px)) 8px calc(8px + env(safe-area-inset-left,0px))}
   }
   `;

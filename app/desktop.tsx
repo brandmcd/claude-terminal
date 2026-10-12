@@ -8,6 +8,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Clawd, Elapsed, confetti, fmtElapsed, type ClawdMood, type ClawdMove } from "./clawd";
 import { APPS } from "./apps";
+import { TeamBoard, useBoard, boardCounts } from "./board";
 
 // The other vhosts on this box (survivor, parlay, umichresources). They open in a new tab, not a window.
 const SITES = APPS.filter((a) => a.external);
@@ -27,6 +28,9 @@ const isTerm = (id: string) => id.startsWith(TERM_PREFIX);
 const termSid = (id: string) => id.slice(TERM_PREFIX.length);
 const winIdFor = (sid: string) => TERM_PREFIX + sid;
 
+// The only windows a guest desktop opens.
+const GUEST_WINDOWS = new Set(["claude", "clawd", "recycle", "board"]);
+
 const TASKBAR_H = 36; // + env(safe-area-inset-bottom), added in CSS only
 
 // Default box for a window the first time it is ever opened (before any saved geometry exists).
@@ -37,6 +41,7 @@ const DEFAULTS: Record<string, { w: number; h: number; minW: number; minH: numbe
   yak: { w: 760, h: 560, minW: 340, minH: 260 },
   code: { w: 900, h: 640, minW: 420, minH: 300 },
   clawd: { w: 300, h: 260, minW: 240, minH: 220 },
+  board: { w: 560, h: 640, minW: 340, minH: 300 },
   recycle: { w: 260, h: 150, minW: 220, minH: 130 },
   term: { w: 640, h: 420, minW: 320, minH: 200 },
 };
@@ -162,6 +167,10 @@ const CSS = `
 .dk-clawdexe-btns{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;}
 .dk-btn{padding:5px 12px;background:#c0c0c0;box-shadow:var(--win-raised,inset -1px -1px 0 #0a0a0a,inset 1px 1px 0 #fff,inset -2px -2px 0 #808080,inset 2px 2px 0 #dfdfdf);font-size:12px;color:#000;}
 .dk-btn:active{box-shadow:var(--win-sunken,inset -1px -1px 0 #fff,inset 1px 1px 0 #0a0a0a,inset -2px -2px 0 #dfdfdf,inset 2px 2px 0 #808080);}
+.dk-start.dk-boardbtn{background:#d97757;color:#fff;gap:5px;padding-right:10px;}
+.dk-boardbtn .dk-badged{margin-right:12px;}
+.dk-badged{position:relative;display:inline-block;}
+.dk-badge{position:absolute;top:-6px;right:-12px;min-width:18px;height:18px;padding:0 4px;border-radius:9px;background:#d00;color:#fff;font:700 11px/18px system-ui,sans-serif;text-align:center;box-shadow:0 0 0 1px #fff;}
 .dk-recycle{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#000;font-size:12.5px;}
 
 /* ---------- taskbar ---------- */
@@ -513,6 +522,8 @@ export function Desktop(props: {
   finishedKey: number;
   openTerminalId?: string | null;
   onTheme: (t: "retro" | "dark" | "light") => void;
+  guest?: boolean; // guest instance (config appGuest): only the chat window, no terminals or owner pages
+  board?: boolean; // config appBoard: the Team To-Do window, opened on every load
 }): JSX.Element {
   injectCss();
 
@@ -550,6 +561,7 @@ export function Desktop(props: {
   // default position so repeated new windows don't stack exactly on top of each other), then open
   // and focus it, all in one state update, so there is no gap where it exists but isn't shown.
   const openWinSafe = useCallback((id: string) => {
+    if (props.guest && !GUEST_WINDOWS.has(id)) return;
     setLayout((l) => {
       const cascade = Object.keys(l.wins).length;
       const vw = window.innerWidth, vh = window.innerHeight;
@@ -562,7 +574,13 @@ export function Desktop(props: {
       return next;
     });
     setOrder((o) => (o.includes(id) ? o : [...o, id]));
-  }, [persist]);
+  }, [persist, props.guest]);
+
+  // The team board opens beside the chat on every load, even when a saved layout had it closed, so
+  // the team sees the list each time they log in. They can still close it for the rest of the visit.
+  useEffect(() => { if (props.board) openWinSafe("board"); }, [props.board, openWinSafe]);
+  const boardSnap = useBoard();
+  const bc = boardCounts(props.board ? boardSnap.board : null);
 
   const retile = useCallback(() => {
     setLayout((l) => { const next = tile(l, window.innerWidth, window.innerHeight); persist(next); return next; });
@@ -702,9 +720,10 @@ export function Desktop(props: {
   const { sessions, loaded: sessionsLoaded, createSession, closeSession, ensureKnown } = useSessions();
 
   const newTerminal = useCallback(async () => {
+    if (props.guest) return;
     const id = await createSession();
     openWinSafe(winIdFor(id));
-  }, [createSession, openWinSafe]);
+  }, [createSession, openWinSafe, props.guest]);
 
   const openTerminal = useCallback((sid: string) => {
     ensureKnown(sid);
@@ -820,6 +839,7 @@ export function Desktop(props: {
     if (id === "code") return "VS Code";
     if (id === "clawd") return "Clawd.exe";
     if (id === "recycle") return "Recycle Bin";
+    if (id === "board") return `Team To-Do (${bc.open} open${bc.unclaimed ? `, ${bc.unclaimed} unclaimed` : ""})`;
     if (isTerm(id)) return sessions.find((s) => s.id === termSid(id))?.title || "Terminal";
     return id;
   };
@@ -831,6 +851,7 @@ export function Desktop(props: {
     if (id === "code") return "</>";
     if (id === "clawd") return <Clawd size={0.55} mood="idle" title="" />;
     if (id === "recycle") return "🗑️";
+    if (id === "board") return "📋";
     if (isTerm(id)) return "⌨";
     return "🪟";
   };
@@ -868,6 +889,7 @@ export function Desktop(props: {
     if (id === "yak") return <iframe ref={(el) => { iframeRefs.current[id] = el; }} src="/yak/" title="Yak picks" />;
     if (id === "code") return <iframe ref={(el) => { iframeRefs.current[id] = el; }} src="/code/" title="VS Code" />;
     if (id === "clawd") return <ClawdExeBody />;
+    if (id === "board") return <TeamBoard />;
     if (id === "recycle") return <div className="dk-recycle"><span style={{ fontSize: 28 }}>🗑️</span><span>The Recycle Bin is empty.</span></div>;
     if (isTerm(id)) {
       const sid = termSid(id);
@@ -918,7 +940,20 @@ export function Desktop(props: {
   // ---- taskbar buttons: every id with open:true (minimized or not) ----
   const openIds = order.filter((id) => layout.wins[id]?.open);
 
-  const startMenuItems: MenuItem[] = [
+  const startMenuItems: MenuItem[] = props.guest ? [
+    { label: "Claude", icon: "💬", onClick: () => onTaskbarClick("claude") },
+    ...(props.board ? [{ label: "Team To-Do", icon: "📋", onClick: () => onTaskbarClick("board") }] : []),
+    { label: "Clawd.exe", icon: <Clawd size={0.8} title="" />, onClick: () => openWinSafe("clawd") },
+    { label: "Tile windows", icon: "🪟", onClick: () => retile() },
+    {
+      label: "Theme", icon: "🎨",
+      sub: [
+        { label: "Retro", onClick: () => props.onTheme("retro") },
+        { label: "Dark", onClick: () => props.onTheme("dark") },
+        { label: "Light", onClick: () => props.onTheme("light") },
+      ],
+    },
+  ] : [
     { label: "Claude", icon: "💬", onClick: () => onTaskbarClick("claude") },
     { label: "New terminal", icon: "⌨", onClick: () => void newTerminal() },
     {
@@ -954,12 +989,16 @@ export function Desktop(props: {
     <div className={"dk-desktop" + (interacting ? " dk-interacting" : "")} onPointerDown={() => { setStartOpen(false); setWinMenu(null); setTaskMenu(null); }}>
       <div className="dk-icons">
         <DesktopIcon icon="💬" label="Claude" onOpen={() => onTaskbarClick("claude")} />
+        {props.board && <DesktopIcon label="Team To-Do" onOpen={() => onTaskbarClick("board")}
+          icon={<span className="dk-badged">📋{bc.unclaimed > 0 && <span className="dk-badge">{bc.unclaimed}</span>}</span>} />}
+        {!props.guest && <>
         <DesktopIcon icon="⌨" label="Terminal" onOpen={() => void newTerminal()} />
         <DesktopIcon icon="📊" label="Usage" onOpen={() => openWinSafe("usage")} />
         <DesktopIcon icon="📰" label="Morning brief" onOpen={() => openWinSafe("brief")} />
         <DesktopIcon icon="🐐" label="Yak picks" onOpen={() => openWinSafe("yak")} />
         <DesktopIcon icon="</>" label="VS Code" onOpen={() => openWinSafe("code")} />
         {SITES.map((a) => <DesktopIcon key={a.id} icon={a.icon} label={a.label} onOpen={() => openSite(a.href)} />)}
+        </>}
         <DesktopIcon icon={<Clawd size={1.4} title="" />} label="Clawd.exe" onOpen={() => openWinSafe("clawd")} />
         <DesktopIcon icon="🗑️" label="Recycle Bin" onOpen={() => openWinSafe("recycle")} />
       </div>
@@ -993,8 +1032,15 @@ export function Desktop(props: {
         <button type="button" className={"dk-start" + (startOpen ? " dk-pressed" : "")} onClick={() => setStartOpen((s) => !s)}>
           <Clawd size={0.6} mood="idle" title="" /> Start
         </button>
+        {/* Pinned, so the team board is one click away even when its window is closed or covered. */}
+        {props.board && (
+          <button type="button" className={"dk-start dk-boardbtn" + (focusedId === "board" && layout.wins.board?.open && !layout.wins.board?.min ? " dk-pressed" : "")}
+            onClick={() => onTaskbarClick("board")} title={winTitle("board")}>
+            <span className="dk-badged">📋{bc.unclaimed > 0 && <span className="dk-badge">{bc.unclaimed}</span>}</span> Team To-Do
+          </button>
+        )}
         <div className="dk-tasklist">
-          {openIds.map((id) => (
+          {openIds.filter((id) => !(props.board && id === "board")).map((id) => (
             <button
               key={id}
               type="button"
@@ -1021,7 +1067,7 @@ export function Desktop(props: {
               <TinyClawd mood="walk" /><Elapsed since={b.since ?? null} className="dk-taskbtn-elapsed" />
             </button>
           ))}
-          {sessions.filter((t) => (t.state === "thinking" || t.state === "waiting") && !openIds.includes(winIdFor(t.id))).map((t) => (
+          {!props.guest && sessions.filter((t) => (t.state === "thinking" || t.state === "waiting") && !openIds.includes(winIdFor(t.id))).map((t) => (
             <button key={"tty:" + t.id} type="button" className="dk-taskbtn dk-taskbtn-active" title={t.title} onClick={() => openTerminal(t.id)}
               onContextMenu={(e) => { e.preventDefault(); setTaskMenu({ id: winIdFor(t.id), x: e.clientX, y: e.clientY }); }}>
               <span className="dk-taskbtn-ic">⌨</span>

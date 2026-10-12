@@ -7,10 +7,11 @@
 
 import { join, resolve } from "path";
 import { homedir } from "os";
-import { readdirSync, statSync, unlinkSync, rmSync } from "fs";
+import { readdirSync, statSync, unlinkSync, rmSync, mkdirSync, promises as fsp } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
+import { applyOp, readBoard, type Op } from "./board";
 import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getCapabilities, resolveEditPoints, type AppEvent, type AskNotifier, type SessionSettings } from "./app-runner";
 
 // Curated Kokoro voices (validated against the local TTS sidecar). Default af_heart matches the
@@ -42,6 +43,10 @@ export interface AppCtx {
   // one of those a 403: inline images rendered as a broken box with alt text, download cards 404'd.
   models: { id: string; label: string }[]; // quick picks
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
+  guest?: boolean; // cfg.appGuest: hide Fable, lead with defaultModel, and tell the client to show only the chat
+  defaultModel?: string; // cfg.appDefaultModel: what a new chat runs on when the client names no model
+  maxEffort?: string; // cfg.appMaxEffort: highest effort the menu offers and the server accepts (FTC accounts: "xhigh")
+  board?: boolean; // cfg.appBoard: serve the team to-do board (board.ts) and show its window
   favoritesFile: string; // JSON array of favorited session ids (server-side so it syncs across devices)
   titlesFile: string; // JSON map {sessionId: customTitle} — user-renamed conversations
   readsFile: string;  // JSON map {sessionId: lastReadMs} — per-conversation read marker, server-side so unread syncs across devices
@@ -60,6 +65,8 @@ export interface AppCtx {
 // #region send idempotency — dedupe a retried/redelivered turn by its client-supplied cid, so a flaky
 // link (a timeout requeue, the offline drain, or Background Sync) can never post the same message
 // twice. In-memory + short TTL: a redelivery only races within a few seconds of the original.
+// Models a guest instance may not pick (ct-guest-gate refuses them too).
+const GUEST_BLOCKED = /fable/i;
 const seenSends = new Map<string, { at: number; id: string }>();
 const SEND_DEDUP_TTL_MS = 2 * 60 * 1000;
 function dedupSeen(cid: unknown): { id: string } | null {
@@ -341,16 +348,20 @@ const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js
 // the session and never writes it to a settings file, which is why it is offered here at all.
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
+// The effort levels this instance accepts: all of them, or up to cfg.appMaxEffort.
+const effortAllowed = (ctx: AppCtx, lv: string) =>
+  EFFORT_LEVELS.includes(lv) && (!ctx.maxEffort || EFFORT_LEVELS.indexOf(lv) <= EFFORT_LEVELS.indexOf(ctx.maxEffort));
+
 // Read a settings blob off a request body into the whitelisted shape. Same four keys the
 // /app/api/settings route accepts; anything else in the body is dropped rather than forwarded into
 // Claude Code's flag settings layer. Returns undefined when there is nothing usable, so a new
 // conversation with no chosen effort gets no `settings` option at all.
-function sessionSettingsFrom(raw: unknown): SessionSettings | undefined {
+function sessionSettingsFrom(raw: unknown, ctx: AppCtx): SessionSettings | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const b = raw as Record<string, unknown>;
   const out: SessionSettings = {};
-  if (typeof b.effortLevel === "string" && EFFORT_LEVELS.includes(b.effortLevel)) out.effortLevel = b.effortLevel as SessionSettings["effortLevel"];
-  if (typeof b.advisorModel === "string" && b.advisorModel) out.advisorModel = b.advisorModel.slice(0, 64);
+  if (typeof b.effortLevel === "string" && effortAllowed(ctx, b.effortLevel)) out.effortLevel = b.effortLevel as SessionSettings["effortLevel"];
+  if (typeof b.advisorModel === "string" && b.advisorModel && !(ctx.guest && GUEST_BLOCKED.test(b.advisorModel))) out.advisorModel = b.advisorModel.slice(0, 64);
   if (typeof b.fastMode === "boolean") out.fastMode = b.fastMode;
   if (typeof b.alwaysThinkingEnabled === "boolean") out.alwaysThinkingEnabled = b.alwaysThinkingEnabled;
   return Object.keys(out).length ? out : undefined;
@@ -421,7 +432,24 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
         moreModels = ctx.moreModels.filter(survives);
       }
     } catch { /* keep config fallback */ }
-    return jsonRes({ models, moreModels, commands, agents, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && (ctx.ttsUrl || ctx.elevenLabs)), voices: ctx.elevenLabs ? ctx.elevenLabs.voices : ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: ctx.elevenLabs ? ctx.elevenLabs.voices[0].id : "af_heart" }, ctx, req);
+    if (ctx.guest) {
+      // "default" and the bare aliases resolve to whatever the CLI picks (Opus), so a guest menu
+      // carries only concrete ids, with the configured default first. The client starts a new
+      // chat on models[0].
+      const ok = (m: { id: string; resolvedModel?: string }) => !GUEST_BLOCKED.test(m.id) && !GUEST_BLOCKED.test(m.resolvedModel || "") && m.id !== "default";
+      models = models.filter(ok);
+      moreModels = moreModels.filter(ok);
+      const d = ctx.defaultModel;
+      if (d) models = [...models.filter((m) => m.id === d), ...(models.some((m) => m.id === d) ? [] : [{ id: d, label: d }]), ...models.filter((m) => m.id !== d)];
+    }
+    if (ctx.maxEffort) {
+      // The client offers every level when a row lists none (and assumes effort for a 5-family
+      // config row), so each such row gets an explicit list that stops at the ceiling.
+      const cap = (m: any) => (m.supportedEffortLevels || m.supportsEffort || /-5(-|$)/.test(m.id) ? { ...m, supportedEffortLevels: (m.supportedEffortLevels || EFFORT_LEVELS).filter((lv: string) => effortAllowed(ctx, lv)) } : m);
+      models = models.map(cap);
+      moreModels = moreModels.map(cap);
+    }
+    return jsonRes({ guest: !!ctx.guest, board: !!ctx.board, models, moreModels, commands, agents, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && (ctx.ttsUrl || ctx.elevenLabs)), voices: ctx.elevenLabs ? ctx.elevenLabs.voices : ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: ctx.elevenLabs ? ctx.elevenLabs.voices[0].id : "af_heart" }, ctx, req);
   }
 
   // --- MCP server management (the tools the LLM can call in /app chats) ---
@@ -850,11 +878,12 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     let cwd: string = ctx.defaultCwd;
     if (resume) { const found = findTranscript(ctx, resume); if (found) { const m = await convMeta(found.path); if (m.cwd) cwd = m.cwd; } }
     if (typeof b.cwd === "string" && b.cwd.startsWith("/")) cwd = b.cwd;
-    const model: string | undefined = typeof b.model === "string" && b.model ? b.model : undefined;
+    const model: string | undefined = typeof b.model === "string" && b.model ? b.model : ctx.defaultModel;
+    if (ctx.guest && model && GUEST_BLOCKED.test(model)) return jsonRes({ error: "This account cannot use Fable. Pick another model." }, ctx, req, 400);
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
     if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.send(text, typeof b.cid === "string" ? b.cid : undefined); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
-    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile, settings: sessionSettingsFrom(b.settings) });
+    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile, settings: sessionSettingsFrom(b.settings, ctx) });
     tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
     void conv.run(text, typeof b.cid === "string" ? b.cid : undefined);
     dedupRecord(b.cid, conv.id);
@@ -920,6 +949,7 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     const conv = b.id ? get(String(b.id)) : undefined;
     if (!conv) return jsonRes({ error: "no live conversation" }, ctx, req, 409);
     if (typeof b.model !== "string" || !b.model) return jsonRes({ error: "model required" }, ctx, req, 400);
+    if (ctx.guest && GUEST_BLOCKED.test(b.model)) return jsonRes({ error: "This account cannot use Fable. Pick another model." }, ctx, req, 400);
     await conv.setModel(b.model);
     return jsonRes({ ok: true, model: b.model }, ctx, req);
   }
@@ -935,9 +965,10 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if ("effortLevel" in b) {
       const v = b.effortLevel;
       if (v === null) patch.effortLevel = null;
-      else if (EFFORT_LEVELS.includes(String(v))) patch.effortLevel = String(v) as SessionSettings["effortLevel"];
-      else return jsonRes({ error: `effortLevel must be null or one of ${EFFORT_LEVELS.join(", ")}` }, ctx, req, 400);
+      else if (effortAllowed(ctx, String(v))) patch.effortLevel = String(v) as SessionSettings["effortLevel"];
+      else return jsonRes({ error: `effortLevel must be null or one of ${EFFORT_LEVELS.filter((lv) => effortAllowed(ctx, lv)).join(", ")}` }, ctx, req, 400);
     }
+    if (ctx.guest && b.advisorModel && GUEST_BLOCKED.test(String(b.advisorModel))) return jsonRes({ error: "This account cannot use Fable. Pick another advisor model." }, ctx, req, 400);
     if ("advisorModel" in b) patch.advisorModel = b.advisorModel === null ? null : String(b.advisorModel).slice(0, 64);
     if ("fastMode" in b) patch.fastMode = b.fastMode === null ? null : !!b.fastMode;
     if ("alwaysThinkingEnabled" in b) patch.alwaysThinkingEnabled = b.alwaysThinkingEnabled === null ? null : !!b.alwaysThinkingEnabled;
@@ -983,6 +1014,24 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
     if (!(file instanceof File)) return jsonRes({ error: "no file" }, ctx, req, 400);
     const safe = file.name.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "upload";
     const destDir = join(cwd, "uploads");
+    // Chunked mode: Cloudflare caps each request body at 100 MB, so the client sends larger files in
+    // pieces. Each piece is written at its offset into a .part file; the last one renames it into place.
+    // Writing at the offset (rather than appending) makes a retried piece harmless.
+    const uploadId = String(form.get("uploadId") || "");
+    if (uploadId) {
+      if (!/^[A-Za-z0-9-]{8,64}$/.test(uploadId)) return jsonRes({ error: "bad uploadId" }, ctx, req, 400);
+      const offset = Number(form.get("offset"));
+      const part = join(destDir, `.${safe}.${uploadId}.part`);
+      let have = 0; try { have = statSync(part).size; } catch {}
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > have) return jsonRes({ error: `bad offset ${offset}, have ${have}` }, ctx, req, 409);
+      try {
+        mkdirSync(destDir, { recursive: true });
+        const fh = await fsp.open(part, offset === 0 ? "w" : "r+");
+        try { await fh.write(new Uint8Array(await file.arrayBuffer()), 0, file.size, offset); } finally { await fh.close(); }
+        if (form.get("done") === "1") { await fsp.rename(part, join(destDir, safe)); return jsonRes({ ok: true, path: join(destDir, safe) }, ctx, req); }
+      } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 500); }
+      return jsonRes({ ok: true, received: offset + file.size }, ctx, req);
+    }
     try { await Bun.write(join(destDir, safe), file); } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 500); }
     return jsonRes({ ok: true, path: join(destDir, safe) }, ctx, req);
   }
@@ -1032,6 +1081,18 @@ export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promis
       }
     }
     return jsonRes({ error: "not found" }, ctx, req, 404);
+  }
+
+  // Team to-do board (board.ts). GET returns the whole board; POST applies one operation on one item,
+  // so two people editing different items never overwrite each other. `who` is the name the person
+  // typed in the window; one PIN login is shared by the whole team, so the server cannot know it.
+  if (ctx.board && path === "/app/api/board" && (req.method === "GET" || req.method === "POST")) {
+    if (req.method === "GET") return jsonRes(readBoard(), ctx, req);
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const ops = ["add", "edit", "claim", "done", "delete", "clearDone"];
+    if (!b || !ops.includes(b.op)) return jsonRes({ error: "unknown op" }, ctx, req, 400);
+    try { return jsonRes(applyOp(b as Op, String(b.who || "")).board, ctx, req); }
+    catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
   }
 
   // Save a text file edited in the viewer's Edit tab. Same roots as the download route, limited to

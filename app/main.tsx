@@ -12,6 +12,8 @@ import * as offline from "./offline";
 import { AssistantContent, ArtifactViewer, noteFromText, type Artifact } from "./artifacts";
 import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
+import { TaskPanel } from "./taskpanel";
+import { BoardStrip } from "./board";
 import { ConnectionsModal } from "./connections";
 import { Clawd, Elapsed } from "./clawd";
 import { Desktop } from "./desktop";
@@ -168,11 +170,48 @@ function prettyModel(id: string): string {
 
 // "xhigh" -> "X-high", every other level simply capitalised. Used by the effort row and the pill.
 const effortName = (lv: string) => (lv === "xhigh" ? "X-high" : lv.charAt(0).toUpperCase() + lv.slice(1));
+// The two prompt keywords the CLI reacts to. "ultrathink" asks for deeper reasoning on the turn it
+// appears in; "ultracode" opts the turn into the Workflow tool (multi-agent orchestration). Both are
+// matched as whole words anywhere in the prompt, so the app turns one on by appending the word.
+// "ultraresearch" is this app's own mode: ultracode plus a protocol for a long run in which agents
+// share one notebook on disk and split oversized parts again. The CLI only sees the ultracode word
+// inside the block; the rest is instructions.
+type UltraMode = "" | "ultrathink" | "ultracode" | "ultraresearch";
+const ULTRA_RE = /\b(ultrathink|ultracode)\b/gi;
+const RESEARCH_RE = /<ultraresearch>[\s\S]*?<\/ultraresearch>/;
+const RESEARCH_BLOCK = `<ultraresearch>
+ultracode. This is a long-horizon research run that may take many hours. Scale the number of agents to the problem rather than to the default workflow size guideline.
+
+1. Before delegating, open a shared notebook: a directory research/<short-slug>/ under the working directory holding NOTEBOOK.md, with the sections Goal, Plan, Findings (dated entries, each signed with the agent's label), Open questions and Next steps.
+2. Split the job into independent parts and give each part to an agent. Tell every agent the notebook path, to read it before starting, and to append its findings and sources there as it goes, not only in its final report. An agent whose part is still too large splits it again and delegates the pieces the same way, where its tools allow.
+3. Agents save long outputs (data, code, drafts) as files in the notebook directory and link them from NOTEBOOK.md.
+4. After each round, read the notebook, reconcile conflicting findings, update Plan and Next steps, and start the next round. Verify any claim that later work depends on before building on it.
+5. Keep Next steps current so the run can resume from the notebook after a compaction, a restart, or a message that says "continue".
+6. Finish with a summary at the top of NOTEBOOK.md and in the reply: what was found, how confident you are, and what is unresolved.
+</ultraresearch>`;
+const ultraName = (m: string) => m.charAt(0).toUpperCase() + m.slice(1);
+const withUltra = (text: string, mode: UltraMode) => {
+  if (mode === "ultraresearch") return RESEARCH_RE.test(text) ? text : `${text}\n\n${RESEARCH_BLOCK}`;
+  return !mode || new RegExp(`\\b${mode}\\b`, "i").test(text) ? text : `${text}\n\n${mode}`;
+};
+// The keywords render in rainbow wherever they appear in a user turn, as they do in the terminal. The
+// research protocol block collapses to one chip; its full text is in the chip's tooltip.
+const keywordSpans = (text: string, base: number): React.ReactNode[] =>
+  text.split(ULTRA_RE).map((part, k) => (k % 2 ? <span key={base + k} className={"ultra-word ultra-" + part.toLowerCase().slice(5)}>{part}</span> : part));
+const ultraSpans = (text: string): React.ReactNode => {
+  const m = text.match(RESEARCH_RE);
+  if (!m) return keywordSpans(text, 0);
+  const before = text.slice(0, m.index).replace(/\s+$/, ""), after = text.slice(m.index! + m[0].length);
+  return [...keywordSpans(before, 0), before ? "\n" : "", <span key="research" className="ultra-word ultra-research ultra-chip" title={m[0]}>ultraresearch</span>, ...keywordSpans(after, 1000)];
+};
 
 // #region api
 const J = (r: Response) => r.json();
+class SignedOut extends Error {}
 // Cloudflare rejects request bodies over 100 MB on this plan; nginx's client_max_body_size matches.
-const MAX_UPLOAD_MB = 100;
+// Files larger than one chunk go up in pieces (app-server.ts /app/api/upload, chunked mode), so there
+// is no overall size limit beyond free disk space.
+const UPLOAD_CHUNK = 64 * 1024 * 1024;
 // Reject a request that hasn't resolved within `ms`. A hung POST on a weak link never rejects on its
 // own, so without this a send would sit "sending" forever and never fall back to the offline queue.
 function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
@@ -279,15 +318,36 @@ const api = {
   setSettings: (b: { id: string } & SessionSettings) =>
     fetch("/app/api/settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   interrupt: (id: string) => fetch("/app/api/interrupt", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }),
-  upload: (id: string | null, file: File) => {
-    const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
-    // A 413 from nginx or Cloudflare is an HTML page, not JSON, so check the status before parsing.
-    return fetch("/app/api/upload", { method: "POST", body: fd }).then(async (r) => {
-      if (r.status === 413) throw new Error(`${file.name} is over the ${MAX_UPLOAD_MB} MB upload limit`);
+  upload: async (id: string | null, file: File) => {
+    const post = async (fd: FormData) => {
+      const r = await fetch("/app/api/upload", { method: "POST", body: fd });
+      // A 413 from nginx or Cloudflare is an HTML page, not JSON, so check the status before parsing.
+      if (r.status === 413) throw new Error(`${file.name} failed to upload: request too large`);
       const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j?.path) throw new Error(`${file.name} failed to upload: ${j?.error || `HTTP ${r.status}`}`);
+      if (!r.ok) throw new Error(`${file.name} failed to upload: ${j?.error || `HTTP ${r.status}`}`);
       return j;
-    });
+    };
+    if (file.size <= UPLOAD_CHUNK) {
+      const fd = new FormData(); fd.append("file", file); if (id) fd.append("id", id);
+      const j = await post(fd);
+      if (!j?.path) throw new Error(`${file.name} failed to upload: no path returned`);
+      return j;
+    }
+    const uploadId = crypto.randomUUID();
+    let j: any;
+    for (let offset = 0; offset < file.size; offset += UPLOAD_CHUNK) {
+      const end = Math.min(offset + UPLOAD_CHUNK, file.size);
+      const fd = new FormData();
+      fd.append("file", file.slice(offset, end), file.name); if (id) fd.append("id", id);
+      fd.append("uploadId", uploadId); fd.append("offset", String(offset)); if (end === file.size) fd.append("done", "1");
+      // Retry a failed piece a few times; the server writes at the offset, so a resend is safe.
+      for (let attempt = 1; ; attempt++) {
+        try { j = await post(fd); break; }
+        catch (e) { if (attempt >= 3) throw e; await new Promise((r) => setTimeout(r, 1000 * attempt)); }
+      }
+    }
+    if (!j?.path) throw new Error(`${file.name} failed to upload: no path returned`);
+    return j;
   },
   reads: () => withTimeout(fetch("/app/api/reads").then(J)),
   pushReads: (reads: Record<string, number>) =>
@@ -301,7 +361,10 @@ const api = {
   context: (id: string) => withTimeout(fetch(`/app/api/context?id=${encodeURIComponent(id)}`).then(J)),
   compact: (id: string) => fetch("/app/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
   usage: () => withTimeout(fetch("/app/api/usage").then(J)),
-  statuses: () => withTimeout(fetch("/app/api/statuses").then(J)),
+  // redirect "manual": an expired Cloudflare Access login answers with a cross-origin redirect to the
+  // login page, which a followed fetch reports as a plain network error. Seen unfollowed, it is an
+  // opaqueredirect, so the poll can tell "signed out" apart from "link down".
+  statuses: () => withTimeout(fetch("/app/api/statuses", { redirect: "manual" }).then((r) => { if (r.type === "opaqueredirect") throw new SignedOut(); return J(r); })),
   search: (q: string) => withTimeout(fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J)),
   answerAsk: (id: string, askId: string, answer: string) =>
     fetch("/app/api/ask-answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, askId, answer }) }).then(J),
@@ -911,7 +974,7 @@ function rewriteLocalRefs(html: string, convId: string | null): string {
     .replace(/<a([^>]*?)\shref="([^"]+)"([^>]*)>/g, (m, pre, href, post) => {
       if (/^https?:/i.test(href)) return `<a${pre} href="${href}"${post} target="_blank" rel="noreferrer noopener">`; // external -> new tab, keep the chat open
       if (/^(mailto:|tel:|#|\/app\/api\/)/i.test(href)) return m; // mail/anchor/download handled elsewhere
-      return `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer" download>`; // local file
+      return `<a${pre} href="${dl(href)}"${post} target="_blank" rel="noreferrer">`; // local file; no `download` attribute, or a missing file saves the JSON 404 as download.json
     });
 }
 
@@ -1158,7 +1221,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
         <div className="bubble-user" {...menuBind(body || it.text, "user")}>
           {images.map((p, k) => <img key={k} className="msg-img" loading="lazy" src={`/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`} alt="attachment" />)}
           {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
-          {body && <div className="bubble-user-text">{body}</div>}
+          {body && <div className="bubble-user-text">{ultraSpans(body)}</div>}
         </div>
         {raPill}
         {(sendStatus === "queued" || sendStatus === "failed") && <div className="send-ticks-row"><SendTicks state={sendStatus} /></div>}
@@ -1268,6 +1331,8 @@ registerTranscriptRenderer({
 
 function App() {
   const [models, setModels] = useState<Model[]>([]);
+  const [board, setBoard] = useState(false); // /app/api/models says this instance has the team to-do board
+  const [guest, setGuest] = useState(false); // /app/api/models says this is a guest instance: chat only
   const [moreModels, setMoreModels] = useState<Model[]>([]);
   // The CLI's own slash commands and subagents, for the composer's command menu.
   const [commands, setCommands] = useState<Command[]>([]);
@@ -1303,6 +1368,17 @@ function App() {
   // The model the advisor tool consults. Same three-layer shape again: "" means "leave it to
   // ~/.claude/settings.json's own advisorModel" rather than forcing one.
   const [defaultAdvisor, setDefaultAdvisor] = useState<string>(() => localStorage.getItem("ct-app-advisor") || "");
+  // Ultrathink / ultracode. One remembered value for every chat (not per conversation), appended to
+  // each prompt as its keyword while it is on. ultraWarn holds a guest's pick until they confirm it.
+  const [ultra, setUltraState] = useState<UltraMode>(() => (localStorage.getItem("ct-app-ultra") as UltraMode) || "");
+  const ultraRef = useRef<UltraMode>(ultra);
+  const [ultraWarn, setUltraWarn] = useState<UltraMode>("");
+  const mirrorRef = useRef<HTMLDivElement>(null);
+  const [ultraBurst, setUltraBurst] = useState(0); // bumps on each switch-on to replay the sparkle burst
+  const setUltra = (m: UltraMode) => {
+    setUltraState(m); ultraRef.current = m;
+    if (m) { localStorage.setItem("ct-app-ultra", m); setUltraBurst((n) => n + 1); } else localStorage.removeItem("ct-app-ultra");
+  };
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
   const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
@@ -1314,7 +1390,19 @@ function App() {
   const [sbHidden, setSbHidden] = useState<boolean>(() => { try { return localStorage.getItem("ct-sidebar-hidden") === "1"; } catch { return false; } });
   useEffect(() => { try { localStorage.setItem("ct-sidebar-hidden", sbHidden ? "1" : "0"); } catch { /* */ } }, [sbHidden]);
   const toggleSidebar = () => { if (matchMedia("(max-width: 820px)").matches) setDrawer((d) => !d); else setSbHidden((h) => !h); };
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState<"" | "model" | "effort">("");
+  // The side columns beside the composer need about 760px in all. Below that the row folds to the old
+  // layout, pills and usage on one line under the box. Measured on the row itself because the chat can
+  // sit in a retro desktop window of any width, not just the viewport.
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [rowNarrow, setRowNarrow] = useState(false);
+  useEffect(() => {
+    const el = rowRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(([e]) => setRowNarrow(e.contentRect.width < 760));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const [showOlder, setShowOlder] = useState(false); // "Older versions" group inside the picker panel
   const [updateAvail, setUpdateAvail] = useState(false);
   const [installed] = useState(isStandalone); // home-screen launch: no browser reload button, so we draw one
@@ -1393,6 +1481,7 @@ function App() {
   // truth from an actual 4s request heartbeat: false when requests are failing, which lets the banner
   // show "connection unstable" even while the browser insists it's online.
   const [reachable, setReachable] = useState(true);
+  const [signedOut, setSignedOut] = useState(false); // Access login expired: requests redirect to the login page
   const netMiss = useRef(0);
   const seenConvIds = useRef<Set<string>>(new Set()); // conv ids the status poll has already reacted to, so an unknown one triggers ONE list refresh (new chat from another device) // consecutive failed status polls; the banner needs 2, so a lone blip does not flash "unstable"
   const [queued, setQueued] = useState(0);
@@ -1623,7 +1712,8 @@ function App() {
     // or flaky link shows your chats immediately instead of an empty sidebar until the network answers.
     // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
     void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setCommands(d.commands || []); setAgents(d.agents || []); setDefaultCwd(d.defaultCwd || ""); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id);
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setCommands(d.commands || []); setAgents(d.agents || []); setDefaultCwd(d.defaultCwd || ""); setBoard(!!d.board); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (d.guest) { setGuest(true); const saved = localStorage.getItem("ct-app-model") || ""; if (d.models?.[0] && (!saved || /fable/i.test(saved) || !(d.models as Model[]).concat(d.moreModels || []).some((m) => m.id === saved))) setDefaultModel(d.models[0].id); }
+      else if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id);
       // "?voice=1" opens straight into voice mode. The terminal's tab bar links here so a
       // voice session is one tap from the terminal rather than open-app-then-find-the-mic.
       // Gated on d.voice for the same reason the mic button is: without the services the
@@ -1677,7 +1767,7 @@ function App() {
     const pull = () => {
       if (navigator.onLine) api.statuses()
         .then((d) => {
-          setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); // a real response = link works
+          setStatuses(d?.statuses || {}); netMiss.current = 0; setReachable(true); setSignedOut(false); // a real response = link works
           // A conversation live on the server that this client's sidebar has never seen is a new chat
           // started on another device. Pull the list ONCE so it appears without a manual refresh.
           const known = new Set(convsRef.current.map((c) => c.sessionId));
@@ -1688,7 +1778,7 @@ function App() {
           }
           if (fresh) refreshConvs();
         })
-        .catch(() => { netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
+        .catch((e) => { if (e instanceof SignedOut) { setSignedOut(true); return; } netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
       void refreshQueue();
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
@@ -2219,6 +2309,7 @@ function App() {
   // voice bridge identity never churns.
   const submitText = useCallback(async (text: string, opts?: { voice?: boolean }): Promise<string | null> => {
     if (!text.trim()) return null;
+    text = withUltra(text, ultraRef.current); // ultrathink / ultracode ride along as the prompt keyword
     stickBottom.current = true; setAtBottom(true); // sending re-anchors to the bottom so you see your turn + the reply
     // Ensure there's a store to send into (a brand-new chat gets a temp store, promoted to its real id
     // when the server assigns one). addOptimisticUser renders the turn + flips busy immediately.
@@ -2276,7 +2367,7 @@ function App() {
     if (editing) {
       const ed = editing;
       setEditing(null); setEditError(null);
-      const err = await doEdit(ed, raw);
+      const err = await doEdit(ed, withUltra(raw, ultraRef.current));
       // Failed edits stay edits: restore the composer and the banner so it can be retried or cancelled.
       // Falling through to submitText() here is what used to append the edit as a duplicate turn.
       if (err) { setEditing(ed); setEditError(err); setInput(raw); requestAnimationFrame(() => taRef.current?.focus()); }
@@ -2452,7 +2543,7 @@ function App() {
   // Effort follows the same rule as the model: a live chat gets it applied to that chat, the new-chat
   // page sets the remembered default. Passing "" clears the override so the CLI's own effortLevel
   // applies again.
-  const onPickEffort = async (level: string) => {
+  const applyEffort = async (level: string) => {
     const s = activeStoreRef.current;
     if (s && !s.id.startsWith("new-") && !s.id.startsWith("pending-")) {
       s.settings = { ...s.settings, effortLevel: (level || null) as EffortLevel | null }; s.signal();
@@ -2461,6 +2552,25 @@ function App() {
     }
     setDefaultEffort(level);
     if (level) localStorage.setItem("ct-app-effort", level); else localStorage.removeItem("ct-app-effort");
+  };
+  // Ultracode is xhigh plus orchestration (ultraresearch: max), so picking any plain level leaves it. Ultrathink is a
+  // per-turn boost on top of whatever level is set, so it survives a level change.
+  const onPickEffort = (level: string) => {
+    if (ultraRef.current === "ultracode" || ultraRef.current === "ultraresearch") setUltra("");
+    void applyEffort(level);
+  };
+  // Tapping the lit mode again switches it off. A guest sees the usage warning first; the owner
+  // does not. Ultracode also moves effort to xhigh where the model offers it, matching the CLI.
+  const commitUltra = (m: UltraMode) => {
+    setUltraWarn("");
+    if (m === "ultracode" && effortLevels.includes("xhigh")) void applyEffort("xhigh");
+    if (m === "ultraresearch") { const top = effortLevels.includes("max") ? "max" : effortLevels.includes("xhigh") ? "xhigh" : ""; if (top) void applyEffort(top); }
+    setUltra(m);
+  };
+  const onPickUltra = (m: UltraMode) => {
+    if (m === ultraRef.current) { setUltra(""); return; }
+    if (guest) { setMenuOpen(""); setUltraWarn(m); return; }
+    commitUltra(m);
   };
 
   // Advisor model, plumbed exactly like effort. "" clears the override so the advisorModel in
@@ -2512,7 +2622,6 @@ function App() {
   const addFiles = async (files: File[]) => {
     setUploadError("");
     for (const f of files) {
-      if (f.size > MAX_UPLOAD_MB * 1024 * 1024) { setUploadError(`${f.name} is over the ${MAX_UPLOAD_MB} MB upload limit`); continue; }
       const isImage = f.type.startsWith("image/");
       const preview = isImage ? URL.createObjectURL(f) : undefined; // local thumbnail, no server round-trip
       try { const r = await api.upload(activeId, f); setAttachments((a) => [...a, { name: f.name, path: r.path, isImage, preview }]); }
@@ -2579,7 +2688,9 @@ function App() {
   // instead of having the control vanish. Older ids stay effort-less rather than guessing for them.
   const ALL_EFFORT = ["low", "medium", "high", "xhigh", "max"] as EffortLevel[];
   const configEffort = !!modelRow && !modelRow.resolvedModel && !modelRow.supportsEffort && /-5(-|$)/.test(modelRow.id);
-  const effortLevels = modelRow?.supportedEffortLevels || (modelRow?.supportsEffort || configEffort ? ALL_EFFORT : []);
+  // No row at all (the model list has not loaded, or the chat names a model the list lacks) offers the
+  // full set rather than hiding the control; the CLI ignores a level a model does not take.
+  const effortLevels = modelRow?.supportedEffortLevels || (!modelRow || modelRow.supportsEffort || configEffort ? ALL_EFFORT : []);
   // Effort in force here: this conversation's own if it has one, else the remembered new-chat default.
   const activeEffort = (activeStore && !activeStore.id.startsWith("new-") ? activeStore.settings.effortLevel : defaultEffort) || "";
   // Same rule for the advisor model.
@@ -2631,7 +2742,12 @@ function App() {
   // resolvedModel the CLI reports. Without one, fall back to the row label minus its "(…)"
   // qualifier so the pill stays short and single-line. The dropdown keeps the full name.
   const modelBtnName = modelRow?.resolvedModel ? prettyModel(modelRow.resolvedModel) : (modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel);
-  const modelBtnLabel = effortLevels.length > 0 ? `${modelBtnName} · ${activeEffort ? effortName(activeEffort) : "Auto"}` : modelBtnName;
+  // A keyword typed by hand lights the box the same way the picker does. Ultracode wins if both appear.
+  const typedUltra: UltraMode = /\bultracode\b/i.test(input) ? "ultracode" : /\bultrathink\b/i.test(input) ? "ultrathink" : "";
+  const ringMode = ultra || typedUltra;
+  const effortBtnLabel = ultra ? ultraName(ultra) : effortLevels.length === 0 ? "Effort" : activeEffort ? effortName(activeEffort) : "Auto";
+  const modelBtnLabel = effortLevels.length > 0 ? `${modelBtnName} · ${effortBtnLabel}` : modelBtnName; // the desktop taskbar still shows both
+  const ftcGuest = guest && /^ftc\./.test(location.hostname); // the two FTC team logins share one cap per team
 
   // sidebar grouping — favorites pulled into their own section, the rest grouped by recency
   const favConvs = useMemo(() => convs.filter((c) => favorites.has(c.sessionId)).sort((a, b) => b.mtime - a.mtime), [convs, favorites]);
@@ -2938,10 +3054,10 @@ function App() {
           )}
         </div>
         <div className="sb-foot">
-          <button type="button" className="term-link" onClick={() => setAppsOpen(true)}>
+          {!guest && <button type="button" className="term-link" onClick={() => setAppsOpen(true)}>
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="4" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5" /><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5" /></svg>
             Apps
-          </button>
+          </button>}
         </div>
       </aside>
 
@@ -2976,9 +3092,16 @@ function App() {
             </button>
           )}
         </div>
+        {board && !desktopMode && <BoardStrip />}
         {loadingConv && <div className="load-bar" aria-label="Loading conversation" />}
 
-        {(!online || !reachable || queued > 0) && (
+        {/* "/" is not served from the service worker cache (unlike /app), so it reaches Access, which
+            shows its login and then lands back on "/", which the server redirects to /app. */}
+        {online && signedOut ? (
+          <div className="net-banner warn" role="button" style={{ cursor: "pointer" }} onClick={() => { location.href = "/"; }}>
+            {`Signed out${queued > 0 ? ` with ${queued} message${queued > 1 ? "s" : ""} queued` : ""}. Tap to sign in again.`}
+          </div>
+        ) : (!online || !reachable || queued > 0) && (
           <div className={"net-banner" + (!online ? "" : !reachable ? " warn" : " sending")}>
             {!online
               ? (queued > 0 ? `Offline — ${queued} message${queued > 1 ? "s" : ""} queued, will send when you reconnect` : "You're offline — cached conversations available")
@@ -3010,14 +3133,103 @@ function App() {
             </button>
           )}
           <SpawnedWork items={items} sessionId={activeId} onJump={jumpToAgent} onOpenConversation={loadConv} />
-          {todos && <TodoChecklist todos={todos} />}
+          {todos && !desktopMode && <TodoChecklist todos={todos} />}
           {editing && (
             <div className={"edit-banner" + (editError ? " error" : "")} role={editError ? "alert" : undefined}>
               <span>{editError || "Editing your message — this rewinds the chat and reruns from here, undoing any file changes since."}</span>
               <button onClick={cancelEdit} aria-label="Cancel edit">×</button>
             </div>
           )}
-          <div className={"composer" + (dragOver ? " drag-over" : "")} onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragOver(false)}>
+          {/* Model and effort stand to the left of the box, usage to the right. A narrow window has no
+              room at the sides, so the two columns drop to one row under the box (see .composer-row). */}
+          <div className={"composer-row" + (rowNarrow ? " narrow" : "")} ref={rowRef}>
+          <div className="cside cside-left">
+              <div className="model-picker up">
+                <button className="model-btn" onClick={() => setMenuOpen((o) => (o === "model" ? "" : "model"))} title="Model and advisor">
+                  <span>{modelBtnName}</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                </button>
+                {/* Click-outside closes. The panel used to close on onMouseLeave, which fires when a
+                    slider thumb is dragged a few pixels past the edge and never fires at all on touch. */}
+                {menuOpen === "model" && <div className="picker-scrim" onClick={() => setMenuOpen("")} />}
+                {menuOpen === "model" && (
+                  <div className="model-menu" role="dialog" aria-label="Model settings">
+                    <div className="pk-grab" aria-hidden="true" />
+                    <div className="pk-sec">
+                      <div className="pk-label">Model</div>
+                      {pickerRows.primary.map(renderModelRow)}
+                      {/* Older versions stay in the same panel, collapsed, so every model this box
+                          offers is reachable without leaving the one control. */}
+                      {pickerRows.older.length > 0 && (
+                        <>
+                          <button className="pk-more" onClick={() => setShowOlder((o) => !o)} aria-expanded={showOlder}>
+                            <span>Older versions</span>
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" className={showOlder ? "flip" : ""}><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                          </button>
+                          {showOlder && pickerRows.older.map(renderModelRow)}
+                        </>
+                      )}
+                    </div>
+                    {/* The model the advisor tool consults. Blank defers to advisorModel in
+                        ~/.claude/settings.json, which is what a chat uses when nothing is chosen here. */}
+                    {advisorChoices.length > 0 && (
+                      <div className="pk-sec pk-inline">
+                        <label className="pk-label" htmlFor="pk-advisor">Advisor</label>
+                        <select id="pk-advisor" className="pk-select" value={activeAdvisor} onChange={(e) => void onPickAdvisor(e.target.value)}>
+                          <option value="">Settings default</option>
+                          {advisorChoices.map((m) => <option key={m.id} value={m.id}>{pickerName(m)}</option>)}
+                        </select>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              {(
+                <div className="model-picker up">
+                  <button className={"model-btn effort-btn" + (ultra ? " ultra-btn ultra-" + ultra.slice(5) : "")} onClick={() => setMenuOpen((o) => (o === "effort" ? "" : "effort"))} title="Reasoning effort">
+                    <span>{effortBtnLabel}</span>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                    {ultra && ultraBurst > 0 && <span key={ultraBurst} className="ultra-burst" aria-hidden="true">{Array.from({ length: 10 }, (_, k) => <i key={k} style={{ "--a": `${k * 36}deg` } as any} />)}</span>}
+                  </button>
+                  {menuOpen === "effort" && <div className="picker-scrim" onClick={() => setMenuOpen("")} />}
+                  {menuOpen === "effort" && (
+                    <div className="model-menu" role="dialog" aria-label="Reasoning effort">
+                      <div className="pk-grab" aria-hidden="true" />
+                      {/* "Auto" clears the override so the CLI's own effortLevel applies, which is not
+                          the same as picking medium. */}
+                      {effortLevels.length > 0 && (
+                      <div className="pk-sec">
+                        <div className="pk-label">Reasoning effort</div>
+                        <div className="pk-seg" role="radiogroup" aria-label="Reasoning effort">
+                          {["", ...effortLevels].map((lv) => {
+                            const on = lv === "" ? !effortLevels.includes(activeEffort as EffortLevel) : lv === activeEffort;
+                            return (
+                              <button key={lv || "auto"} role="radio" aria-checked={on} className={on ? "on" : ""} onClick={() => onPickEffort(lv)}>
+                                {lv ? effortName(lv) : "Auto"}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      )}
+                      {/* The keyword modes. Each stays on for every message until tapped off. */}
+                      <div className="pk-sec">
+                        <div className="pk-label">Go further</div>
+                        <div className="pk-ultra">
+                          {((guest ? ["ultrathink", "ultracode"] : ["ultrathink", "ultracode", "ultraresearch"]) as UltraMode[]).map((m) => (
+                            <button key={m} className={"pk-ultra-btn ultra-" + m.slice(5) + (ultra === m ? " on" : "")} aria-pressed={ultra === m} onClick={() => onPickUltra(m)}>
+                              <span className="pk-ultra-name">{ultraName(m)}</span>
+                              <span className="pk-ultra-blurb">{m === "ultrathink" ? "Deepest reasoning on every message" : m === "ultracode" ? "X-high plus a team of agents" : "Max effort, agents that spawn agents, one shared notebook. For runs of many hours"}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+          </div>
+          <div className={"composer" + (dragOver ? " drag-over" : "") + (ringMode ? " ultra-on ultra-" + ringMode.slice(5) : "")} onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragOver(false)}>
             {uploadError && (
               <div className="attach-err" role="alert">
                 <span>{uploadError}</span>
@@ -3035,7 +3247,13 @@ function App() {
                 ))}
               </div>
             )}
-            <textarea ref={taRef} value={input} onChange={onInput} onKeyDown={onKey} onPaste={onPaste} rows={1} placeholder={pendingAsk ? "Answer the question above…" : "Reply to Claude..."} />
+            {/* A typed "ultrathink" / "ultracode" turns rainbow as you type, like the terminal. A textarea
+                cannot colour single words, so its text goes transparent and a mirror underneath, with the
+                same font and wrapping, draws the coloured copy. The caret stays on the real textarea. */}
+            <div className="ta-wrap">
+            {typedUltra && <div className="ta-mirror" ref={mirrorRef} aria-hidden="true">{ultraSpans(input)}{"\n"}</div>}
+            <textarea ref={taRef} className={typedUltra ? "ta-hl" : undefined} onScroll={(e) => { if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop; }} value={input} onChange={onInput} onKeyDown={onKey} onPaste={onPaste} rows={1} placeholder={pendingAsk ? "Answer the question above…" : ultra === "ultrathink" ? "Ultrathink is on. Ask something hard…" : ultra === "ultracode" ? "Ultracode is on. Describe the whole job…" : ultra === "ultraresearch" ? "Ultraresearch is on. State the research question…" : "Reply to Claude..."} />
+            </div>
             <div className="composer-actions">
               {/* Photo/gallery picker: accept=image/* makes Android/iOS open the photo library (with a
                   camera option), not the file browser. The paperclip stays for any-file attachments. */}
@@ -3085,65 +3303,8 @@ function App() {
               </button>
             </div>
           </div>
-          <div className="composer-foot">
-            <div className="model-picker up">
-              <button className="model-btn" onClick={() => setMenuOpen((o) => !o)}>
-                <span>{modelBtnLabel}</span>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-              </button>
-              {/* Click-outside closes. The panel used to close on onMouseLeave, which fires when a
-                  slider thumb is dragged a few pixels past the edge and never fires at all on touch. */}
-              {menuOpen && <div className="picker-scrim" onClick={() => setMenuOpen(false)} />}
-              {menuOpen && (
-                <div className="model-menu" role="dialog" aria-label="Model and reasoning settings">
-                  <div className="pk-grab" aria-hidden="true" />
-                  <div className="pk-sec">
-                    <div className="pk-label">Model</div>
-                    {pickerRows.primary.map(renderModelRow)}
-                    {/* Older versions stay in the same panel, collapsed, so every model this box
-                        offers is reachable without leaving the one control. */}
-                    {pickerRows.older.length > 0 && (
-                      <>
-                        <button className="pk-more" onClick={() => setShowOlder((o) => !o)} aria-expanded={showOlder}>
-                          <span>Older versions</span>
-                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" className={showOlder ? "flip" : ""}><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                        </button>
-                        {showOlder && pickerRows.older.map(renderModelRow)}
-                      </>
-                    )}
-                  </div>
-                  {/* Effort, for models that take it. "Auto" clears the override so the CLI's own
-                      effortLevel applies, which is not the same as picking medium. */}
-                  {effortLevels.length > 0 && (
-                    <div className="pk-sec">
-                      <div className="pk-label">Reasoning effort</div>
-                      <div className="pk-seg" role="radiogroup" aria-label="Reasoning effort">
-                        {["", ...effortLevels].map((lv) => {
-                          const on = lv === "" ? !effortLevels.includes(activeEffort as EffortLevel) : lv === activeEffort;
-                          return (
-                            <button key={lv || "auto"} role="radio" aria-checked={on} className={on ? "on" : ""} onClick={() => void onPickEffort(lv)}>
-                              {lv ? effortName(lv) : "Auto"}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-                  {/* The model the advisor tool consults. Blank defers to advisorModel in
-                      ~/.claude/settings.json, which is what a chat uses when nothing is chosen here. */}
-                  {advisorChoices.length > 0 && (
-                    <div className="pk-sec pk-inline">
-                      <label className="pk-label" htmlFor="pk-advisor">Advisor</label>
-                      <select id="pk-advisor" className="pk-select" value={activeAdvisor} onChange={(e) => void onPickAdvisor(e.target.value)}>
-                        <option value="">Settings default</option>
-                        {advisorChoices.map((m) => <option key={m.id} value={m.id}>{pickerName(m)}</option>)}
-                      </select>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-            <div className="cf-spacer" />
+          <div className="cside cside-right">
+            <div className="cside-nums">
             {activeId && context && (
               <button className="cf-convtok" onClick={doCompact} disabled={compacting || context.estimated}
                 title={`${fmtTokens(context.total)} tokens in this conversation, ${context.estimated ? "~" : ""}${Math.round(context.percentage)}% of the ${(context.max / 1000).toFixed(0)}k window${context.estimated ? " (estimated, send a message for the exact figure)" : " (click to compact)"}`}>
@@ -3156,10 +3317,14 @@ function App() {
                 <span>{fmtTokens(usage5h.output5h)}</span>
               </a>
             )}
+            </div>
             <LimitRing sub={subscription} url={usage5h?.url} />
+          </div>
           </div>
         </div>
       </main>
+      {/* Desktop: the task list moves from above the composer to an editable pane on the right. */}
+      {desktopMode && <TaskPanel items={items} convId={activeId} onSend={submitText} askOpen={items.some((it) => it.kind === "ask" && it.answered === undefined)} />}
       {artifact && (
         window.matchMedia("(max-width: 820px)").matches
           ? <ArtifactViewer key={artifact.id} artifact={artifact} mode="sheet" onClose={closeArtifact} onBack={artifactTrail.length > 1 ? backArtifact : undefined} onOpen={openArtifact} />
@@ -3202,6 +3367,33 @@ function App() {
           </div>
         </>
       )}
+      {/* Guests only: the ultra modes spend usage fast, and an FTC login spends its whole team's
+          share. Students skip text, so the picture carries the message: a battery draining under a
+          flame, with the team standing under the same battery on an FTC account. */}
+      {ultraWarn && (
+        <div className="modal-scrim" onClick={() => setUltraWarn("")}>
+          <div className="modal ultra-warn" role="alertdialog" aria-label="This uses a lot of usage" onClick={(e) => e.stopPropagation()}>
+            <svg className="uw-art" viewBox="0 0 240 170" aria-hidden="true">
+              <path className="uw-flame" d="M115 6c4 12 18 18 18 34a18 18 0 0 1-36 0c0-8 4-12 8-18 1 6 4 9 7 9-2-9 0-17 3-25z" />
+              <rect x="44" y="44" width="140" height="70" rx="12" fill="none" stroke="currentColor" strokeWidth="6" />
+              <rect x="186" y="66" width="12" height="26" rx="3" fill="currentColor" />
+              <rect className="uw-charge" x="53" y="53" width="122" height="52" rx="5" />
+              {(ftcGuest ? [62, 98, 134, 170] : [116]).map((x, k) => (
+                <g key={k} className="uw-person" transform={`translate(${x} 128)`}>
+                  <circle cx="0" cy="8" r="8" />
+                  <path d="M-13 40v-8a13 13 0 0 1 26 0v8z" />
+                </g>
+              ))}
+            </svg>
+            <div className="uw-big">{ftcGuest ? "This uses up your whole team's Claude fast" : "This uses up your Claude limit fast"}</div>
+            <div className="uw-small">{ultraName(ultraWarn)} {ultraWarn === "ultrathink" ? "thinks much longer on every message." : "runs a group of agents on every message."}{ftcGuest ? " Everyone on your team shares one limit. When it runs out, nobody can use Claude until it resets." : " When your limit runs out, Claude stops until it resets."}</div>
+            <div className="uw-actions">
+              <button className="uw-yes" onClick={() => commitUltra(ultraWarn)}>Use it anyway</button>
+              <button className="uw-no" autoFocus onClick={() => setUltraWarn("")}>Never mind</button>
+            </div>
+          </div>
+        </div>
+      )}
       <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} ttsVoice={ttsVoice || undefined} tapToTalk={tapToTalk} />
     </div>
   );
@@ -3215,13 +3407,15 @@ function App() {
       chatWaiting={!!activeId && !!statuses[activeId]?.waiting}
       otherBusy={Object.entries(statuses).filter(([id, st]) => st.busy && id !== activeId).map(([id, st]) => ({ id, title: titleOf(id), since: st.since }))}
       modelLabel={modelBtnLabel}
-      onModelClick={() => setMenuOpen(true)}
+      onModelClick={() => setMenuOpen("model")}
       onOpenChat={(id) => void loadConv(id)}
       chats={convs.slice(0, 12).map((c) => ({ id: c.sessionId, title: titleOf(c.sessionId), busy: !!statuses[c.sessionId]?.busy, waiting: !!statuses[c.sessionId]?.waiting }))}
       onNewChat={newChat}
       finishedKey={finishedKey}
       openTerminalId={termArg}
       onTheme={(t) => setTheme(t)}
+      guest={guest}
+      board={board}
     />
   );
 }

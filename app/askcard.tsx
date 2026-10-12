@@ -36,9 +36,18 @@ function EmailCard({ it, draft, onAnswer }: { it: AskItem; draft: EmailDraft; on
     try { localStorage.setItem(key, JSON.stringify(n)); } catch {}
   };
   // The signature follows the From account; it can be edited for this one email.
-  const sigFor = (from?: string) => (draft.signatures || {})[(from || "").toLowerCase()] || "";
+  // "behalf" swaps it for a line saying Claude sent the email for the account owner, whose name
+  // is the first line of that account's signature.
+  const ownSig = (from?: string) => (draft.signatures || {})[(from || "").toLowerCase()] || "";
+  const behalfSig = (from?: string) => {
+    const name = ownSig(from).split("\n")[0].trim() || (from || "").trim();
+    return `Claude (AI assistant), on behalf of ${name}\nSent from ${name}'s Claude VPS. Replies go to ${name}.`;
+  };
+  const [sigMode, setSigMode] = useState<"own" | "behalf">("own");
+  const sigFor = (from?: string, mode = sigMode) => mode === "behalf" ? behalfSig(from) : ownSig(from);
   const [sig, setSig] = useState<string>(() => sigFor(f.from));
   const pickFrom = (e: React.ChangeEvent<HTMLSelectElement>) => { set("from")(e); setSig(sigFor(e.target.value)); };
+  const pickSigMode = (e: React.ChangeEvent<HTMLSelectElement>) => { const m = e.target.value as "own" | "behalf"; setSigMode(m); setSig(sigFor(f.from, m)); };
   const fullBody = () => f.body.replace(/\s+$/, "") + (sig.trim() ? "\n\n" + sig : "");
   const finish = (a: object) => { try { localStorage.removeItem(key); } catch {} onAnswer(it.askId, JSON.stringify(a)); };
 
@@ -72,7 +81,12 @@ function EmailCard({ it, draft, onAnswer }: { it: AskItem; draft: EmailDraft; on
       {draft.bcc && <div className="email-row"><label>Bcc</label><input value={f.bcc || ""} onChange={set("bcc")} /></div>}
       <div className="email-row"><label>Subject</label><input value={f.subject} onChange={set("subject")} /></div>
       <textarea className="email-body" value={f.body} onChange={set("body")} rows={Math.min(24, Math.max(6, f.body.split("\n").length + 1))} />
-      <div className="email-sig-label">Signature</div>
+      <div className="email-sig-label">Signature{" "}
+        <select className="email-sig-mode" value={sigMode} onChange={pickSigMode}>
+          <option value="own">Mine</option>
+          <option value="behalf">Sent by Claude on my behalf</option>
+        </select>
+      </div>
       <textarea className="email-body email-sig" value={sig} onChange={(e) => setSig(e.target.value)} rows={Math.max(1, sig.split("\n").length)} placeholder="No signature" />
       <div className="ask-actions email-actions">
         <button className="email-cancel" onClick={() => finish({ action: "cancel" })}>Cancel</button>

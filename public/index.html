@@ -80,7 +80,14 @@
   .util .ul { display:flex; justify-content:space-between; align-items:baseline; font-size:12.5px; color:var(--muted); margin-bottom:8px; }
   .util .ul b { color:var(--ink); font-size:16px; font-weight:750; font-variant-numeric:tabular-nums; }
   .util .track { position:relative; height:8px; border-radius:6px; background:var(--line); overflow:hidden; }
-  .util .track > span { display:block; height:100%; border-radius:6px; transition:width .6s cubic-bezier(.2,.7,.2,1); }
+  .util .track > span { display:flex; height:100%; border-radius:6px; overflow:hidden; transition:width .6s cubic-bezier(.2,.7,.2,1); }
+  .util .track > span > em { display:block; height:100%; }
+  /* Limit reached: the bar keeps its per-person colors and the box itself turns red. */
+  .util .u.out { border-color:var(--danger); background:color-mix(in srgb,var(--danger) 16%,var(--track)); }
+  .util .u.out .ul b { color:var(--danger); }
+  .util .who-used { display:flex; flex-wrap:wrap; gap:4px 12px; margin-top:8px; font-size:12px; color:var(--muted); }
+  .util .who-used span { display:inline-flex; align-items:center; gap:5px; }
+  .util .who-used i { width:9px; height:9px; border-radius:2px; display:inline-block; }
   .util .track > i { position:absolute; top:0; bottom:0; width:2px; margin-left:-1px; background:#fff; box-shadow:0 0 0 1px rgba(0,0,0,.45); border-radius:1px; }
   @media (max-width:440px){ .util { gap:10px; margin:6px 2px 12px; } }
   .billfoot { margin:14px 4px 4px; padding-top:12px; border-top:1px dashed var(--line); font-size:13.5px; color:var(--muted); }
@@ -506,7 +513,16 @@ function refresh(d){
 }
 
 // #region Shared subscription limit (session 5h + weekly 7d)
-function subColor(u){ if(u==null) return "var(--muted)"; if(u>=85) return "var(--danger)"; if(u>=60) return "#f59e0b"; return "#22c55e"; }
+// Split a limit bar by who used the window: each person's weighted output since the window
+// opened, as a share of the filled part. Usage the box can't attribute (claude.ai web/phone)
+// is already inside utilization, so the segments are proportions of the fill, not absolutes.
+function subSegments(win){
+  const by = (win && win.by_user) || {};
+  const nameOf = u => ((DATA && DATA.users) || []).find(x => x.user===u)?.name || u;
+  const rows = Object.entries(by).filter(([,v]) => v>0).sort((a,b) => b[1]-a[1]);
+  const sum = rows.reduce((t,[,v]) => t+v, 0);
+  return rows.map(([u,v]) => ({ name:nameOf(u), color:colorFor(u), share:v/sum }));
+}
 function untilStr(iso){
   if(!iso) return "";
   const t = Date.parse(iso); if(isNaN(t)) return "";
@@ -521,7 +537,8 @@ function untilStr(iso){
 function subCell(label, win, windowSec, wide){
   const u = win && typeof win.utilization==="number" ? win.utilization : null;
   const pct = u==null ? 0 : Math.max(0,Math.min(100,u));
-  const col = subColor(u);
+  const segs = subSegments(win);
+  const out = u!=null && u>=100;
   const left = u==null ? "" : Math.max(0,100-Math.round(u))+"% left";
   // Ghost bar: where we'd be if the window were used evenly over time. elapsed = windowLen - remaining.
   // The marker alone shows ahead/behind at a glance (fill left of the tick = ahead), no text needed.
@@ -530,10 +547,18 @@ function subCell(label, win, windowSec, wide){
     const remain = (Date.parse(win.resets_at)-Date.now())/1000;
     if(isFinite(remain)) ghost = Math.max(0,Math.min(100,Math.round((1-remain/windowSec)*100)));
   }
-  return '<div class="u"'+(wide?' style="grid-column:1/-1"':'')+'>'
+  // No attribution data (or nobody here used the window): one neutral fill, as before.
+  const fill = segs.length
+    ? segs.map(g => '<em title="'+g.name+' '+Math.round(g.share*100)+'%" style="width:'+(g.share*100)+'%;background:'+g.color+'"></em>').join("")
+    : '<em style="width:100%;background:var(--muted)"></em>';
+  const legend = segs.length
+    ? '<div class="who-used">'+segs.map(g => '<span><i style="background:'+g.color+'"></i>'+g.name+' '+Math.round(g.share*100)+'%</span>').join("")+'</div>'
+    : "";
+  return '<div class="u'+(out?' out':'')+'"'+(wide?' style="grid-column:1/-1"':'')+'>'
     + '<div class="ul"><span>'+label+'</span><b>'+(u==null?"–":Math.round(u)+"%")+'</b></div>'
-    + '<div class="track"><span style="width:'+pct+'%;background:'+col+'"></span>'+(ghost!=null?'<i title="'+ghost+'% of the window elapsed" style="left:'+ghost+'%"></i>':'')+'</div>'
+    + '<div class="track"><span style="width:'+pct+'%">'+fill+'</span>'+(ghost!=null?'<i title="'+ghost+'% of the window elapsed" style="left:'+ghost+'%"></i>':'')+'</div>'
     + '<div class="ul" style="margin:8px 0 0"><span>'+left+'</span><span>'+untilStr(win&&win.resets_at)+'</span></div>'
+    + legend
     + '</div>';
 }
 function renderSubscription(d){
@@ -544,8 +569,7 @@ function renderSubscription(d){
   panel.style.display="";
   document.getElementById("subUtil").innerHTML =
     subCell("Session (5h)", p.five_hour, 5*3600)
-    + (p.fable ? subCell("Fable (7d)", p.fable, 7*86400) : "")
-    + subCell("Weekly (7d)", p.seven_day, 7*86400, true);
+    + subCell("Weekly (7d)", p.seven_day, 7*86400);
   const n = p.active_users, foot = document.getElementById("subFoot");
   if(typeof n==="number" && n>0){
     foot.style.display="";

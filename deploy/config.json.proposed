@@ -18,7 +18,8 @@
     "brandon": "Brandon",
     "sam": "Sam",
     "ishan": "Ishan",
-    "yak": "Yik Yak bot"
+    "yak": "Yik Yak bot",
+    "rtr": "Red Thunder"
   },
   "hosts": [
     "brandon",
@@ -28,7 +29,8 @@
     "brandon": "#4ADE80",
     "sam": "#F59E0B",
     "ishan": "#60A5FA",
-    "yak": "#A78BFA"
+    "yak": "#A78BFA",
+    "rtr": "#EF4444"
   },
   "appModels": [
     {
@@ -84,6 +86,19 @@
   "exportName": "brandon",
   "exportTokenFile": "/etc/claude-terminal/export.token",
   "exportCombinePeers": true,
+  "exportGroups": {
+    "guests": {
+      "name": "Brandon's guests",
+      "members": [
+        "sam",
+        "ishan",
+        "gearcats",
+        "cougears",
+        "in-training",
+        "rtr"
+      ]
+    }
+  },
   "extraUsers": {
     "sam": [
       "/var/lib/claude-terminal/guests/sam/projects"
@@ -93,6 +108,21 @@
     ],
     "yak": [
       "/home/ctuser/.claude/projects/-home-ctuser--local-share-yak-claude-runs"
+    ],
+    "gearcats": [
+      "/var/lib/claude-terminal/guests/gearcats/projects"
+    ],
+    "cougears": [
+      "/var/lib/claude-terminal/guests/cougears/projects"
+    ],
+    "peter": [
+      "/var/lib/claude-terminal/guests/peter/projects"
+    ],
+    "in-training": [
+      "/var/lib/claude-terminal/guests/in-training/projects"
+    ],
+    "rtr": [
+      "/var/lib/claude-terminal/guests/rtr/projects"
     ]
   }
 }

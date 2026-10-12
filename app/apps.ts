@@ -9,6 +9,7 @@ export const APPS: HostedApp[] = [
   { id: "tty", label: "Terminal", icon: "⌨", desc: "Claude Code in tmux tabs", href: "/tty/" },
   { id: "yak", label: "Yak picks", icon: "🐐", desc: "Ranked Yik Yak post ideas", href: "/yak/" },
   { id: "brief", label: "Brief", icon: "📰", desc: "Daily morning brief", href: "/brief/" },
+  { id: "ftc-admin", label: "FTC admin", icon: "🤖", desc: "FTC team accounts: logins, chats, usage", href: "/ftc-admin/" },
   { id: "usage", label: "Usage", icon: "📊", desc: "Token usage dashboard", href: "/usage/" },
   { id: "code", label: "VS Code", icon: "💻", desc: "code-server editor", href: "/code/" },
   { id: "survivor", label: "Survivor", icon: "🏈", desc: "NFL survivor pool", href: "https://survivor.brandmcd.com/", external: true },

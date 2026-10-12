@@ -280,21 +280,40 @@ self.addEventListener("push", (event) => {
   })());
 });
 
-// Clicking a notification: focus an already-open terminal (and tell the overlay
-// which session to switch to), or open a fresh window at the target URL.
+// Clicking a notification opens what it names. Only top-level windows are candidates: the app embeds
+// same-origin frames (/brief/, /usage/, /tty/ on the desktop layout), and handing the click to one of
+// those used to focus a page with no listener, so the tap did nothing. A chat push to a window that is
+// already on /app switches conversation in place; anything else navigates the window to the target.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const d = event.notification.data || {};
   const url = d.url || "/";
+  const msg = { type: "ct-notification-click", url, sessionId: d.sessionId || null };
   event.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (const c of all) {
-      try {
-        await c.focus();
-        c.postMessage({ type: "ct-notification-click", url, sessionId: d.sessionId || null });
-        return;
-      } catch {}
+    const tops = all.filter((c) => !c.frameType || c.frameType === "top-level");
+    const path = (u) => { try { return new URL(u, self.location.origin).pathname; } catch { return ""; } };
+    const onApp = (c) => path(c.url).startsWith("/app");
+    let isChat = false; // /app?c=<id> names a chat; /app?arg=<tab> names a terminal tab that loadConv cannot open
+    try { isChat = path(url).startsWith("/app") && new URL(url, self.location.origin).searchParams.has("c"); } catch {}
+    const c = tops.find(onApp) || tops[0];
+    if (!c) { if (self.clients.openWindow) return self.clients.openWindow(url); return; }
+    if (d.sessionId && isChat && onApp(c)) {
+      try { await c.focus(); } catch {}
+      c.postMessage(msg);
+      return;
     }
-    if (self.clients.openWindow) return self.clients.openWindow(url);
+    if (url === "/" || (path(url) === path(c.url) && !d.sessionId)) {
+      try { await c.focus(); } catch {}
+      return;
+    }
+    try {
+      const nav = await c.navigate(url);
+      try { await (nav || c).focus(); } catch {}
+    } catch {
+      // navigate() throws for a window this worker does not control; fall back to the page listener.
+      try { await c.focus(); } catch {}
+      c.postMessage(msg);
+    }
   })());
 });
