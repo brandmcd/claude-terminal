@@ -6,6 +6,7 @@
 // Config-driven via config.json. Reads usage.db (written by collector.ts); never scrapes
 // transcripts itself. HOME-relative for the per-instance terminal bits (tab-registry, settings,
 // tmux), so the same binary runs for the host owner and inside each guest container.
+import { isWorkUser, WORK_SUFFIX } from "./transcripts.ts";
 import { mkdir, rename, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -17,7 +18,9 @@ import { Connections } from "./connections.ts";
 import { appRoutes, type AppCtx } from "./app-server.ts";
 import { initSubscriptionResume } from "./subscription-resume.ts";
 import { startStatusPush, type StatusPayload } from "./status-push.ts";
-import { liveActivity } from "./app-runner.ts";
+import { liveActivity, setBuiltinMcp, builtinMcpNames } from "./app-runner.ts";
+import { reserveMcpNames } from "./app-mcp.ts";
+import { initBstats, recordSample, countEvent, buildReport } from "./battery-stats.ts";
 
 const CONFIG_PATH = process.argv[2] || join(import.meta.dir, "config.json");
 const cfg = JSON.parse(await Bun.file(CONFIG_PATH).text());
@@ -51,6 +54,7 @@ const UPLOAD_DIR: string = cfg.uploadDir || "/tmp/claude-paste"; // one per Unix
 const MAX_BYTES = 20 * 1024 * 1024;
 const PUBLIC_DIR = join(import.meta.dir, "public");
 const overlayPath = join(import.meta.dir, "overlay.js");
+const bstatsClientPath = join(import.meta.dir, "bstats-client.js");
 
 // #region PWA + Web Push config
 const APP_NAME: string = cfg.appName || "Claude Terminal";
@@ -63,6 +67,7 @@ const VAPID_SUBJECT: string = cfg.vapidSubject || "mailto:admin@localhost";
 const STATE_DIR: string = cfg.stateDir || join(HOME, ".claude");
 const VAPID_FILE = join(STATE_DIR, "claude-terminal-vapid.json");
 const SUBS_FILE = join(STATE_DIR, "claude-terminal-push.json");
+try { initBstats(join(STATE_DIR, "claude-terminal-bstats.db")); } catch (e) { console.error("bstats init failed", e); }
 const PWA_DIR = join(import.meta.dir, "pwa");
 const swPath = join(import.meta.dir, "sw.js");
 const PWA_MIME: Record<string, string> = { ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
@@ -600,19 +605,36 @@ function buildLeaderboard() {
     return w != null ? w : rawOut;
   };
   const users: any[] = [];
-  for (const { user } of qUsers.all() as any[]) {
+  // A "<user>_work" row holds tokens run on an unbilled box login (transcripts.ts accountRouter).
+  // The card shows the person's whole usage, so it folds into the user's own card; byMonth (the
+  // split, the monthly chart) counts only the billed row.
+  const present = new Set((qUsers.all() as any[]).map((r) => r.user as string));
+  const bases = [...new Set([...present].map((u) => (isWorkUser(u) ? u.slice(0, -WORK_SUFFIX.length) : u)))];
+  for (const user of bases) {
     const hours = new Map<string, any>();
-    for (const r of qHours.all(user) as any[]) {
-      hours.set(r.hour_utc, r);
-      const mk = r.hour_utc.slice(0, 7);
-      addParts(((byMonth[mk] ??= {})[user] ??= zeroParts()), r);
+    const cum: Record<string, number> = zeroParts();
+    const month = zeroParts();
+    let sessions = 0, last: string | null = null;
+    const models = new Set<string>();
+    for (const row of [user, user + WORK_SUFFIX]) {
+      if (!present.has(row)) continue;
+      const billed = row === user;
+      for (const r of qHours.all(row) as any[]) {
+        let h = hours.get(r.hour_utc);
+        if (!h) hours.set(r.hour_utc, h = zeroParts());
+        addParts(h, r);
+        const mk = r.hour_utc.slice(0, 7);
+        if (billed) addParts(((byMonth[mk] ??= {})[user] ??= zeroParts()), r);
+        if (mk === monthPrefix) addParts(month, r);
+      }
+      addParts(cum, (qCum.get(row) as any) || {});
+      const meta = (qMeta.get(row) as any) || {};
+      sessions += meta.sessions || 0;
+      for (const m of JSON.parse(meta.models || "[]")) if (!String(m).startsWith("<")) models.add(m);
+      if (meta.last_activity && (!last || Date.parse(meta.last_activity) > Date.parse(last))) last = meta.last_activity;
     }
-    const cum = (qCum.get(user) as any) || { output: 0, total: 0 };
-    const meta = (qMeta.get(user) as any) || {};
-    const last = meta.last_activity || null;
     let active = false;
     if (last) { const t = Date.parse(last); if (!isNaN(t)) active = now.getTime() - t <= ACTIVE_MS; }
-    const month = byMonth[monthPrefix]?.[user] || zeroParts();
     users.push({
       user,
       name: cfg.names?.[user] || titleCase(user),
@@ -621,12 +643,13 @@ function buildLeaderboard() {
       // operator's names. Send it per row and let the page fall back to its hash.
       color: cfg.colors?.[user] || null,
       host: (cfg.hosts || []).includes(user),
+      billed: present.has(user),
       output_5h: rolling(hours, "output", now),
       tokens_5h: rolling(hours, "total", now),
       output_total: cum.output,
       tokens_total: cum.total,
-      sessions: meta.sessions || 0,
-      models: JSON.parse(meta.models || "[]").filter((m: string) => !String(m).startsWith("<")),
+      sessions,
+      models: [...models].sort(),
       last_used: last,
       active,
       spark: sparkSeries(hours, now, SPARK_HOURS),
@@ -639,7 +662,7 @@ function buildLeaderboard() {
     });
   }
 
-  const allUsers = users.map((u) => u.user);
+  const allUsers = users.filter((u) => u.billed).map((u) => u.user);
   const nameOf = Object.fromEntries(users.map((u) => [u.user, u.name]));
   const months: any[] = [];
   for (const mk of Object.keys(byMonth).sort()) {
@@ -672,6 +695,7 @@ function buildLeaderboard() {
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
   const curCents = splitCents(cur, subUsdFor(monthPrefix) * 100);
   for (const u of users) {
+    if (!u.billed) { u.share_usd = null; u.month_pct = null; continue; }
     u.share_usd = curCents[u.user] / 100;
     u.month_pct = curTotal ? Math.round((1000 * cur[u.user]) / curTotal) / 10 : 0; // share of WEIGHTED output
   }
@@ -685,13 +709,15 @@ function buildLeaderboard() {
     sum(cache_creation_1h) AS cache_creation_1h, sum(cache_read) AS cache_read
     FROM model_usage WHERE minute_utc >= ? GROUP BY user, hour, model`).all(
       hourKeyOf(new Date(now.getTime() - HOURLY_HOURS * 3600e3))) as any[]) {
-    let hours = weightedHours.get(r.user);
-    if (!hours) weightedHours.set(r.user, hours = new Map());
+    const key = isWorkUser(r.user) ? r.user.slice(0, -WORK_SUFFIX.length) : r.user; // a _work row folds into its person's card
+    let hours = weightedHours.get(key);
+    if (!hours) weightedHours.set(key, hours = new Map());
     const b = hours.get(r.hour) || { total: 0 };
     b.total += effectiveTokens(r); hours.set(r.hour, b);
   }
   for (const u of users as any[]) {
-    const w = wt[u.user];
+    const [wb, ww] = [wt[u.user], wt[u.user + WORK_SUFFIX]];
+    const w = wb && ww ? Object.fromEntries(Object.keys(wb).map((k) => [k, (wb as any)[k] + ((ww as any)[k] || 0)])) as typeof wb : wb || ww;
     const wh = weightedHours.get(u.user) || new Map();
     u.weighted_hourly = sparkSeries(wh, now, HOURLY_HOURS);
     u.weighted_tokens_5h = rolling(wh, "total", now);
@@ -845,6 +871,7 @@ async function pushAll(payload: NotifPayload, opts?: { cadenceOnly?: boolean }):
     catch (e: any) { const c = e?.statusCode; if (c === 404 || c === 410) dead.push(s.endpoint); }
   }));
   for (const d of dead) removeSub(d);
+  countEvent(payload.tag === "ct-status" ? "push:status" : "push:other", targets.length);
   return { sent: targets.length, pruned: dead.length };
 }
 
@@ -1088,6 +1115,11 @@ const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
   { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
   { id: "claude-haiku-4-5", label: "Haiku 4.5" },
 ];
+// Built-in MCP servers every /app chat gets ({name: McpServerConfig}). Off unless configured: the
+// upstream google and shop servers are hardwired to another host, and this box connects Google and
+// Slack through the Connections page instead.
+setBuiltinMcp(cfg.appBuiltinMcp);
+reserveMcpNames(builtinMcpNames());
 const appCtx: AppCtx = {
   sharedTools: cfg.appGuest ? undefined : { url: `http://127.0.0.1:${PORT}`, owner: OWNER, vault: join(HOME, "vault") },
   allowed,
@@ -1137,6 +1169,7 @@ const appCtx: AppCtx = {
       const now = Date.now();
       let n = 0;
       for (const { user } of qUsers.all() as any[]) {
+        if (isWorkUser(user)) continue; // another plan: not contending for the shared limit
         const meta = qMeta.get(user) as any;
         const t = meta?.last_activity ? Date.parse(meta.last_activity) : NaN;
         if (!isNaN(t) && now - t <= ACTIVE_MS) n++;
@@ -1218,7 +1251,10 @@ const server = Bun.serve({
   // offline" on a perfectly good wired LAN (1058 stream opens in one hour). Well above the ping.
   idleTimeout: 120,
   async fetch(req) {
-    const path = new URL(req.url).pathname;
+    const url = new URL(req.url);
+    const path = url.pathname;
+    // Battery diagnostics: the service worker tags its background delta pulls with src=sw.
+    if (url.searchParams.get("src") === "sw") countEvent("sw:delta");
 
     // Chat-app front-end (/app*). Returns null for non-app paths so the rest still matches.
     const appRes = await appRoutes(req, path, appCtx);
@@ -1284,10 +1320,24 @@ const server = Bun.serve({
     // #endregion
 
     // #region terminal sidecar (owner-gated where noted)
+    // Battery diagnostics (battery-stats.ts). The beacon carries the owner's cookie like any request.
+    if (req.method === "POST" && path === "/bstats") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      try { recordSample(await req.json()); } catch { /* malformed beacon */ }
+      return new Response(null, { status: 204 });
+    }
+    if (req.method === "GET" && path === "/bstats/report") {
+      if (!allowed(req)) return new Response("Forbidden", { status: 403 });
+      const hours = Math.min(336, Math.max(1, Number(url.searchParams.get("hours")) || 24));
+      return Response.json(buildReport(hours), { headers: { "Cache-Control": "no-store" } });
+    }
     if (req.method === "GET" && path === "/overlay.js") {
       // The injected tag carries ?v=<n>, so a new overlay gets a new URL. That makes it
       // safe to cache hard here and saves a revalidation round trip on every page load.
-      return new Response(Bun.file(overlayPath), { headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "public, max-age=31536000, immutable" } });
+      // Bump ?v= in ttyd/index.html when overlay.js or bstats-client.js changes.
+      // The counters must patch WebSocket before the overlay's own patch captures ttyd's socket.
+      const js = (await Bun.file(bstatsClientPath).text()) + "\n" + (await Bun.file(overlayPath).text());
+      return new Response(js, { headers: { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "public, max-age=31536000, immutable" } });
     }
 
     // #region PWA (installable app) — manifest, service worker, icons. Ungated

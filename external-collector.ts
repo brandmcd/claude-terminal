@@ -77,6 +77,9 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
     console.error(`external peer: dropping implausible ${what} ${n} for hour ${hour}`);
     return 0;
   };
+  // One export carried a model named "unmetered" with 9.96e22 output tokens. num() already zeroes
+  // anything past 2^53; no real model writes 100 billion output tokens in a month either.
+  const MAX_MODEL_MONTH_OUTPUT = 1e11;
 
   for (const p of peers) {
     if (!p?.url) continue;
@@ -125,6 +128,10 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
           // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
           for (const mm of Array.isArray(u.models) ? u.models : []) {
             if (!mm?.mk || !mm?.model) continue;
+            if (typeof mm.output === "number" && mm.output > MAX_MODEL_MONTH_OUTPUT) {
+              console.error(`external peer ${peerName}: dropped ${user} ${mm.mk} ${mm.model} output=${mm.output} (implausible)`);
+              continue;
+            }
             insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output), num(mm.input), num(mm.cache_read), num(mm.cache_creation), num(mm.cache_creation_5m), num(mm.cache_creation_1h), num(mm.total));
           }
         }

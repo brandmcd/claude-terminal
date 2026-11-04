@@ -16,6 +16,9 @@
       "/path/to/another/.claude/projects"
     ]
   },
+  "guestsFile": "/path/to/guests.tsv",
+  "guestProjectsDir": "/path/to/guests/{user}/.claude/projects",
+  "guestsExclude": [],
   "names": {
     "me": "Me"
   },
@@ -72,5 +75,6 @@
   },
   "voice": true,
   "sttUrl": "http://127.0.0.1:7801",
-  "ttsUrl": "http://127.0.0.1:7802"
+  "ttsUrl": "http://127.0.0.1:7802",
+  "boxLogin": { "file": "/home/you/.claude.json", "billedEmail": "you@example.com" }
 }

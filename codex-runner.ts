@@ -123,7 +123,7 @@ export class CodexConversation {
   private queue = Promise.resolve();
   private streamed = new Set<string>();
   private asks = new Map<string, { meta: PendingAsk; resolve: (answer: string) => void }>();
-  private subs = new Map<Sub, (() => void) | undefined>();
+  private subs = new Map<Sub, { evict?: (why?: string) => void; key?: string }>();
   private hooks = new Set<Sub>();
   private tokenUsage?: any;
   private tokenBaseline?: any;
@@ -165,16 +165,21 @@ export class CodexConversation {
     appendFileSync(pathFor(this.id, "jsonl"), JSON.stringify(e) + "\n", { mode: 0o600 });
     for (const fn of [...this.subs.keys(), ...this.hooks]) { try { fn(e); } catch {} }
   }
-  private addSub(fn: Sub, evict?: () => void) {
-    this.subs.set(fn, evict);
-    if (this.subs.size > 12) { const [oldest, close] = this.subs.entries().next().value!; this.subs.delete(oldest); close?.(); }
+  // `key` names the client socket; a reconnect with the same key replaces its own stale subscriber
+  // instead of pushing out another tab's live one (same rule as Conversation.addSub in app-runner.ts).
+  private addSub(fn: Sub, evict?: (why?: string) => void, key?: string) {
+    if (key) for (const [f, meta] of this.subs) { if (meta.key !== key) continue; this.subs.delete(f); try { meta.evict?.("replaced"); } catch {} }
+    this.subs.set(fn, { evict, key });
+    if (this.subs.size > 12) { const [oldest, meta] = this.subs.entries().next().value!; this.subs.delete(oldest); meta.evict?.(); }
   }
-  subscribe(fn: Sub, fromNow = false, evict?: () => void) {
-    this.addSub(fn, evict); if (!fromNow) for (const e of this.log.slice(this.runStart)) fn(e);
+  // Claude chats stamp the user's device timezone on each turn; Codex turns carry no such stamp.
+  setClientTz(_tz: unknown) {}
+  subscribe(fn: Sub, fromNow = false, evict?: (why?: string) => void, key?: string) {
+    this.addSub(fn, evict, key); if (!fromNow) for (const e of this.log.slice(this.runStart)) fn(e);
     return () => { this.subs.delete(fn); };
   }
-  subscribeSince(fn: Sub, seq: number, evict?: () => void) {
-    this.addSub(fn, evict); for (const e of this.log) if ((e._seq ?? -1) > seq) fn(e);
+  subscribeSince(fn: Sub, seq: number, evict?: (why?: string) => void, key?: string) {
+    this.addSub(fn, evict, key); for (const e of this.log) if ((e._seq ?? -1) > seq) fn(e);
     return () => { this.subs.delete(fn); };
   }
   onEvent(fn: Sub) { this.hooks.add(fn); return () => { this.hooks.delete(fn); }; }

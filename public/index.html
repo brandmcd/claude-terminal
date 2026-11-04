@@ -122,6 +122,11 @@
      tooltip in half — you got the date or the token count, never both. The chart
      graphics stay clipped by the <svg> root, which clips its own content anyway. */
   .spark { grid-column:2; grid-row:2; height:46px; margin:-2px -4px; min-width:0; }
+  .spark .apexcharts-canvas { overflow:visible !important; }
+  /* keep tooltip values (e.g. "1,234,567 output tokens") on one line — no ugly wrapping at 7 digits. */
+  .apexcharts-tooltip, .apexcharts-tooltip-series-group,
+  .apexcharts-tooltip-text, .apexcharts-tooltip-y-group,
+  .apexcharts-tooltip-text-y-value { white-space:nowrap !important; }
   .meta { grid-column:1/4; grid-row:3; display:flex; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:12.5px; padding-top:4px; border-top:1px dashed var(--line); margin-top:4px; }
   /* Hover breakdown. ApexCharts owns the .apexcharts-tooltip shell, so its palette is
      overridden here to the card palette; everything inside is ours via tooltip.custom. */
@@ -389,7 +394,10 @@ const ttWrap = (when, body) => `<div class="ttwrap"><div class="ttw">${when}</di
 function sparkOpts(user, data){
   const c = colorFor(user);
   return {
-    chart:{ type:"area", height:46, sparkline:{enabled:true}, animations:{enabled:true, easing:"easeinout", speed:700} },
+    // Animations OFF: on a 46px sparkline the entrance tween buys nothing, and with it enabled the
+    // hover marker re-animates the series, which makes ApexCharts clear the tooltip the moment the
+    // animation finishes (~700ms) — the tooltip flashed then vanished until the cursor moved again.
+    chart:{ type:"area", height:46, sparkline:{enabled:true}, animations:{enabled:false} },
     stroke:{ curve:"smooth", width:2 },
     fill:{ type:"gradient", gradient:{ shadeIntensity:1, opacityFrom:.45, opacityTo:0, stops:[0,100] } },
     colors:[c],
@@ -437,21 +445,26 @@ function mainOpts(d){
 // External peers are excluded here because they carry no per-month rows in the payload
 // (months[].rows is built from local transcripts only), so they would plot as a flat
 // zero series. Their activity still shows on the hourly chart and on their own card.
-const splitUsers = (d) => d.users.filter(u => !u.external);
+// Rows with billed === false (a "_work" row with no billed row of its own) are outside the split too.
+const splitUsers = (d) => d.users.filter(u => !u.external && u.billed !== false);
+// Upstream trims this chart to its own first full month; this board shows every month, so the
+// x axis, the series and the tooltip (which indexes DATA.months) all use the same list.
+const chartMonths = (d) => d.months;
 const monthlySeries = (d) => splitUsers(d).map(u => ({ name:u.name,
   data: d.months.map(m => { const r=m.rows.find(x=>x.user===u.user); return r ? rowOf(r) : 0; }) }));
 function monthlyOpts(d){
+  const mm = chartMonths(d);
   return {
     chart:{ type:"bar", height:300, stacked:true, fontFamily:"inherit", background:"transparent",
       toolbar:{show:false}, animations:{ enabled:true, easing:"easeinout", speed:800 } },
     theme:{ mode: isDark()?"dark":"light" },
     colors: splitUsers(d).map(u=>colorFor(u.user)),
     series: monthlySeries(d),
-    plotOptions:{ bar:{ columnWidth: d.months.length<=2 ? "42%" : "62%",
+    plotOptions:{ bar:{ columnWidth: mm.length<=2 ? "42%" : "62%",
       borderRadius:4, borderRadiusApplication:"end", borderRadiusWhenStacked:"last" } },
     dataLabels:{ enabled:false },
     grid:{ borderColor:"color-mix(in srgb, "+muted()+" 22%, transparent)", strokeDashArray:4 },
-    xaxis:{ categories: d.months.map(m=>m.label), labels:{style:{colors:muted()}},
+    xaxis:{ categories: mm.map(m=>m.label), labels:{style:{colors:muted()}},
       axisBorder:{show:false}, axisTicks:{show:false} },
     yaxis:{ labels:{ style:{colors:muted()}, formatter:v=>fmt(v) } },
     legend:{ position:"top", horizontalAlign:"left", labels:{colors:ink()}, markers:{radius:4}, fontWeight:600 },
@@ -470,6 +483,36 @@ function monthlyOpts(d){
 
 let DATA=null, mainChart=null, monthlyChart=null; const sparks={}; let lastSig="";
 const sig = d => d.users.map(u=>u.user).join(",")+"|"+d.months.map(m=>m.key).join(",");
+
+// Create each chart once, then update in place. Destroying + re-rendering on every poll/stream
+// tick (which fires whenever the ranking reshuffles) restarted the grow-from-zero animation each
+// time, so the bars flickered and often showed as empty. updateSeries/updateOptions tween smoothly
+// (animate=false on background ticks) with no teardown.
+function syncMonthly(d, animate){
+  if(!monthlyChart){
+    monthlyChart = new ApexCharts(document.getElementById("monthlyChart"), monthlyOpts(d));
+    monthlyChart.render(); return;
+  }
+  const mm = chartMonths(d);
+  monthlyChart.updateOptions({
+    theme:{ mode: isDark()?"dark":"light" },
+    colors: splitUsers(d).map(u=>colorFor(u.user)),
+    xaxis:{ categories: mm.map(m=>m.label) },
+    plotOptions:{ bar:{ columnWidth: mm.length<=2 ? "42%" : "62%" } }
+  }, false, false);
+  monthlyChart.updateSeries(monthlySeries(d), !!animate);
+}
+function syncMain(d, animate){
+  if(!mainChart){
+    mainChart = new ApexCharts(document.getElementById("mainChart"), mainOpts(d));
+    mainChart.render(); return;
+  }
+  mainChart.updateOptions({
+    theme:{ mode: isDark()?"dark":"light" },
+    colors: d.users.map(u=>colorFor(u.user))
+  }, false, false);
+  mainChart.updateSeries(mainSeries(d), !!animate);
+}
 
 function build(d){
   const cards = document.getElementById("cards"); cards.innerHTML="";
@@ -509,13 +552,8 @@ function build(d){
 
   applyModeText();
 
-  if(monthlyChart) monthlyChart.destroy();
-  monthlyChart = new ApexCharts(document.getElementById("monthlyChart"), monthlyOpts(d));
-  monthlyChart.render();
-
-  if(mainChart) mainChart.destroy();
-  mainChart = new ApexCharts(document.getElementById("mainChart"), mainOpts(d));
-  mainChart.render();
+  syncMonthly(d, true);
+  syncMain(d, true);
 
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
   document.getElementById("foot").textContent =
@@ -525,14 +563,34 @@ function build(d){
     + "Sparklines cover the last "+d.spark_hours+" hours. This page refreshes every 30 seconds.";
 }
 
+// The SSE feed fires several times a second (usage.db is in WAL mode, so its file changes
+// continuously while any session is active). Each tick rebuilds every chart's SVG via updateSeries,
+// which yanks an open tooltip out from under the cursor — the tooltip flashed for one debounce
+// window (~0.5s) then vanished until you moved the pointer. So while the pointer is over any chart
+// (or its tooltip, which now escapes the sparkline box), hold the latest payload and apply it on the
+// way out. The `updated` stamp still ticks; only the redraw is deferred.
+let onChart = false, pendingData = null;
+const CHART_SEL = ".spark, #mainChart, #monthlyChart, .apexcharts-tooltip";
+document.addEventListener("pointerover", e => { if(e.target.closest?.(CHART_SEL)) onChart = true; });
+document.addEventListener("pointerout", e => {
+  if(e.target.closest?.(CHART_SEL) && !e.relatedTarget?.closest?.(CHART_SEL)){
+    onChart = false;
+    if(pendingData){ const d = pendingData; pendingData = null; refresh(d); }
+  }
+});
+
 function refresh(d){
+  // Periodic refresh: update data in place with animation OFF. Re-tweening every chart on each 30s
+  // poll / live tick is pure CPU/GPU churn that piles up when the board is left open. The one-time
+  // entrance animation still runs in build().
+  if(onChart){ pendingData = d; return; }   // don't redraw a chart the cursor is hovering — see note above
   d.users.forEach(u => {
     if(sparks[u.user]) sparks[u.user].updateSeries([{name:"tokens", data:sparkData(d,u)}]);
     const vals = { mo:monthOf(u), fivh:fiveOf(u), tot:totOf(u), all:allOf(u) };
     for(const pfx in vals){ const el=document.getElementById(pfx+"-"+u.user); if(el) countUp(el, vals[pfx]); }
   });
-  if(monthlyChart) monthlyChart.updateSeries(monthlySeries(d));
-  if(mainChart) mainChart.updateSeries(mainSeries(d));
+  syncMonthly(d, false);
+  syncMain(d, false);
   document.getElementById("updated").textContent = "updated "+ago(d.generated_at);
 }
 

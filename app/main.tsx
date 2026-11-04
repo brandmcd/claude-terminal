@@ -1,6 +1,7 @@
 // Chat-app front-end. A Claude-app-style UI that drives Claude Code through the
 // headless Agent SDK via the /app* routes in app-server.ts. The terminal stays one
 // click away (the "Terminal" link -> "/").
+import "../bstats-client.js"; // first: patches EventSource/WebSocket/setInterval for battery diagnostics
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { marked } from "marked";
@@ -9,8 +10,10 @@ import { VoiceMode, type VoiceBridge, readAloud, stopReadAloud } from "./voice";
 import { useDictation } from "./dictation";
 import { AskCard, type EmailDraft } from "./askcard";
 import * as offline from "./offline";
-import { AssistantContent, ArtifactViewer, noteFromText, type Artifact } from "./artifacts";
-import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } from "./agents";
+import { AssistantContent, ArtifactViewer, FileCard, Lightbox, downloadUrl, noteFromText, openLocalPath, type Artifact } from "./artifacts";
+import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer, isSpawnTabTool, SpawnTabButton, setOpenConversation } from "./agents";
+import { toolDisplay } from "./toollabels";
+import { extractShopCards, ShopGallery } from "./shopcards";
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { TaskPanel } from "./taskpanel";
 import { BoardStrip } from "./board";
@@ -70,21 +73,33 @@ const saveDraft = (id: string | null, v: string) => { try { if (v.trim()) localS
 // Save image as) instead of our text menu — the images are served inline, so native save works.
 const isImageTarget = (t: EventTarget | null) => (t as HTMLElement | null)?.tagName === "IMG";
 
-function longPressBind(open: (x: number, y: number) => void) {
+// The pressed element is passed along so a menu can offer what was under the finger (a link, code).
+function longPressBind(open: (x: number, y: number, target: Element | null) => void) {
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let sx = 0, sy = 0, fired = false, firedAt = 0;
+  let sx = 0, sy = 0, fired = false, firedAt = 0, st: Element | null = null;
   const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   return {
-    onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); open(e.clientX, e.clientY); },
+    onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); open(e.clientX, e.clientY, e.target as Element); },
     // 600ms hold, cancelled by any real movement (a scroll or a normal tap never opens the menu). On
     // an image the hold is left to the browser so its native "save image" sheet can open.
-    onTouchStart: (e: React.TouchEvent) => { if (isImageTarget(e.target)) return; const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy); }, 600); },
+    onTouchStart: (e: React.TouchEvent) => { if (isImageTarget(e.target)) return; const t = e.touches[0]; sx = t?.clientX || 0; sy = t?.clientY || 0; st = e.target as Element; fired = false; clear(); timer = setTimeout(() => { timer = null; fired = true; firedAt = Date.now(); open(sx, sy, st); }, 600); },
     onTouchMove: (e: React.TouchEvent) => { const t = e.touches[0]; if (t && (Math.abs(t.clientX - sx) > 8 || Math.abs(t.clientY - sy) > 8)) clear(); },
     onTouchEnd: (e: React.TouchEvent) => { clear(); if (fired) e.preventDefault(); },
     onTouchCancel: clear,
     // Swallow the click the browser fires after a long-press so the row doesn't ALSO navigate/open.
     onClickCapture: (e: React.MouseEvent) => { if (fired || Date.now() - firedAt < 700) { e.preventDefault(); e.stopPropagation(); fired = false; } },
   };
+}
+
+// What a long-press / right-click landed on inside a message: a link (its absolute URL) and/or code
+// (an inline code span, or the whole block it sits in), so the menu can copy just that.
+function pressedExtras(target: Element | null): { link?: string; code?: string } {
+  const el = target instanceof Element ? target : null;
+  if (!el) return {};
+  const a = el.closest("a") as HTMLAnchorElement | null;
+  const pre = el.closest("pre");
+  const code = pre ? (pre.querySelector("code") || pre) : el.closest("code");
+  return { link: a?.href || undefined, code: code?.textContent ?? undefined };
 }
 
 // #region types
@@ -112,7 +127,7 @@ type AppEvent =
   | { t: "compacting"; active: boolean; _seq?: number }
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft; _seq?: number }
   | { t: "ask_done"; askId: string; answer: string; _seq?: number }
-  | { t: "user"; text: string; cid?: string; _seq?: number }
+  | { t: "user"; text: string; cid?: string; midTurn?: boolean; uuid?: string; _seq?: number }
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage; _seq?: number }
   | { t: "notice"; kind: "task" | "peer" | "info" | "skill"; text: string; from?: string; status?: string; _seq?: number }
   | { t: "busy"; busy: boolean; since?: number; _seq?: number }
@@ -135,7 +150,7 @@ type SubscriptionWin = { utilization: number | null; resetsAt: string | null };
 type Subscription = { available: boolean; subscription: string | null; fiveHour: SubscriptionWin | null; sevenDay: SubscriptionWin | null } | null;
 
 type Item =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; midTurn?: boolean; uuid?: string }
   | { kind: "assistant"; model?: string; text: string; usage?: TurnUsage; bid?: string }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }; done?: "completed" | "failed" | "stopped" }
@@ -316,11 +331,13 @@ const api = {
   conversation: (id: string, since?: number) =>
     withTimeout(fetch(`/app/api/conversation/${encodeURIComponent(id)}${since && since > 0 ? `?since=${since}` : ""}`).then(J)),
   start: (b: { text: string; resume?: string; model?: string; cwd?: string; cid?: string; voice?: boolean; settings?: SessionSettings }) =>
-    fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+    fetch("/app/api/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
   send: (b: { id: string; text: string; cid?: string }) =>
-    fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
-  edit: (b: { id: string; index: number; text: string; cid?: string; orig?: string; model?: string }) =>
-    fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+    fetch("/app/api/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
+  deleteFrom: (b: { id: string; uuid: string }) =>
+    fetch("/app/api/delete-from", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
+  edit: (b: { id: string; uuid: string; text: string; cid: string; model?: string }) =>
+    fetch("/app/api/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...b, tz: clientTz() }) }).then(J),
   setModel: (b: { id: string; model: string }) =>
     fetch("/app/api/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) }).then(J),
   setSettings: (b: { id: string } & SessionSettings) =>
@@ -463,7 +480,7 @@ function applyEvent(items: Item[], e: AppEvent, model?: string | null): Item[] {
       // A loaded skill arrives as a user message that dumps the whole skill file. Render a compact card.
       const sk = skillLoadName(e.text);
       if (sk) return [...items, { kind: "notice", noticeKind: "skill", text: sk }];
-      return [...items, { kind: "user", text: sanitizeUserText(e.text) }];
+      return [...items, { kind: "user", text: sanitizeUserText(e.text), ...(e.midTurn ? { midTurn: true } : {}), ...(e.uuid ? { uuid: e.uuid } : {}) }];
     }
     case "text":
     case "text_delta": {
@@ -626,6 +643,10 @@ class ConvStore {
   private lastWrite = 0;
   private subs = new Set<() => void>();
   private mgr: ConvManager;
+  // Names this store's socket to the server, so a reconnect replaces its own stale subscriber there
+  // instead of pushing out another tab's live one (the reconnect ring of 2026-10-28). Per store, not
+  // per tab: two stores for one conversation must never replace each other.
+  private readonly cl = Math.random().toString(36).slice(2, 12);
   constructor(id: string, mgr: ConvManager) { this.id = id; this.mgr = mgr; }
 
   subscribe = (l: () => void) => { this.subs.add(l); return () => { this.subs.delete(l); }; };
@@ -639,7 +660,7 @@ class ConvStore {
     // the whole fix for "sent from my phone, never showed on the laptop": a fresh EventSource carries
     // no Last-Event-ID, so a deliberate reconnect used to ask for future-only and drop the gap.
     const resume = this.epoch && this.seq >= 0;
-    const q = resume ? `?epoch=${encodeURIComponent(this.epoch!)}&since=${this.seq}` : tail ? "?tail=1" : "";
+    const q = "?" + new URLSearchParams({ ...(resume ? { epoch: this.epoch!, since: String(this.seq) } : tail ? { tail: "1" } : {}), cl: this.cl });
     this.connectMode = resume ? "resume" : tail ? "tail" : "full";
     let es: EventSource;
     try { es = new EventSource(`/app/stream/${encodeURIComponent(this.id)}${q}`); } catch { return; }
@@ -742,7 +763,7 @@ class ConvStore {
   // now (so the send is visibly acknowledged) but pinned BELOW the reply that is still streaming
   // instead of splitting it. doEdit passes false, because a rewind cancels the running turn and its rerun
   // must appear under the edited bubble, not above it.
-  addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text }); this.busy = true; this.setSendState("sending"); this.touch(); }
+  addOptimisticUser(text: string, cid?: string) { this.pendingEcho.push({ cid, text, at: Date.now() }); this.items = applyEvent(this.items, { t: "user", text, ...(cid ? { uuid: cid } : {}), ...(this.busy ? { midTurn: true } : {}) }); this.busy = true; this.setSendState("sending"); this.touch(); }
   // Edit-and-rerun: drop the edited user bubble + everything after it (the forked turn streams in
   // below), and restore the pre-edit view if the server rejects the edit.
   truncateFrom(index: number) { this.items = this.items.slice(0, Math.max(0, index)); this.pendingEcho = []; this.touch(); }
@@ -754,6 +775,20 @@ class ConvStore {
   // Put an ask card back to unanswered: the optimistic mark is a lie if the answer never reached the
   // server, and a card that looks answered while the turn is still parked in the tool call is the
   // worst of both worlds (see deliverAsk).
+  // Make this chat's open questions match the server's pending ones (the only ones that can unblock
+  // the turn): add any we never received, and close any the server no longer has (answered on another
+  // device, or a transcript copy of an ask that the live runner replaced). A closed one keeps its
+  // place in the thread but can no longer be answered or be the target of the composer.
+  mergeAsks(pending: { askId: string; question: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean }[]) {
+    const ids = new Set(pending.map((a) => a.askId));
+    let items = this.items.map((it) => (it.kind === "ask" && it.answered === undefined && !ids.has(it.askId) ? { ...it, answered: "" } : it));
+    for (const a of pending) {
+      if (!items.some((it) => it.kind === "ask" && it.askId === a.askId)) {
+        items = [...items, { kind: "ask", askId: a.askId, question: a.question, options: a.options || [], multiSelect: a.multiSelect, allowText: a.allowText }];
+      }
+    }
+    this.items = items; this.touch();
+  }
   unanswerAsk(askId: string) { this.items = this.items.map((it) => (it.kind === "ask" && it.askId === askId ? { ...it, answered: undefined } : it)); this.touch(); }
   // When the current turn started (epoch ms), 0 when idle. The server's busy event carries the exact
   // start; before it arrives (an optimistic send, a reload mid-turn) the first local sighting stands in.
@@ -876,6 +911,7 @@ class ConvStore {
   }
 
   teardown() { this.disconnect(); this.flushCache(); this.subs.clear(); }
+  abandon() { this.disconnect(); if (this.cacheTimer) { clearTimeout(this.cacheTimer); this.cacheTimer = null; } this.subs.clear(); } // replaced by another store for the same id: write nothing, its cache entry belongs to that one now
 }
 
 class ConvManager {
@@ -886,6 +922,11 @@ class ConvManager {
   get(id: string) { return this.stores.get(id); }
   rebind(store: ConvStore, newId: string) {
     if (store.id === newId) return;
+    // The status poll can see a new chat's real id before this store learns it and open a background
+    // store for it. Overwriting that entry orphaned it with its EventSource still open, reconnecting
+    // forever with nothing able to close it. Close it before taking its place.
+    const other = this.stores.get(newId);
+    if (other && other !== store) other.abandon();
     this.stores.delete(store.id);
     this.stores.set(newId, store); store.id = newId; store.hydrated = true; store.signal();
   }
@@ -934,10 +975,34 @@ function estToolTokens(it: Extract<Item, { kind: "tool" }>): number {
   return Math.round(n / 4);
 }
 
+/**
+ * Render a shop tool's result as a gallery, or null if it has no cards.
+ *
+ * The tool card is still reachable underneath: a gallery shows the listings,
+ * and anyone wanting the raw text can open the collapsed original.
+ */
+function shopGalleries(it: Extract<Item, { kind: "tool" }>) {
+  if (it.result === undefined || it.isError) return null;
+  if (!/^mcp__shop__|^shop__/.test(it.name)) return null;
+  let raw = "";
+  try { raw = contentToText(it.result) || ""; } catch { return null; }
+  if (!raw.includes("```shop-cards")) return null;
+  const { payloads } = extractShopCards(raw);
+  if (!payloads.length) return null;
+  return (
+    <>
+      {payloads.map((p, k) => <ShopGallery key={k} payload={p} />)}
+      <ToolCard it={it} />
+    </>
+  );
+}
+
 function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
   const [open, setOpen] = useState(false);
   const summary = useMemo(() => {
     const inp: any = it.input || {};
+    const pretty = toolDisplay(it.name, inp);
+    if (pretty) return pretty.summary;
     if (it.name === "Bash") return inp.command || "";
     if (inp.file_path) return inp.file_path;
     if (inp.path) return inp.path;
@@ -949,7 +1014,7 @@ function ToolCard({ it }: { it: Extract<Item, { kind: "tool" }> }) {
     <div className="tool">
       <button className={"tool-head" + (open ? " open" : "")} onClick={() => setOpen((o) => !o)}>
         <svg className="chev" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-        <span className="tname">{it.name}</span>
+        {(() => { const d = toolDisplay(it.name, it.input); return <span className={"tname" + (d ? " tname-pretty" : "")}>{d?.label ?? it.name}</span>; })()}
         <span className={"tsum" + (it.isError ? " terr" : "")}>{summary}</span>
         {est > 0 && <span className="tool-tok" title="Estimated tokens (call + result)">~{fmtTokens(est)} tokens</span>}
         {it.result === undefined && <span className="typing"><span></span><span></span><span></span></span>}
@@ -1114,7 +1179,7 @@ function BusyLine({ phase, detail, since, waiting }: { phase: Phase; detail?: st
   const label = waiting ? "Waiting for you"
     : phase === "starting" ? "Starting the session"
     : phase === "waiting" ? "Waiting for the model"
-    : phase === "tool" ? `Running ${detail || "a tool"}`
+    : phase === "tool" ? `Running ${detail ? (toolDisplay(detail, {})?.label ?? detail) : "a tool"}`
     : phase === "retrying" ? `API error, retrying${detail ? ` (${detail})` : ""}`
     : phase === "limited" ? "Rate limited, waiting for the window to reset"
     : phase === "compacting" ? "Compacting"
@@ -1141,6 +1206,26 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
   // condition a stale block at the end of a dead turn ticked from its start time forever.
   const live = isLast && it.elapsed == null && busy;
   const [now, setNow] = useState(() => Date.now());
+  // Live: capped at 4 lines and scrolling. Done: a collapsed "Thought for Xs" row that opens.
+  const [open, setOpen] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  // Summarized thinking does not stream: a block sits empty, then all its text lands in one burst
+  // just before the block ends. Showing that text at once meant a four-line box that appeared and
+  // collapsed into the "Thought for Xs" row a moment later, before almost every tool call, so the
+  // thread flashed. Only reveal live text that has been there 600 ms; a short block goes straight
+  // to its row, a long one still shows its capped text while it runs.
+  const [showLiveText, setShowLiveText] = useState(false);
+  const hasText = !!it.text;
+  useEffect(() => {
+    if (!live || !hasText || showLiveText) return;
+    const t = setTimeout(() => setShowLiveText(true), 600);
+    return () => clearTimeout(t);
+  }, [live, hasText, showLiveText]);
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    if (live) el.scrollTop = el.scrollHeight; // streaming: keep the newest line in view
+  }, [it.text, open, live]);
   useEffect(() => {
     if (!live) return; // only the live block ticks
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -1148,7 +1233,19 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
   }, [live]);
   if (!live) {
     // finished: only worth showing if the reasoning text is exposed (usually redacted on subscription auth)
-    return it.text ? (<div className="thinking"><div className="think-label">Thought process</div>{it.text}</div>) : null;
+    if (!it.text) return null;
+    // Done: fold into a tool-style row, "Thought for 12s", that opens to the whole reasoning.
+    const secsDone = it.elapsed != null ? Math.max(1, Math.round(it.elapsed / 1000)) : null;
+    return (
+      <div className={"tool-group think-group" + (open ? " open" : "")}>
+        <button className="tool-group-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+          <svg className="chev" width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+          <span className="tg-label">{secsDone != null ? `Thought for ${fmtDur(secsDone)}` : "Thought"}</span>
+          {it.tokens ? <span className="tg-tok">~{fmtTokens(it.tokens)} tokens</span> : null}
+        </button>
+        {open && <div className="tool-group-body think-full">{it.text}</div>}
+      </div>
+    );
   }
   const secs = it.elapsed != null ? Math.round(it.elapsed / 1000) : it.started ? Math.max(0, Math.round((now - it.started) / 1000)) : null;
   const meta = [secs == null ? "" : fmtDur(secs), it.tokens ? `~${it.tokens} tokens` : ""].filter(Boolean).join(" · ");
@@ -1157,9 +1254,24 @@ function ThinkingCard({ it, isLast, busy }: { it: Extract<Item, { kind: "thinkin
       <span className="think-dots"><span></span><span></span><span></span></span>
       <span className="think-label">Thinking</span>
       {meta && <span className="think-tok">{meta}</span>}
-      {it.text && <div className="think-text">{it.text}</div>}
+      {it.text && showLiveText && <div ref={bodyRef} className="think-text think-body">{it.text}</div>}
     </div>
   );
+}
+
+// A message's id. The client makes it when the message is sent; the server and Claude Code store the
+// same value as the transcript entry's uuid, so every message has one id everywhere from the start.
+// The device's IANA timezone, sent with every turn so Claude's clock is the user's, not the server's.
+function clientTz(): string | undefined {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined; } catch { return undefined; }
+}
+
+function newId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|heic|heif|svg|avif)$/i;
@@ -1196,7 +1308,24 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
   return null;
 }
 
-function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy, assistantName = "Claude" }: { assistantName?: string; items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
+// Images and files the user attached: a photo opens in the full-screen viewer, a file is a download
+// card. Its own component so the viewer's open state lives here, not in the memoized message block.
+function UserAttachments({ images, files, convId, onOpenArtifact }: { images: string[]; files: string[]; convId: string | null; onOpenArtifact?: (a: Artifact) => void }) {
+  const [light, setLight] = useState<string | null>(null);
+  if (!images.length && !files.length) return null;
+  return (
+    <>
+      {images.map((p, k) => {
+        const src = downloadUrl(convId, p);
+        return <img key={k} className="msg-img msg-img-zoom" loading="lazy" src={src} alt="attachment" onClick={(e) => { e.stopPropagation(); setLight(src); }} />;
+      })}
+      {files.map((p, k) => <FileCard key={k} href={downloadUrl(convId, p)} name={p.split("/").pop() || p} onOpen={onOpenArtifact ? () => openLocalPath(p, convId, onOpenArtifact) : undefined} />)}
+      {light && <Lightbox src={light} onClose={() => setLight(null)} />}
+    </>
+  );
+}
+
+function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy, assistantName = "Claude" }: { assistantName?: string; items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number, extra?: { link?: string; code?: string }) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
   // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
   // audio actually plays (Kokoro TTS can take a moment), then a subtle "playing" state until it ends.
@@ -1215,8 +1344,8 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   // triggers our menu instead of the OS text-selection popup.
   const menuBind = (text: string, kind: "user" | "assistant"): Record<string, unknown> => {
     if (!onMenu) return {};
-    if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y) => onMenu(x, y, text, kind, i)) };
-    return { onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i); } };
+    if (IS_TOUCH) return { style: { userSelect: "none", WebkitUserSelect: "none" }, ...longPressBind((x, y, t) => onMenu(x, y, text, kind, i, pressedExtras(t))) };
+    return { onContextMenu: (e: React.MouseEvent) => { if (isImageTarget(e.target)) return; e.preventDefault(); onMenu(e.clientX, e.clientY, text, kind, i, pressedExtras(e.target as Element)); } };
   };
   if (it.kind === "user") {
     // A message from another Claude session -> a tidy card, not the raw XML tag.
@@ -1229,7 +1358,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M17 8l4 4-4 4" /><path d="M7 8l-4 4 4 4" /><path d="M14 4l-4 16" /></svg>
               <span>{agent.from}</span>
             </div>
-            <AssistantContent text={agent.body} convId={convId} onOpenArtifact={onOpenArtifact} />
+            <AssistantContent text={agent.body} convId={convId} onOpenArtifact={onOpenArtifact} v={i} />
           </div>
           {raPill}
         </div>
@@ -1239,8 +1368,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
     return (
       <div className="msg">
         <div className="bubble-user" {...menuBind(body || it.text, "user")}>
-          {images.map((p, k) => <img key={k} className="msg-img" loading="lazy" src={`/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(p)}`} alt="attachment" />)}
-          {files.map((p, k) => <div key={k} className="msg-file">📎 {p.split("/").pop()}</div>)}
+          <UserAttachments images={images} files={files} convId={convId} onOpenArtifact={onOpenArtifact} />
           {body && <div className="bubble-user-text">{ultraSpans(body)}</div>}
         </div>
         {raPill}
@@ -1262,7 +1390,16 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   }
   if (it.kind === "ask") return <AskCard it={it} onAnswer={onAnswer} />;
   if (it.kind === "thinking") return <ThinkingCard it={it} isLast={i === items.length - 1} busy={!!busy} />;
-  if (it.kind === "tool") return isAgentTool(it.name, it.input) ? <div data-agent-id={it.id}><AgentToolCard it={it} /></div> : <ToolCard it={it} />;
+  if (it.kind === "tool") {
+    if (isAgentTool(it.name, it.input)) return <div data-agent-id={it.id}><AgentToolCard it={it} /></div>;
+    // A shopping result draws as a browsable gallery rather than a collapsed
+    // accordion of JSON. Falls through to the ordinary card when the result has
+    // no cards in it (an error, or a tool that returns prose only).
+    const gal = shopGalleries(it);
+    if (gal) return gal;
+    if (isSpawnTabTool(it.name, it.input)) return <><ToolCard it={it} /><SpawnTabButton it={it} convId={convId} /></>;
+    return <ToolCard it={it} />;
+  }
   if (it.kind === "notice") {
     if (it.noticeKind === "skill") {
       return (
@@ -1303,7 +1440,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   return (
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
       {showRole && <div className="role">{it.model ? (providerOf(it.model) === "codex" ? "Codex" : "Claude") : assistantName}</div>}
-      <AssistantContent text={it.text} convId={convId} onOpenArtifact={onOpenArtifact} />
+      <AssistantContent text={it.text} convId={convId} onOpenArtifact={onOpenArtifact} v={i} />
       {raPill}
       {summary && <div className="turn-think" title={tip}>{summary}</div>}
     </div>
@@ -1408,6 +1545,7 @@ function App() {
   const assistantName = provider === "codex" ? "Codex" : "Claude";
   useEffect(() => { document.body.classList.toggle("provider-codex", provider === "codex"); return () => document.body.classList.remove("provider-codex"); }, [provider]);
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
+  const editChipsRef = useRef(false); // the composer chips came from an edited turn (cleared on chat switch)
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [uploadError, setUploadError] = useState("");
   const [drawer, setDrawer] = useState(false);
@@ -1463,6 +1601,7 @@ function App() {
   const [limitToast, setLimitToast] = useState<{ left: number; resetIn: string; n: number } | null>(null);
   const limitDismissed = useRef(false);
   const [statuses, setStatuses] = useState<Record<string, { busy: boolean; waiting: boolean; since?: number }>>({});
+  const prevStatusesRef = useRef<Record<string, { busy: boolean; waiting: boolean; since?: number }>>({});
   // When the open conversation's current turn started: the server's figure from the live stream
   // first, then the status poll's, which covers a turn driven from a terminal tab.
   const turnSince = busy ? (activeId && statuses[activeId]?.since) || activeStore?.turnStart() || Date.now() : 0;
@@ -1478,10 +1617,10 @@ function App() {
   const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
   const lastReadRef = useRef<Record<string, number>>(loadLastRead());
   const [readTick, setReadTick] = useState(0); // bump to re-render unread dots after marking read
-  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant"; i: number } | null>(null);
+  const [msgMenu, setMsgMenu] = useState<{ x: number; y: number; text: string; kind: "user" | "assistant"; i: number; link?: string; code?: string } | null>(null);
   // Editing a past user turn: its item index + original text. Set by the message "Edit" action;
   // on submit the turn is rewound-and-rerun (full rollback) instead of appended as a new turn.
-  const [editing, setEditing] = useState<{ i: number; orig: string } | null>(null);
+  const [editing, setEditing] = useState<{ uuid: string; orig: string } | null>(null); // the message being edited, by id
   // Why an in-flight edit could not be applied. An edit is a server-side rewind, so when it fails the
   // turn must stay in edit mode with the reason shown, never silently fall through to a normal send.
   const [editError, setEditError] = useState<string | null>(null);
@@ -1759,7 +1898,7 @@ function App() {
     // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
     void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
     api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setCommands(d.commands || []); setAgents(d.agents || []); setDefaultCwd(d.defaultCwd || ""); setBoard(!!d.board); setSketch(!!d.sketch); setInventory(!!d.inventory); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (d.guest) { setGuest(true); const saved = localStorage.getItem("ct-app-model") || ""; if (d.models?.[0] && (!saved || /fable/i.test(saved) || !(d.models as Model[]).concat(d.moreModels || []).some((m) => m.id === saved))) setDefaultModel(d.models[0].id); }
-      else if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id);
+      else { const def = d.defaultModel || d.models?.[0]?.id; if (!localStorage.getItem("ct-app-model") && def) setDefaultModel(def); }
       // "?voice=1" opens straight into voice mode. The terminal's tab bar links here so a
       // voice session is one tap from the terminal rather than open-app-then-find-the-mic.
       // Gated on d.voice for the same reason the mic button is: without the services the
@@ -1823,6 +1962,10 @@ function App() {
             if (!/^[A-Za-z0-9-]{20,}$/.test(id) || known.has(id) || seenConvIds.current.has(id)) continue;
             seenConvIds.current.add(id); fresh = true;
           }
+          // A turn finishing (busy -> idle) changes that chat's place in the list, on whichever device ran it.
+          const prev = prevStatusesRef.current;
+          for (const [id, st] of Object.entries<any>(d?.statuses || {})) if (prev[id]?.busy && !st?.busy) fresh = true;
+          prevStatusesRef.current = d?.statuses || {};
           if (fresh) refreshConvs();
         })
         .catch((e) => { if (e instanceof SignedOut) { setSignedOut(true); return; } netMiss.current += 1; if (netMiss.current >= 2) setReachable(false); });        // TWO misses in a row before crying unstable: one dropped 4s poll is not a down link, and flipping the banner on every single miss made a fine connection look flaky
@@ -1830,6 +1973,30 @@ function App() {
     };
     pull(); const t = setInterval(pull, 4000); return () => clearInterval(t);
   }, [refreshQueue, refreshConvs]);
+  // Self-heal the open question. The thread can miss an ask_user card (seen on a phone: its live
+  // stream stalled mid-turn, it resumed from a transcript copy, and the question that arrived in the
+  // gap never showed), or hold a stale one that the composer then "answers". The status poll knows
+  // the truth about waiting; whenever it, or the set of questions open on screen, changes, fetch the
+  // server's pending asks once and merge them. One fetch per change, at most every 8 s.
+  const askSyncKey = useRef("");
+  const askSyncAt = useRef(0);
+  useEffect(() => {
+    const s = activeStoreRef.current, id = activeIdRef.current;
+    if (!s || !id || id.startsWith("new-")) return;
+    const open = s.items.filter((it) => it.kind === "ask" && it.answered === undefined).map((it) => (it as Extract<Item, { kind: "ask" }>).askId).sort();
+    const waiting = !!statuses[id]?.waiting;
+    const key = `${id}|${waiting ? 1 : 0}|${open.join(",")}`;
+    if (key === askSyncKey.current) return;
+    if (!waiting && !open.length) { askSyncKey.current = key; return; } // nothing open anywhere: agreed
+    if (Date.now() - askSyncAt.current < 8000) return;
+    askSyncAt.current = Date.now();
+    void api.conversation(id, s.evCount).then((d: any) => {
+      if (activeStoreRef.current !== s) return;
+      s.mergeAsks(d?.live && Array.isArray(d.pendingAsks) ? d.pendingAsks : []);
+      const after = s.items.filter((it) => it.kind === "ask" && it.answered === undefined).map((it) => (it as Extract<Item, { kind: "ask" }>).askId).sort();
+      askSyncKey.current = `${id}|${waiting ? 1 : 0}|${after.join(",")}`;
+    }).catch(() => { /* next poll retries */ });
+  }, [statuses]);
   // App-icon badge: how many agents are WAITING on you. Deliberately not "how many are busy" — the
   // badge answers "does anything need me", and a working agent does not. The service worker sets the
   // same badge from a status push while the app is closed, so the two agree.
@@ -2173,7 +2340,7 @@ function App() {
     compactQueue.current = compactQueue.current.filter((it) => !take.includes(it));
     void (async () => {
       for (const { store: s, text } of take) {
-        const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+        const cid = newId();
         s.addOptimisticUser(text, cid); // now renders below the compaction divider (card already applied)
         const body = { text, cid, resume: s.id.startsWith("new-") ? undefined : s.id, model: (s.id.startsWith("new-") ? modelRef.current : s.model) || undefined, cwd: cwdRef.current || undefined , settings: startSettings(s) };
         try { if (s.connected) await api.send({ id: s.id, text, cid }); else { const r = await api.start(body); if (r?.id) { manager.rebind(s, r.id); s.connect(false); } } }
@@ -2185,19 +2352,30 @@ function App() {
   // Open a conversation: point the view at its store, paint instantly from what we already have (memory
   // -> cache), then reconcile from the network once and connect if it's live. The store holds its items
   // continuously, so a switch is a pointer change — no reconnect, no re-fetch when it's already in memory.
-  const loadConv = useCallback(async (id: string, highlight?: string) => {
+  // `resync`: a same-conversation catch-up (coming back to the app). Fetch what this device missed
+  // and reconnect, without the side effects of OPENING a chat (drawer, search, read-aloud, spinner).
+  const loadConv = useCallback(async (id: string, highlight?: string, opts?: { resync?: boolean }) => {
+    const resync = !!opts?.resync && activeIdRef.current === id;
     activeStoreRef.current?.flushCache(); // snapshot the conversation we're leaving so returning is instant
-    setEditing(null); setEditError(null); // a stale edit target from another conversation must not carry over
+    // A stale edit target from another conversation must not carry over, nor its attachment chips. A
+    // resync is the SAME conversation catching up (app refocused): an edit in progress stays. Clearing
+    // it here is what turned an edit into a plain new message on 2026-10-26.
+    if (!resync) {
+      setEditing(null); setEditError(null);
+      if (editChipsRef.current) { editChipsRef.current = false; setAttachments([]); }
+    }
     const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
     const s = manager.ensure(id);
     if (!s.model) s.model = convsRef.current.find((c) => c.sessionId === id)?.model || null;
     setActiveStore(s); activeStoreRef.current = s;
     activeIdRef.current = id;
     if (switching) setInput(loadDraft(id)); // swap the composer to this conversation's saved draft
-    setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
-    stopReadAloud(); setReading(null); // don't keep reading a message from the conversation you just left
-    setDrawer(false);
-    history.replaceState(null, "", `/app?c=${id}`);
+    if (!resync) {
+      setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
+      stopReadAloud(); setReading(null); // don't keep reading a message from the conversation you just left
+      setDrawer(false);
+      history.replaceState(null, "", `/app?c=${id}`);
+    }
     // Jump to the end only when actually OPENING a different conversation. A same-conversation reload
     // (stall-watchdog resync, stream reconnect, offline-queue drain) must not force-scroll, or it yanks
     // you back to the bottom every few seconds while you're scrolled up reading.
@@ -2219,11 +2397,14 @@ function App() {
       }
     }
     if (!navigator.onLine) { if (!s.items.length) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
-    setLoadingConv(true);
+    if (!resync) setLoadingConv(true);
     try {
       // A cursor with no messages behind it (cache lost its items) would fold an empty delta onto nothing
-      // and leave the chat blank on every open, so it needs the full fetch.
-      const useDelta = s.evCount > 0 && !s.evDirty && s.items.length > 0;
+      // and leave the chat blank on every open, so it needs the full fetch. Every user bubble must also
+      // carry its transcript id (edit and delete act on it). Bubbles from the offline cache or a live
+      // stream have none, so a store holding any of those loads in full.
+      const missingIds = s.items.some((x) => x.kind === "user" && !x.midTurn && !(x as { uuid?: string }).uuid);
+      const useDelta = s.evCount > 0 && !s.evDirty && s.items.length > 0 && !missingIds;
       const d = await api.conversation(id, useDelta ? s.evCount : 0);
       if (d.model) s.model = d.model;
       else for (const e of (d.events || []) as AppEvent[]) if (e.t === "init" || e.t === "model") s.model = e.model;
@@ -2252,7 +2433,30 @@ function App() {
     } finally { if (activeStoreRef.current === s) setLoadingConv(false); }
   }, [defaultCwd]);
 
+  // Coming back to the app (phone unlocked, tab refocused) after using another device: the list
+  // and the open thread were only refreshed by this device's own actions, and a stream that died
+  // while asleep reconnected only if this device thought a turn was running, so turns sent from the
+  // other device stayed missing until the app was closed and reopened. Re-pull both on return, and
+  // pull the list once a minute while visible so renames, deletes and reordering show up too.
+  useEffect(() => {
+    let last = 0;
+    const resync = () => {
+      if (document.visibilityState !== "visible" || !navigator.onLine) return;
+      const now = Date.now();
+      if (now - last < 3000) return; // visibilitychange and focus fire together
+      last = now;
+      refreshConvs();
+      const id = activeIdRef.current;
+      if (id && !id.startsWith("new-") && !id.startsWith("pending-")) void loadConv(id, undefined, { resync: true });
+    };
+    document.addEventListener("visibilitychange", resync);
+    window.addEventListener("focus", resync);
+    const iv = setInterval(() => { if (document.visibilityState === "visible" && navigator.onLine) refreshConvs(); }, 60_000);
+    return () => { document.removeEventListener("visibilitychange", resync); window.removeEventListener("focus", resync); clearInterval(iv); };
+  }, [refreshConvs, loadConv]);
+
   loadConvRef.current = loadConv;
+  useEffect(() => { setOpenConversation((id) => { void loadConv(id); }); return () => setOpenConversation(null); }, [loadConv]);
   const newChat = () => { setActiveStore(null); activeStoreRef.current = null; activeIdRef.current = null; setAttachments([]); setEditing(null); setEditError(null); setInput(loadDraft(null)); cwdRef.current = defaultCwd; history.replaceState(null, "", "/app"); setDrawer(false); taRef.current?.focus(); };
   newChatRef.current = newChat;
   // View a queued (offline) new chat immediately — show its message + a note, without waiting for it
@@ -2373,7 +2577,7 @@ function App() {
     if (s!.compacting && !s!.id.startsWith("new-")) { compactQueue.current.push({ store: s!, text }); return s!.id; }
     // Stable client id so a redelivery (offline queue OR a timeout requeue) is deduped server-side
     // instead of posting the same turn twice, and so the server's echo of this turn matches it exactly.
-    const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    const cid = newId();
     s!.addOptimisticUser(text, cid); // renders the turn, flips busy, sets sendState "sending"
     const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: (s!.id.startsWith("new-") ? modelRef.current : s!.model) || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined , settings: startSettings(s!) };
     const queue = async () => {
@@ -2407,6 +2611,7 @@ function App() {
     // Doing it here (not only via the input-change effect) avoids a race where a new chat gets its real
     // id before the effect runs, leaving the "__new__" draft set so the next new chat reloads it.
     saveDraft(activeIdRef.current, "");
+    const sentAttachments = attachments;
     setInput(""); setAttachments([]);
     if (taRef.current) taRef.current.style.height = "auto";
     // The composer being emptied is authoritative. Without this, dictation's next poll returns the
@@ -2415,23 +2620,27 @@ function App() {
     // so you can send mid-thought and carry straight on into a clean composer.
     if (dictation.active) { dictation.reset(); dictAnchorRef.current = { prefix: "", suffix: "" }; }
     else dictAnchorRef.current = null;
-    // Editing a past turn -> rewind-and-rerun instead of appending. Attachments don't apply to an edit.
+    // Editing a past turn -> rewind-and-rerun instead of appending, with the chips as its attachments.
     if (editing) {
       const ed = editing;
       setEditing(null); setEditError(null);
-      const err = await doEdit(ed, withUltra(raw, provider === "codex" ? "" : ultraRef.current));
+      const err = await doEdit(ed, withUltra(text, provider === "codex" ? "" : ultraRef.current));
       // Failed edits stay edits: restore the composer and the banner so it can be retried or cancelled.
       // Falling through to submitText() here is what used to append the edit as a duplicate turn.
-      if (err) { setEditing(ed); setEditError(err); setInput(raw); requestAnimationFrame(() => taRef.current?.focus()); }
+      if (err) { setEditing(ed); setEditError(err); setInput(raw); setAttachments(sentAttachments); requestAnimationFrame(() => taRef.current?.focus()); }
       return;
     }
     // An unanswered ask_user card blocks the whole turn: the SDK is parked inside the tool call, so
     // a normal send only reaches the runner's input queue, which is not drained until the turn ends.
     // That reads as double grey ticks and no reply, forever. Typing an answer is the obvious thing
     // to do when the last thing on screen is a question, so route the text to the card instead.
+    // Only when the draft was started AFTER the question appeared, though: text the user was already
+    // typing when a question popped up is the mid-turn message they meant, not an answer. That goes
+    // out as a normal (queued) message and the card stays open for them to answer.
     const askStore = activeStoreRef.current;
     const openAsk = attachments.length ? undefined : (askStore?.items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined);
-    if (askStore && openAsk) {
+    const typedForAsk = !!openAsk && draftStartRef.current >= (askSeenRef.current[openAsk.askId] ?? 0);
+    if (askStore && openAsk && typedForAsk) {
       askStore.answerAsk(openAsk.askId, raw);
       void deliverAsk(askStore, openAsk.askId, raw);
       return;
@@ -2478,36 +2687,79 @@ function App() {
   const stop = async () => { const s = activeStoreRef.current; if (!s) return; s.setBusy(false); await api.interrupt(s.id); };
 
   // #region context menus (long-press / right-click): message copy+edit, conversation rename+delete
-  const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant", i: number) => setMsgMenu({ x, y, text, kind, i }), []);
-  const copyText = (t: string) => { try { void navigator.clipboard?.writeText(t); } catch { /* */ } };
+  const onMsgMenu = useCallback((x: number, y: number, text: string, kind: "user" | "assistant", i: number, extra?: { link?: string; code?: string }) => setMsgMenu({ x, y, text, kind, i, ...extra }), []);
+  // Clipboard API first; the hidden-textarea fallback covers browsers/contexts where it is missing.
+  const copyText = (t: string) => {
+    const fallback = () => { try { const ta = document.createElement("textarea"); ta.value = t; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); } catch { /* */ } };
+    try { if (navigator.clipboard?.writeText) navigator.clipboard.writeText(t).catch(fallback); else fallback(); } catch { fallback(); }
+  };
   // Enter edit mode for a past user turn: prefill the composer and remember which turn, so submit
   // rewinds-and-reruns from there (see doEdit) instead of appending a new turn.
-  const startEdit = (i: number, t: string) => { setMsgMenu(null); setEditing({ i, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
-  const cancelEdit = () => { setEditing(null); setEditError(null); setInput(""); if (taRef.current) taRef.current.style.height = "auto"; };
+  // Editing a turn loads its attachments into the composer chips too, so they can be removed or
+  // added to before the rerun (doSend builds the same "Attached files:" text a normal send does).
+  const startEdit = (i: number, t: string) => {
+    const it = activeStoreRef.current?.items[i] as { kind: string; text?: string } | undefined;
+    editChipsRef.current = true;
+    if (it?.kind === "user" && it.text) {
+      const p = parseUserText(it.text);
+      const cid = activeIdRef.current;
+      setAttachments([...p.images, ...p.files].map((path) => ({ name: path.split("/").pop() || path, path, isImage: IMG_RE.test(path), preview: IMG_RE.test(path) ? downloadUrl(cid, path) : undefined })));
+    }
+    startEditText(i, t);
+  };
+  const startEditText = (i: number, t: string) => { const uuid = (activeStoreRef.current?.items[i] as { uuid?: string } | undefined)?.uuid; setMsgMenu(null); if (!uuid) { window.alert("Edit failed: message has no id"); return; } setEditing({ uuid, orig: t }); setEditError(null); setInput(t); requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; ta.setSelectionRange(t.length, t.length); } }); };
+  const cancelEdit = () => { setEditing(null); setEditError(null); setInput(""); setAttachments([]); if (taRef.current) taRef.current.style.height = "auto"; };
   // Rewind-and-rerun: drop the edited turn + everything after (optimistically), then ask the server to
   // roll files back to that turn's checkpoint, fork the transcript, and re-run the edited text. The
   // forked session's new id + reply stream back in on the existing socket. Returns null on success or
   // a human reason on failure. It must NEVER fall back to submitText(): an edit that degrades into a
   // plain send leaves the original turn in place and posts the edited text as a second, duplicate turn.
-  const doEdit = async (ed: { i: number; orig: string }, text: string): Promise<string | null> => {
+  const doEdit = async (ed: { uuid: string; orig: string }, text: string): Promise<string | null> => {
     const s = activeStoreRef.current;
     const realId = !!s && !s.id.startsWith("new-") && !s.id.startsWith("pending-");
     if (!s || !realId) return "This chat hasn't started on the server yet, so there's no turn to rewind. Cancel the edit to send it as a new message.";
     if (typeof navigator !== "undefined" && !navigator.onLine) return "You're offline. An edit rewinds the conversation on the server, so unlike a normal message it can't be queued. It will work once you're back online.";
-    // 0-based ordinal among user turns up to the edited item — matches the server's user-turn count.
-    let uindex = -1; for (let k = 0; k <= ed.i && k < s.items.length; k++) if (s.items[k].kind === "user") uindex++;
-    if (uindex < 0) return "Couldn't work out which turn to rewind to. Reload the conversation and try again.";
+    const target = ed.uuid; // the message's own id, same on client and server
+    const at = s.items.findIndex((x) => (x as { uuid?: string }).uuid === target);
+    if (at < 0) return "That message is no longer in this conversation.";
     stickBottom.current = true; setAtBottom(true);
     const snapshot = s.items;
-    s.truncateFrom(ed.i);             // drop the edited bubble + everything after
-    const cid = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
-    s.addOptimisticUser(text, cid); // re-render the edited text below; arms the echo dedup
+    s.truncateFrom(at);               // drop the edited bubble + everything after
+    const cid = newId();              // the edited message's id, used by the server and Claude Code as-is
+    s.addOptimisticUser(text, cid);   // re-render the edited text below; arms the echo dedup
     try {
-      const r = await withTimeout(api.edit({ id: s.id, index: uindex, text, cid, orig: ed.orig, model: s.model || undefined }), 30000);
+      const r = await withTimeout(api.edit({ id: s.id, uuid: target, text, cid, model: s.model || undefined }), 30000);
       if (r?.error) { s.restore(snapshot); return "Couldn't edit that message: " + r.error; }
       if (s.sendState === "sending") s.setSendState("delivered");
       return null;
     } catch { s.restore(snapshot); return "Couldn't reach the server to edit, so nothing was sent and nothing was duplicated. Try again."; }
+  };
+  // The first real user turn is the whole conversation: it has Delete on the conversation instead.
+  const isFirstTurn = (items: Item[], i: number) => {
+    for (let k = 0; k < i; k++) { const x = items[k]; if (x.kind === "user" && !x.midTurn) return false; }
+    return true;
+  };
+  // Delete a sent message and everything after it: the server cuts the transcript back to just
+  // before the message with this id (chat only; files are left alone).
+  const deleteFrom = async (i: number) => {
+    setMsgMenu(null);
+    const s = activeStoreRef.current;
+    if (!s || s.id.startsWith("new-") || s.id.startsWith("pending-") || !navigator.onLine) return;
+    const target = (s.items[i] as { uuid?: string } | undefined)?.uuid;
+    if (!target) { window.alert("Delete failed: message has no id"); return; }
+    const snapshot = s.items;
+    s.truncateFrom(i);
+    try {
+      const r = await api.deleteFrom({ id: s.id, uuid: target });
+      if (r?.error) throw new Error(r.error);
+    } catch (e) {
+      s.showItems(snapshot);
+      window.alert("Delete failed: " + (e instanceof Error ? e.message : String(e)));
+      return;
+    }
+    s.evDirty = true; // the transcript was cut under the cursor: next load is a full one
+    await loadConv(s.id, undefined, { resync: true });
+    refreshConvs();
   };
   const deleteConv = useCallback(async (id: string) => {
     setConvMenu(null);
@@ -2579,6 +2831,12 @@ function App() {
   // The first unanswered ask — surfaced on top of voice mode (a tappable card can't be used
   // hands-free, but at least it's visible and answerable instead of hidden behind the overlay).
   const pendingAsk = useMemo(() => items.find((it) => it.kind === "ask" && it.answered === undefined) as Extract<Item, { kind: "ask" }> | undefined, [items]);
+  // When each question first appeared, and when the current draft was started (first character after
+  // an empty composer, from typing, paste or dictation). send() compares the two: see the ask routing.
+  const askSeenRef = useRef<Record<string, number>>({});
+  useEffect(() => { if (pendingAsk && askSeenRef.current[pendingAsk.askId] == null) askSeenRef.current[pendingAsk.askId] = Date.now(); }, [pendingAsk]);
+  const draftStartRef = useRef(0);
+  useEffect(() => { if (!input.trim()) draftStartRef.current = 0; else if (!draftStartRef.current) draftStartRef.current = Date.now(); }, [input]);
 
   // Picking a model leaves the panel open: effort and advisor sit in the same panel and picking a
   // model is usually the first of the three, not the last. The scrim closes it.
@@ -2859,8 +3117,10 @@ function App() {
   const convStatus = (c: Conv): "queued" | "thinking" | "waiting" | "unread" | null => {
     if (c.pending || queuedIds.has(c.sessionId)) return "queued";
     const st = statuses[c.sessionId];
-    if (st?.busy) return "thinking";
+    // Waiting first: a pending ask_user question keeps the turn "busy" (the tool is still open), so
+    // checking busy first showed the thinking dot and never said the chat was waiting on the user.
     if (st?.waiting) return "waiting";
+    if (st?.busy) return "thinking";
     void readTick; // re-read lastRead when it bumps
     const lr = lastReadRef.current[c.sessionId];
     if (c.sessionId !== activeId && lr != null && c.mtime > lr) return "unread";
@@ -2909,7 +3169,7 @@ function App() {
     const nodes: React.ReactNode[] = [];
     // Plain tools collapse into an accordion; subagent/workflow (Task) tools stay standalone
     // (rich activity card); TodoWrite is hidden here (the pinned checklist replaces it).
-    const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name);
+    const isPlainTool = (t: Item) => t.kind === "tool" && !isAgentTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input) && !isTodoTool((t as Extract<Item, { kind: "tool" }>).name) && !isSpawnTabTool((t as Extract<Item, { kind: "tool" }>).name, (t as Extract<Item, { kind: "tool" }>).input); // a spawn call stays standalone so its tab button shows
     let lastUserIdx = -1; for (let k = items.length - 1; k >= 0; k--) if (items[k].kind === "user") { lastUserIdx = k; break; }
     // Only the tail is mounted. Blocks still read their neighbours out of the FULL items array, so
     // the role label and turn-final footer stay correct at the window edge.
@@ -3443,7 +3703,7 @@ function App() {
       {msgMenu && (
         <>
           <div className="ctx-scrim" onClick={() => setMsgMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMsgMenu(null); }} />
-          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 200), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
+          <div className="ctx-menu" style={{ top: Math.min(msgMenu.y, window.innerHeight - 300), left: Math.min(msgMenu.x, window.innerWidth - 180) }}>
             {speaking ? (
               <button onClick={() => { stopReadAloud(); setReading(null); setMsgMenu(null); }}>Stop reading</button>
             ) : (
@@ -3458,9 +3718,13 @@ function App() {
                 });
               }}>Read aloud</button>
             )}
+            {msgMenu.link && <button onClick={() => { copyText(msgMenu.link!); setMsgMenu(null); }}>Copy link</button>}
+            {msgMenu.link && <button onClick={() => { window.open(msgMenu.link!, "_blank", "noopener"); setMsgMenu(null); }}>Open link</button>}
+            {msgMenu.code !== undefined && <button onClick={() => { copyText(msgMenu.code!); setMsgMenu(null); }}>Copy code</button>}
             <button onClick={() => { copyText(msgMenu.text); setMsgMenu(null); }}>Copy text</button>
             <button onClick={() => { openArtifact(noteFromText(msgMenu.text, activeId)); setMsgMenu(null); }}>Open in editor</button>
-            {msgMenu.kind === "user" && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
+            {msgMenu.kind === "user" && !(activeStore?.items[msgMenu.i] as { midTurn?: boolean } | undefined)?.midTurn && <button onClick={() => startEdit(msgMenu.i, msgMenu.text)}>Edit &amp; rerun</button>}
+            {msgMenu.kind === "user" && activeStore && !(activeStore.items[msgMenu.i] as { midTurn?: boolean } | undefined)?.midTurn && !isFirstTurn(activeStore.items, msgMenu.i) && !busy && <button className="ctx-danger" onClick={() => void deleteFrom(msgMenu.i)}>Delete from here</button>}
           </div>
         </>
       )}

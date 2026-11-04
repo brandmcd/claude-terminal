@@ -64,7 +64,7 @@ export type AppEvent =
   | { t: "compacting"; active: boolean } // compaction started/stopped (drives the progress banner, incl. auto-compaction)
   | { t: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft } // Claude asks with tappable options (optionally multi-select / free-text)
   | { t: "ask_done"; askId: string; answer: string } // an ask was answered (or cancelled)
-  | { t: "user"; text: string; cid?: string } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly
+  | { t: "user"; text: string; cid?: string; midTurn?: boolean; uuid?: string } // an echoed user turn; cid = the sender's client id, so it can match its own echo exactly; midTurn = sent while a turn was running (folded into it, not a turn of its own)
   // Real token accounting for the turn (from the SDK result message): output = tokens Claude
   // actually generated this turn (thinking + text + tool-call args); in/cacheRead = context read.
   | { t: "result"; subtype: string; sessionId: string; costUsd: number; usage?: TurnUsage }
@@ -393,9 +393,18 @@ const APP_UI_SYSTEM_APPEND = [
   "  before starting and keep it current as you go (load it first with ToolSearch \"select:TodoWrite\" if",
   "  it is not in your tool list). Skip it for quick questions and one-step edits. If",
   "  the user sends back an edited list from the panel, adopt it with TodoWrite and follow it.",
+  "",
+  "Built-in tools in this app. Their schemas may be deferred: load one with ToolSearch (for example",
+  "\"select:mcp__app-ui__ask_user\") before the first call. Use them; do not work around them:",
+  "- mcp__app-ui__ask_user: whenever you need the user to choose (which approach, yes or no, pick one",
+  "  of a few options), ask with this tool instead of writing the question in prose. The user taps an",
+  "  answer. Ask one clear question with short option labels.",
 ].join("\n");
 // Machine-added blocks appended to a user turn. Stripped everywhere a turn is displayed, compared
 // or replayed, so the user only ever sees what they actually typed.
+// The CLI's note after the model reads an image ("[Image: original 2856x1280, displayed at ...]") is
+// an isMeta user row. Never shown live; on reload it rendered as a user bubble.
+const IMAGE_NOTE_RE = /^\[Image: original \d+x\d+/;
 const HIDDEN_STRIP = /\s*<(voice-mode|turn-context|title-request)>[\s\S]*?<\/\1>\s*/g;
 const TITLE_TAG = /<title>[\s\S]*?<\/title>\s*/i; // the conversation-title tag the first reply opens with
 // #endregion
@@ -595,6 +604,39 @@ function limitNoticeText(resumeAt: number | null): string {
 // query emits an init/stream event within seconds; only a dead subprocess produces nothing at all.
 const HUNG_QUERY_MS = 60_000;
 
+// Built-in MCP servers every /app conversation gets. Injected here rather than through the editable
+// MCP panel, so the owner and guests always have them and can neither remove nor edit them. They must
+// be included on BOTH paths that set the server set (run() and applyMcpServers), because the SDK's
+// setMcpServers replaces the whole dynamic set (the same reason app-ui is re-included every time).
+// Upstream hardwires a google and a shop server at paths on its own host. Here the set comes from
+// config.json `appBuiltinMcp` ({name: McpServerConfig}) and is empty by default, since this box runs
+// its Google and Slack servers from the Connections page. app-server sets it at startup.
+let BUILTIN_MCP: Record<string, McpServerConfig> = {};
+export function setBuiltinMcp(m: unknown) {
+  BUILTIN_MCP = m && typeof m === "object" && !Array.isArray(m) ? { ...(m as Record<string, McpServerConfig>) } : {};
+  delete (BUILTIN_MCP as any)["app-ui"];
+}
+export function builtinMcpNames(): string[] { return Object.keys(BUILTIN_MCP); }
+// System-prompt lines for the built-ins upstream ships, added only when a server of that name is configured.
+const BUILTIN_MCP_PROMPT: Record<string, string> = {
+  shop: [
+    "- mcp__shop__* (Amazon and eBay): for any question about buying something, what it costs, or where",
+    "  to get it, use compare_prices, search_amazon, search_ebay, amazon_item, ebay_item or price_check",
+    "  for real, current listings instead of answering from memory. Finish a shopping answer with",
+    "  present_results so the user gets product cards. Nothing here can buy anything.",
+  ].join("\n"),
+  google: "- mcp__google__*: the user's own Calendar, Gmail, Drive (incl. uploading and downloading any file), Sheets, Docs, Slides, Forms, Tasks and Contacts.",
+};
+function appUiSystemAppend(): string {
+  const extra = Object.keys(BUILTIN_MCP).map((n) => BUILTIN_MCP_PROMPT[n]).filter(Boolean);
+  return extra.length ? APP_UI_SYSTEM_APPEND + "\n" + extra.join("\n") : APP_UI_SYSTEM_APPEND;
+}
+
+// Persists each conversation's chosen model (app-server owns the file). The transcript only records
+// the concrete model every turn ran on, so without this a reopened chat could only show that.
+let modelChoiceHook: ((id: string, model: string) => void) | null = null;
+export function onModelChoice(fn: (id: string, model: string) => void) { modelChoiceHook = fn; }
+
 export class Conversation {
   id: string; // session id once known; a temp key beforehand
   cwd: string;
@@ -613,6 +655,34 @@ export class Conversation {
   // running work; fold them into busy so the list dot shows while they run.
   private bgTasks = new Set<string>();
   get busy(): boolean { return this.phase !== "idle" || this.bgTasks.size > 0; }
+  // What the idle sweeper must not kill: every live background task, ambient ones INCLUDED. The CLI
+  // flips a long polling loop (`until curl ...; do sleep 15; done`) to ambient as a "live-update
+  // watcher" after a few minutes; it then dropped out of busy, and the sweeper closed the chat and
+  // killed the watcher (RustDesk cart chat, 2026-10-24 06:19, launched 03:25, busy=0 from 03:40).
+  private liveTasks = new Set<string>();
+  // Session cron jobs and /loop wakeups live in the CLI process too and send no task signal at all,
+  // so they are tracked from the tool calls: CronCreate holds for 7 days (the CLI expires recurring
+  // jobs then), a matching number of CronDelete calls releases it, ScheduleWakeup holds until a
+  // little after its wake, and ScheduleWakeup stop releases.
+  private cronCreated = 0;
+  private cronDeleted = 0;
+  private cronHoldUntil = 0;
+  private wakeHoldUntil = 0;
+  private noteScheduling(name: string, input: any) {
+    const now = Date.now();
+    if (name === "CronCreate") { this.cronCreated++; this.cronHoldUntil = now + 7 * 86_400_000; }
+    else if (name === "CronDelete") { this.cronDeleted++; if (this.cronDeleted >= this.cronCreated) this.cronHoldUntil = 0; }
+    else if (name === "ScheduleWakeup") {
+      if (input?.stop) this.wakeHoldUntil = 0;
+      else this.wakeHoldUntil = now + Math.max(0, Number(input?.delaySeconds) || 0) * 1000 + 15 * 60_000;
+    }
+  }
+  // True while closing this conversation would kill work the user started: a background task, a
+  // cron job or a pending wakeup. The sweeper skips it.
+  holdsWork(): boolean {
+    const now = Date.now();
+    return this.liveTasks.size > 0 || now < this.cronHoldUntil || now < this.wakeHoldUntil;
+  }
   get seq(): number { return this.seqCounter - 1; } // highest _seq handed out so far (-1 = none)
   get isClosed(): boolean { return this.closed; }
   private curMsgId = ""; // id of the assistant message being streamed: block ids are <msg>:<index>
@@ -635,7 +705,7 @@ export class Conversation {
   // holds the upstream connection open (Zoraxy), a client that reloads or navigates away leaves its
   // subscriber alive until the stream's own lifetime expires, so without a cap the count climbs into
   // the hundreds and every event is written to every dead socket.
-  private subs = new Map<Sub, { at: number; evict?: () => void }>();
+  private subs = new Map<Sub, { at: number; evict?: (why?: string) => void; key?: string }>();
   private hooks = new Set<Sub>(); // internal lifecycle listeners (init/closed bookkeeping); do NOT count as client subscribers, or the idle reaper never fires
   private log: AppEvent[] = []; // replay buffer so a reconnecting client sees this live run
   private pendingAsks = new Map<string, (answer: string) => void>(); // ask_user awaiting a tap
@@ -688,14 +758,14 @@ export class Conversation {
   // fromNow: subscribe to FUTURE events only (no buffer replay). Used when a client reopens a
   // live conversation and has already rebuilt the current turn from the transcript + pending
   // asks, so replaying the buffer would double-render it.
-  subscribe(fn: Sub, fromNow = false, evict?: () => void): () => void {
-    this.addSub(fn, evict);
+  subscribe(fn: Sub, fromNow = false, evict?: (why?: string) => void, key?: string): () => void {
+    this.addSub(fn, evict, key);
     // Replay only the CURRENT turn (from the last turn boundary), so a client that reopens
     // an already-live conversation doesn't get every prior turn re-injected. The client has
     // the earlier turns from the transcript, and _seq dedupe covers mid-turn reconnects.
     const from = fromNow ? this.log.length : this.runStart;
     for (let i = from; i < this.log.length; i++) fn(this.log[i]);
-    return () => this.subs.delete(fn);
+    return () => { this.subs.delete(fn); this.lastWatchedAt = Date.now(); };
   }
 
   // Resume after a dropped SSE socket: replay everything newer than the last event the client
@@ -703,18 +773,31 @@ export class Conversation {
   // "future only" and every event emitted during the gap is lost for good — which is how a one-shot
   // event like the compaction card disappears while the streamed text around it looks fine. Safe to
   // over-deliver: the client drops anything whose _seq it has already seen.
-  subscribeSince(fn: Sub, sinceSeq: number, evict?: () => void): () => void {
-    this.addSub(fn, evict);
+  subscribeSince(fn: Sub, sinceSeq: number, evict?: (why?: string) => void, key?: string): () => void {
+    this.addSub(fn, evict, key);
     for (const e of this.log) { const s = (e as any)._seq; if (typeof s === "number" && s > sinceSeq) fn(e); }
-    return () => this.subs.delete(fn);
+    return () => { this.subs.delete(fn); this.lastWatchedAt = Date.now(); };
   }
 
   // Register a subscriber and, if this conversation now has more than SUBS_CAP, evict the OLDEST.
   // A single client keeps one stream per conversation, so a two-figure count is always leaked
   // reconnections a proxy never told us had closed; dropping the oldest reclaims them without
   // touching anyone actually watching (their stream reconnects and resumes from its cursor anyway).
-  private addSub(fn: Sub, evict?: () => void) {
-    this.subs.set(fn, { at: Date.now(), evict });
+  //
+  // `key` names the client socket (one per ConvStore in a browser tab). A stream that reconnects with
+  // the same key is the same viewer coming back, so its old subscriber is a dead socket the proxy never
+  // closed: replace it. Without this, every reconnect added a subscriber and pushed out the oldest one,
+  // which was usually another tab's LIVE stream. That tab reconnected 3s later and pushed out the next,
+  // a ring of ~25 reopens a minute, each replaying its gap synchronously, which stalled the event loop
+  // for up to 14s and put "Connection unstable" on every client (2026-10-28).
+  private addSub(fn: Sub, evict?: (why?: string) => void, key?: string) {
+    this.lastWatchedAt = Date.now();
+    if (key) for (const [f, meta] of this.subs) {
+      if (meta.key !== key) continue;
+      this.subs.delete(f);
+      try { meta.evict?.("replaced"); } catch {}
+    }
+    this.subs.set(fn, { at: Date.now(), evict, key });
     if (this.subs.size <= SUBS_CAP) return;
     const oldest = [...this.subs.entries()].sort((a, b) => a[1].at - b[1].at);
     for (let i = 0; i < oldest.length - SUBS_CAP; i++) {
@@ -762,6 +845,10 @@ export class Conversation {
   statusEvent(): AppEvent { return { t: "status", phase: this.phase, since: this.phaseSince, ...(this.phaseDetail ? { detail: this.phaseDetail } : {}) }; }
 
   hasSubscribers(): boolean { return this.subs.size > 0; }
+  // A client's stream expires every few minutes and reconnects a few seconds later, so "no
+  // subscriber right now" is not "nobody is watching". Last time a stream attached or detached:
+  lastWatchedAt = Date.now();
+  watchedWithin(ms: number): boolean { return this.hasSubscribers() || Date.now() - this.lastWatchedAt < ms; }
   // Monotonic "has anything happened" counter. The status coalescer polls it to decide whether a
   // conversation actually advanced since the last push, so a long-running turn that is quiet does not
   // spend a push (and a radio wake) every cycle just for being busy.
@@ -783,12 +870,24 @@ export class Conversation {
   // happened, so it fills the gap by inventing one: "in the hour since we started talking" after
   // fifteen minutes. Stamp the real local time and the real gap onto every turn. Hidden from the UI
   // by HIDDEN_STRIP, the same way the voice directive is.
+  // The timezone of the device the user is typing on (IANA name, sent with each turn). Without it the
+  // stamp used the server's zone, so Claude quoted Eastern times to Filip while he was in Europe.
+  private clientTz?: string;
+  setClientTz(tz: unknown) {
+    if (typeof tz !== "string" || !tz || tz.length > 64) return;
+    try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); this.clientTz = tz; } catch { /* unknown zone: keep the last good one */ }
+  }
   private turnContext(): string {
     const now = Date.now();
-    const stamp = new Date(now).toLocaleString(undefined, {
+    const fmt = (timeZone?: string) => new Date(now).toLocaleString("en-US", {
       weekday: "short", day: "numeric", month: "short", year: "numeric",
-      hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+      hour: "2-digit", minute: "2-digit", timeZoneName: "short", ...(timeZone ? { timeZone } : {}),
     });
+    const serverTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const tz = this.clientTz || serverTz;
+    // The server's own time is added when the zones differ: cron jobs, logs and services run on it.
+    const stamp = tz === serverTz ? `${fmt(tz)} (${tz})`
+      : `${fmt(tz)} (${tz}, where the user is). Server time is ${fmt(serverTz)} (${serverTz}); give times to the user in their zone`;
     // After a service restart a resumed conversation has no in-memory history, so "first message"
     // would be a plain lie about a chat with hours of history above it. Say unknown instead.
     const gap = this.lastTurnAt ? `My previous message was ${humanGap(now - this.lastTurnAt)} ago.`
@@ -799,18 +898,30 @@ export class Conversation {
   }
 
   send(text: string, cid?: string) {
-    if (this.closed) { tlog("dropped", { conv: this.id, why: "closed" }); return; }
+    // A closed conversation can still be in the map: the reaper skips one that has a watcher, and a
+    // client tab reconnects to it. Dropping the turn here meant messages were "accepted" and then
+    // silently never ran (a chat closed overnight would not start in the morning). Reopen instead:
+    // supersede the old run, resume this session, and let the normal path below run the turn.
+    if (this.closed) {
+      this.closed = false;
+      this.runGen++;
+      this.running = false;
+      if (!this.resume && this.inited) this.resume = this.id;
+      tlog("reopen", { conv: this.id });
+    }
     this.lastActivity = Date.now();
     this.currentTurnText = text; // remember it so a subscription-limit rejection can re-run this turn
     // The user is actively driving this conversation, so any auto-resume we had queued for it is
     // no longer wanted (this counts as the "easy cancel" for the default-on behaviour).
     try { cancelResume(this.id); } catch { /* */ }
+    const midTurn = this.running; // folded into the running turn by the SDK, not a turn of its own
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
-    this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
+    const uuid = messageId(cid);
+    this.emit({ t: "user", text, uuid, ...(cid ? { cid } : {}), ...(midTurn ? { midTurn } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
     // The model often repeats the first reply's <title> line on later turns; strip it there too.
     this.titleScan = true; this.titleEmit = false; this.titleBuf = "";
-    const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+    const msg: SDKUserMessage = { type: "user", uuid: uuid as any, message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
     // nor the queue, and its dead inputGen is parked exactly at the waiter below, so the healthy-path
     // early return must be covered too. handle() clears this the instant any real message arrives.
@@ -874,6 +985,7 @@ export class Conversation {
     this.model = model;
     this.pendingModel = model;
     this.emit({ t: "model", model }); // every device watching this chat shows the switch right away
+    if (!this.id.startsWith("new-")) modelChoiceHook?.(this.id, model); // a new chat persists at init
     if (!this.busy) await this.applyPendingModel();
   }
   // Push a queued model change to the live query. Only safe when the query is up and idle. On the
@@ -923,7 +1035,7 @@ export class Conversation {
   // Returns which servers were added/removed and any connection errors (or null if not running).
   async applyMcpServers(stored: Record<string, McpServerConfig>) {
     if (!this.q?.setMcpServers) return null;
-    const payload = { ...stored, ...sharedMcpConfig(this.launchOpts, this.id, "claude", this.model), ...(this.askServer ? { "app-ui": this.askServer } : {}) };
+    const payload = { ...BUILTIN_MCP, ...stored, ...sharedMcpConfig(this.launchOpts, this.id, "claude", this.model), ...(this.askServer ? { "app-ui": this.askServer } : {}) };
     try { return await this.q.setMcpServers(payload); }
     catch (e: any) { this.emit({ t: "error", message: "setMcpServers: " + (e?.message || e) }); return null; }
   }
@@ -969,7 +1081,7 @@ export class Conversation {
   // turn -> start a fresh session). rewindToUuid = the edited user message's uuid (files restore to
   // its pre-turn state). The forked session's new id arrives on the next init event, which re-keys
   // the map and rebinds the client automatically.
-  async editTurn(forkAtUuid: string | null, rewindToUuid: string | null, text: string): Promise<RewindInfo> {
+  async editTurn(forkAtUuid: string | null, rewindToUuid: string | null, text: string, cid?: string): Promise<RewindInfo> {
     let rewind: RewindInfo = {};
     if (rewindToUuid && this.q) {
       try {
@@ -983,7 +1095,7 @@ export class Conversation {
     if (forkAtUuid) { this.resume = this.id; this.forkAt = forkAtUuid; this.forkNext = true; }
     else { this.resume = undefined; this.forkAt = undefined; this.forkNext = false; } // editing the first turn -> fresh session
     this.closed = false;
-    void this.run(text);                         // bumps runGen, starts the forked query, emits the edited user turn
+    void this.run(text, cid);                    // bumps runGen, starts the forked query, emits the edited user turn
     try { oldQ?.close(); } catch { /* the old run's finally is superseded (older gen) -> stays silent */ }
     return rewind;
   }
@@ -1077,10 +1189,11 @@ export class Conversation {
     if (first !== undefined) {
       this.currentTurnText = first; // re-sent if the subscription limit cuts this opening turn off
       this.runStart = this.log.length; // first turn's replay boundary
-      this.emit({ t: "user", text: first, ...(cid ? { cid } : {}) });
+      const uuid = messageId(cid);
+      this.emit({ t: "user", text: first, uuid, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
       this.titleScan = true; this.titleEmit = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
-      yield { type: "user", message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
+      yield { type: "user", uuid: uuid as any, message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     }
     while (!this.closed) {
       const next = this.queue.shift() ?? (await new Promise<SDKUserMessage | null>((res) => { this.waiter = res; }));
@@ -1127,11 +1240,14 @@ export class Conversation {
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         includePartialMessages: true, // stream text + thinking tokens live
-        thinking: { type: "adaptive" }, // let Claude think; we render it streaming
+        // Opus 5.5 returns the short notes it writes between tool calls as progress-update thinking
+        // blocks, empty at the default display:"omitted" — so the chat would go quiet between tools.
+        // display:"summarized" asks for that text back; we already render thinking deltas streaming.
+        thinking: { type: "adaptive", display: "summarized" }, // let Claude think; we render it streaming
         autoCompactEnabled: true, // compact automatically before the context window fills (default, set explicit)
         enableFileCheckpointing: true, // back up files before edits so an edit-and-rerun can roll them back (Query.rewindFiles)
-        systemPrompt: { type: "preset", preset: "claude_code", append: APP_UI_SYSTEM_APPEND + (this.launchOpts.sharedTools ? "\n\n" + sharedInstructions("claude", this.model) : "") + (this.handoffContext ? "\n\n" + this.handoffContext : "") }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
-        mcpServers: { ...stored, ...sharedMcpConfig(this.launchOpts, this.id, "claude", this.model), "app-ui": this.askServer }, // ask_user + any managed MCP servers
+        systemPrompt: { type: "preset", preset: "claude_code", append: appUiSystemAppend() + (this.launchOpts.sharedTools ? "\n\n" + sharedInstructions("claude", this.model) : "") + (this.handoffContext ? "\n\n" + this.handoffContext : "") }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
+        mcpServers: { ...BUILTIN_MCP, ...stored, ...sharedMcpConfig(this.launchOpts, this.id, "claude", this.model), "app-ui": this.askServer }, // built-ins (config) + ask_user + any managed MCP servers
       },
     });
     if (first === undefined && !this.inited) this.setPhase("starting"); // a resume: the subprocess is coming up before any turn is queued
@@ -1213,8 +1329,17 @@ export class Conversation {
         if (anyM.subtype === "init") {
           this.inited = true;
           this.bgTasks.clear(); // the level is per-process: a (re)start resets it; the CLI re-sends a snapshot
-          this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: anyM.model, cwd: anyM.cwd });
-          if (anyM.model) { this.model = anyM.model; this.emit({ t: "model", model: anyM.model }); }
+          this.liveTasks.clear();
+          this.cronCreated = this.cronDeleted = this.cronHoldUntil = this.wakeHoldUntil = 0; // a new process has none of the old one's jobs
+          // The model the user CHOSE (an alias like "default" or "opus[1m]", or a pinned id) is what drives
+          // the query and what the selector shows. anyM.model is only what that choice resolved to
+          // today. Overwriting the choice with it pinned every chat to the concrete model of the moment,
+          // so when "default" moved from Opus 4.8 to 5.5 old chats stayed on 4.8 and the selector
+          // showed 4.8. A resume that passed no model runs the CLI default, i.e. "default".
+          const chosen = this.model || "default";
+          this.emit({ t: "init", sessionId: anyM.session_id || this.id, model: chosen, cwd: anyM.cwd });
+          this.emit({ t: "model", model: chosen });
+          if (this.model && anyM.session_id) modelChoiceHook?.(anyM.session_id, this.model);
           if (this.phase === "starting") this.setPhase("waiting");
           // An MCP server that failed to connect is the classic silent pre-model stall. Say so.
           for (const m of (anyM.mcp_servers as { name: string; status: string }[] | undefined) || []) if (m.status && m.status !== "connected") this.emit({ t: "notice", kind: "info", text: `MCP server "${m.name}" ${m.status}.` });
@@ -1253,7 +1378,9 @@ export class Conversation {
         // change, so emit the busy edge ourselves.
         else if (anyM.subtype === "background_tasks_changed") {
           const next = new Set<string>();
-          for (const t of (anyM.tasks as any[]) || []) if (t && !t.ambient && t.task_id) next.add(String(t.task_id));
+          const all = new Set<string>();
+          for (const t of (anyM.tasks as any[]) || []) if (t && t.task_id) { all.add(String(t.task_id)); if (!t.ambient) next.add(String(t.task_id)); }
+          this.liveTasks = all;
           const wasBusy = this.busy;
           this.bgTasks = next;
           if (wasBusy !== this.busy) this.emit({ t: "busy", busy: this.busy, ...(this.busy ? { since: this.busySince() } : {}) });
@@ -1340,6 +1467,7 @@ export class Conversation {
         for (const b of blocks) {
           if (b?.type !== "tool_use") continue;
           if (b.name === "mcp__app-ui__ask_user") { this.askToolUseIds.add(b.id); continue; } // the ask card renders this, not a raw tool card
+          this.noteScheduling(b.name, b.input);
           this.emit({ t: "tool_use", id: b.id, name: b.name, input: b.input });
         }
         break;
@@ -1454,6 +1582,15 @@ export function get(key: string): LiveConversation | undefined {
   const c = conversations.get(key) || getCodex(key);
   return c && !c.isClosed ? c : undefined; // closed -> not live, so the client resumes via /start
 }
+// Stop a conversation and forget it, so the next open builds a fresh one (new epoch) from the
+// transcript. Used before the transcript is cut (delete-from-here): the old process must not write
+// to it again, and clients holding the old log must reload rather than resume into it.
+export function discard(key: string): void {
+  const c = conversations.get(key);
+  if (!c) return;
+  c.close();
+  for (const [k, v] of conversations) if (v === c) conversations.delete(k);
+}
 
 // A conversation can also be driven from a TERMINAL tab by the CLI, which this process knows nothing
 // about — it only tracks its own /app conversations. Those CLI sessions publish their own state to
@@ -1530,20 +1667,84 @@ function reapIfIdle(c: LiveConversation) {
 // Idle sweeper: close conversations no client has watched for a while.
 setInterval(() => {
   const now = Date.now();
+  let reaped = 0;
   for (const c of new Set(conversations.values())) {
+    // A closed conversation is finished with: once no client is attached, drop it from the map so
+    // its event log (up to 5000 events, tool results and pasted images included) can be collected.
+    // The one-shot reapIfIdle 60 s after close() gives up if a stream is still attached at that
+    // moment, and until 2026-10-04 nothing ever retried, so every such chat stayed resident for the
+    // life of the process. That retention is the best candidate for the sidecar reaching 64 GB
+    // (13 GB resident + 51 GB swapped) and taking the whole box down that day.
+    if (c.isClosed) { if (!c.hasSubscribers()) { reapIfIdle(c); reaped++; } continue; }
     // Never collect a conversation that is still working, or one parked on an unanswered question:
     // close() kills the SDK query and answers pending asks with "(the user did not answer)", which
     // would throw away a real turn just because the phone dropped its stream.
     const s = c.statusInfo();
-    if (s.busy || s.waiting) continue;
-    if (!c.hasSubscribers() && now - c.lastActivity > 30 * 60_000) c.close();
+    if (s.busy || s.waiting || (c instanceof Conversation && c.holdsWork())) continue;
+    // watchedWithin, not hasSubscribers: the sweep once landed in the ~3 s gap between a tab's
+    // stream expiring and reconnecting, closed a chat that was open on screen, and the next
+    // morning's messages were dropped (3b4a0dc1, 2026-09-25 17:26).
+    const watched = c instanceof Conversation ? c.watchedWithin(10 * 60_000) : c.hasSubscribers();
+    if (!watched && now - c.lastActivity > 30 * 60_000) c.close();
   }
+  // Memory telemetry, one journal line per sweep. Reading this over hours is how a slow leak gets
+  // attributed: rss climbing with a flat heap is native (Bun/SDK buffers), a climbing heap with a
+  // climbing conv count is retained conversations, a climbing heap with a flat count is elsewhere.
+  const m = process.memoryUsage();
+  const mb = (n: number) => Math.round(n / 1048576);
+  console.log(`[mem] rss=${mb(m.rss)}M heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}M ext=${mb(m.external)}M convs=${new Set(conversations.values()).size} keys=${conversations.size} reaped=${reaped} replayCache=${replayCache.size}/${Math.round(replayCacheBytes / 1048576)}M`);
 }, 5 * 60_000);
 // #endregion
 
 // #region historical transcript -> the same AppEvent stream (for opening a past chat)
-// Parses a session .jsonl into the normalized events the front-end already renders.
+// Parsed-events cache, keyed on the file's size+mtime. replayTranscript() used to read and parse the
+// whole .jsonl on every call, and it is called on a timer: the service worker refetches up to 8
+// conversations on every status push (15 s while anything is working, sw.js:202) and the app prewarms
+// 12 on load. Two 30-40 MB transcripts in that set cost about half a GB of short-lived allocation per
+// push, and Bun's allocator kept the pages: measured 2026-10-04, rss 1.3 GB (peak 2.3 GB) five
+// minutes after a restart with a 17 MB JS heap, and 64 GB after a week, which took the box down.
+// An unchanged transcript is now parsed once. Bounded by source bytes, LRU beyond that; files over
+// the per-file cap are parsed on demand and not kept.
+const REPLAY_CACHE_MAX_FILE = 64 * 1048576;
+const REPLAY_CACHE_MAX_TOTAL = 160 * 1048576;
+const replayCache = new Map<string, { size: number; mtimeMs: number; events: AppEvent[] }>();
+let replayCacheBytes = 0;
+function replayCacheRemember(path: string, size: number, mtimeMs: number, events: AppEvent[]) {
+  if (size > REPLAY_CACHE_MAX_FILE) return;
+  const prev = replayCache.get(path);
+  if (prev) { replayCache.delete(path); replayCacheBytes -= prev.size; }
+  replayCache.set(path, { size, mtimeMs, events });
+  replayCacheBytes += size;
+  for (const [k, v] of replayCache) {
+    if (replayCacheBytes <= REPLAY_CACHE_MAX_TOTAL) break;
+    replayCache.delete(k); replayCacheBytes -= v.size;
+  }
+}
+
+// Parses a session .jsonl into the normalized events the front-end already renders. Callers get
+// their own array (the conversation route rewrites the trailing model event in place).
+// A user message's id: the client's cid when it is a UUID (the app makes one per message), so the
+// bubble, the live event and the transcript entry (Claude Code keeps a uuid it is handed) all carry
+// the same value. Anything else (an old client, a server-originated turn) gets a fresh one, which the
+// live user event carries to every client.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function messageId(cid?: string): string { return cid && UUID_RE.test(cid) ? cid.toLowerCase() : crypto.randomUUID(); }
+
 export async function replayTranscript(path: string): Promise<AppEvent[]> {
+  let size = -1, mtimeMs = -1;
+  try { const st = statSync(path); size = st.size; mtimeMs = st.mtimeMs; } catch {}
+  const hit = replayCache.get(path);
+  if (hit && hit.size === size && hit.mtimeMs === mtimeMs) {
+    replayCache.delete(path); replayCache.set(path, hit); // LRU touch
+    return hit.events.slice();
+  }
+  const out = await parseTranscript(path);
+  // An empty result from a non-empty file is a failed or racing read, not a parse: do not pin it.
+  if (size >= 0 && (out.length > 0 || size === 0)) replayCacheRemember(path, size, mtimeMs, out);
+  return out.slice();
+}
+
+async function parseTranscript(path: string): Promise<AppEvent[]> {
   const out: AppEvent[] = [];
   const askToolIds = new Set<string>(); // tool_use ids of ask_user calls -> render as ask cards, not raw tool cards
   // Per-turn accumulators so the reloaded footer matches the live one: a turn can span several
@@ -1607,13 +1808,14 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         }
       }
       const txt = textOfContent(c).replace(HIDDEN_STRIP, ""); // hide the appended voice-mode directive
+      if (o.isMeta && IMAGE_NOTE_RE.test(txt.trim())) continue;
       const sk = skillLoadName(txt);
       if (sk) out.push({ t: "notice", kind: "skill", text: sk }); // loaded skill -> compact card, not the raw file
       else if (o.isMeta && RESUME_PROMPT_RE.test(txt.trim())) out.push({ t: "notice", kind: "info", text: "Resumed after a service restart. The interrupted turn was picked up automatically." });
       else if (txt.trim() && !txt.startsWith("<")) {
         // New user turn -> reset the per-turn token/duration accumulators.
         turnOut = 0; turnThink = 0; apiErrors = 0; turnStartTs = o.timestamp ? Date.parse(o.timestamp) || 0 : 0;
-        out.push({ t: "user", text: txt });
+        out.push({ t: "user", text: txt, ...(o.uuid ? { uuid: String(o.uuid) } : {}) }); // uuid: edit/delete target this exact entry
       }
     } else if (o.type === "assistant" && msg) {
       // Same synthetic session-limit message as the live path. Replaying its text put "You've hit
@@ -1657,6 +1859,13 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
         // output/thinking = cumulative turn totals so the footer matches what was shown live.
         out.push({ t: "result", subtype: "success", sessionId: "", costUsd: 0, usage: { input, output: turnOut, thinking: turnThink, cacheCreate, cacheRead, context, total: context + turnOut, costUsd: 0, durationMs } });
       }
+    } else if (o.type === "attachment" && o.attachment?.type === "queued_command") {
+      // A message sent while a turn was running. The CLI does not write it as a user row: it is an
+      // attachment injected into the running turn at this point, so it rendered nowhere on reload.
+      // Not a turn boundary (the accumulators keep running) and not an edit target, hence midTurn.
+      const a = o.attachment;
+      const txt = textOfContent(a.prompt).replace(HIDDEN_STRIP, "");
+      if (txt.trim() && !txt.startsWith("<")) out.push({ t: "user", text: txt, midTurn: true, ...(a.source_uuid ? { uuid: String(a.source_uuid) } : {}) });
     } else if (o.type === "system" && o.subtype === "task_notification" && o.tool_use_id) {
       out.push({ t: "agent_done", id: String(o.tool_use_id), status: o.status || "completed", summary: o.summary ? String(o.summary).slice(0, 400) : undefined });
     } else if (o.type === "system" && o.subtype === "compact_boundary") {
@@ -1670,42 +1879,6 @@ export async function replayTranscript(path: string): Promise<AppEvent[]> {
   return out;
 }
 
-// Resolve the fork points for editing the user turn at ordinal `userIndex` (0-based, counting only
-// real user prompts — the same turns the UI renders as `user` bubbles). Returns the edited turn's
-// transcript uuid (rewindTo, for the file rollback), the uuid of the kept history's last chain entry
-// (forkAt, for resumeSessionAt — null when editing the first turn), and the original prompt text (so
-// the caller can guard against a stale index). Mirrors replayTranscript's notion of a "user turn".
-export async function resolveEditPoints(path: string, userIndex: number): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
-  let text: string;
-  try { text = await Bun.file(path).text(); } catch { return null; }
-  const entries: { uuid: string; isPrompt: boolean; isSidechain: boolean; text: string }[] = [];
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let o: any;
-    try { o = JSON.parse(line); } catch { continue; }
-    if (!o.uuid) continue;
-    const isSidechain = !!o.isSidechain;
-    let isPrompt = false, ptext = "";
-    if (o.type === "user" && o.message && !o.isCompactSummary && !isSidechain) {
-      const c = o.message.content;
-      const hasToolResult = Array.isArray(c) && c.some((b: any) => b?.type === "tool_result");
-      if (!hasToolResult) {
-        const t = textOfContent(c).replace(HIDDEN_STRIP, "");
-        if (t.trim() && !t.startsWith("<") && !skillLoadName(t)) { isPrompt = true; ptext = t; }
-      }
-    }
-    entries.push({ uuid: o.uuid, isPrompt, isSidechain, text: ptext });
-  }
-  const prompts = entries.filter((e) => e.isPrompt);
-  const target = prompts[userIndex];
-  if (!target) return null;
-  const pos = entries.indexOf(target);
-  // Fork at the last MAIN-chain (non-sidechain) entry before the edited turn: that's the kept
-  // history's tail. Subagent (sidechain) entries aren't valid main-chain fork points.
-  let forkAtUuid: string | null = null;
-  for (let i = pos - 1; i >= 0; i--) { if (!entries[i].isSidechain) { forkAtUuid = entries[i].uuid; break; } }
-  return { rewindToUuid: target.uuid, forkAtUuid, promptText: target.text };
-}
 // #endregion
 
 // #region subscription usage (claude.ai subscription rate-limit windows — the data behind `/usage`)
@@ -1732,11 +1905,19 @@ let ctrlReady: Promise<void> | null = null;
 let subCache: SubscriptionUsage | null = null;
 let subRefreshing = false;
 
+// The limits shown are those of the personal Max subscription the guests, the coach and stonkbot
+// draw on, not whatever account the box's CLI login is (Filip signed it in to his work account on
+// 2026-10-08 and the bars jumped to that account). The guests' setup token is inference-only and
+// cannot read usage, so the personal account has its own full login in a separate config dir
+// (`CLAUDE_CONFIG_DIR=~/.claude-usage claude`, done by hand once). No login there -> the box login.
+const SUB_CONFIG_DIR = process.env.CT_USAGE_CONFIG_DIR || join(homedir(), ".claude-usage");
+
 function startControlQuery() {
   try { mkdirSync(SUB_CWD, { recursive: true }); } catch { /* */ }
   let release = () => {};
   const gen = (async function* (): AsyncGenerator<SDKUserMessage> { await new Promise<void>((r) => { release = r; }); })();
-  const q: any = query({ prompt: gen, options: { cwd: SUB_CWD, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
+  const env = existsSync(join(SUB_CONFIG_DIR, ".credentials.json")) ? { ...process.env, CLAUDE_CONFIG_DIR: SUB_CONFIG_DIR } : undefined;
+  const q: any = query({ prompt: gen, options: { cwd: SUB_CWD, permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true, ...(env ? { env } : {}) } });
   ctrlQuery = q;
   ctrlReady = new Promise<void>((resolve) => {
     (async () => {
@@ -1777,3 +1958,25 @@ export function getSubscriptionUsage(): SubscriptionUsage | null {
   return subCache;
 }
 // #endregion
+
+// Fork points for editing or deleting the user message with this id (the transcript entry's uuid,
+// which every message carries on client and server). rewindTo = that entry; forkAt = the last main-
+// chain entry before it (null for the first message).
+export async function resolveEditPoints(path: string, uuid: string): Promise<{ rewindToUuid: string; forkAtUuid: string | null; promptText: string } | null> {
+  let text: string;
+  try { text = await Bun.file(path).text(); } catch { return null; }
+  const entries: { uuid: string; isSidechain: boolean }[] = [];
+  let hit = -1, prompt = "";
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let o: any;
+    try { o = JSON.parse(line); } catch { continue; }
+    if (!o.uuid) continue;
+    if (o.uuid === uuid && o.type === "user" && !o.isSidechain) { hit = entries.length; prompt = textOfContent(o.message?.content).replace(HIDDEN_STRIP, ""); }
+    entries.push({ uuid: o.uuid, isSidechain: !!o.isSidechain });
+  }
+  if (hit < 0) return null;
+  let forkAtUuid: string | null = null;
+  for (let i = hit - 1; i >= 0; i--) if (!entries[i].isSidechain) { forkAtUuid = entries[i].uuid; break; }
+  return { rewindToUuid: uuid, forkAtUuid, promptText: prompt };
+}

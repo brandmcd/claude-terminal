@@ -5,15 +5,15 @@
 // to this sidecar, and /_ct/app* strips to the same). Returns a Response for an app route,
 // or null to let server.ts keep matching its own routes.
 
-import { join, resolve, basename } from "path";
+import { dirname, join, resolve, basename } from "path";
 import { homedir } from "os";
-import { readdirSync, statSync, unlinkSync, rmSync, mkdirSync, promises as fsp } from "fs";
+import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync, mkdirSync, truncateSync, promises as fsp } from "fs";
 import { loadMcp, upsertServer, removeServer, mcpServersForQuery } from "./app-mcp";
 import { startSignIn, finishSignIn } from "./app-mcp-signin";
 import { listMemory, readMemory, writeMemory, listSkills, readSkill, writeSkill, setSkillEnabled, type MemSkillCtx } from "./app-mem-skills";
 import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
 import { applyOp, readBoard, type Op } from "./board";
-import { getOrCreate, get, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getCapabilities, resolveEditPoints, type AppEvent, type AskNotifier, type SessionSettings } from "./app-runner";
+import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getCapabilities, resolveEditPoints, onModelChoice, builtinMcpNames, type AppEvent, type AskNotifier, type SessionSettings } from "./app-runner";
 
 import { getCodexModels, getCodexUsage, getCodexUsageReady, isCodexModel, isCodexTranscriptPath, listCodexConversations, findCodexTranscript, codexMeta, replayCodexTranscript, deleteCodexConversation, forkCodexConversation } from "./codex-runner";
 import { readHandoff, handoffAtPath, findHandoff, listHandoffs, deleteHandoff, createHandoff, readLaunchContext, saveLaunchContext, deleteLaunchContext } from "./provider-handoff";
@@ -83,6 +83,9 @@ export interface AppCtx {
 // Models a guest instance may not pick (ct-guest-gate refuses them too).
 const GUEST_BLOCKED = /fable/i;
 const seenSends = new Map<string, { at: number; id: string }>();
+// Where delete-from keeps the transcript tail it cut off, one file per delete (outside the projects
+// dir so no collector or conversation list ever reads it).
+const DELETED_DIR = join(process.env.HOME || homedir(), ".local/state/claude-terminal/deleted");
 const SEND_DEDUP_TTL_MS = 2 * 60 * 1000;
 function dedupSeen(cid: unknown): { id: string } | null {
   if (typeof cid !== "string" || !cid) return null;
@@ -92,6 +95,32 @@ function dedupSeen(cid: unknown): { id: string } | null {
   return hit ? { id: hit.id } : null;
 }
 function dedupRecord(cid: unknown, id: string) { if (typeof cid === "string" && cid) seenSends.set(cid, { at: Date.now(), id }); }
+// #endregion
+
+// #region chosen model per conversation — what the selector shows and what a resume runs on.
+// The transcript only records the concrete model each turn ran on ("claude-opus-4-8"), never the
+// alias the user picked ("default"), so a reopened chat used to show and re-pin the concrete one.
+let modelChoices: Record<string, string> | null = null;
+let modelChoicesFile = "";
+async function loadModelChoices(file: string): Promise<Record<string, string>> {
+  if (modelChoices && modelChoicesFile === file) return modelChoices;
+  modelChoicesFile = file;
+  try { const o = JSON.parse(await Bun.file(file).text()); modelChoices = o && typeof o === "object" ? o : {}; }
+  catch { modelChoices = {}; }
+  return modelChoices!;
+}
+function ensureModelChoices(ctx: AppCtx) {
+  if (modelChoicesFile) return;
+  const file = join(dirname(ctx.mcpFile), "claude-app-models.json"); // beside the other claude-app-* state
+  modelChoicesFile = file;
+  onModelChoice((id, model) => {
+    void loadModelChoices(file).then((m) => {
+      if (m[id] === model) return;
+      m[id] = model;
+      return Bun.write(file, JSON.stringify(m));
+    }).catch(() => {});
+  });
+}
 // #endregion
 
 // #region favorites (starred conversations) — server-side, shared across the owner's devices
@@ -225,11 +254,26 @@ async function listConversations(ctx: AppCtx): Promise<{ path: string; sessionId
   return all;
 }
 
-// Pull a title + cwd from the head/tail of a transcript (cheap: reads once).
-async function convMeta(path: string): Promise<{ title: string | null; cwd: string | null; first?: string | null; aiTitle?: string | null; model?: string; settings?: SessionSettings }> {
+// Pull a title + cwd from a transcript. Cached on size+mtime: the conversations list calls this
+// for up to 40 files on every refresh and the conversation route on every delta fetch, and each
+// call read and JSON-parsed the whole file (see the replay cache note in app-runner.ts for what
+// that churn did to the process). One small object per file, so no bound is needed. Handoff and
+// Codex rows and the launch-context model override are read fresh, outside the cache.
+type ConvMeta = { title: string | null; cwd: string | null; first?: string | null; aiTitle?: string | null; model?: string; settings?: SessionSettings };
+const metaCache = new Map<string, { size: number; mtimeMs: number; meta: ConvMeta }>();
+async function convMeta(path: string): Promise<ConvMeta> {
   const h = handoffAtPath(path);
   if (h) return { title: h.title, cwd: h.cwd, model: h.model };
   if (isCodexTranscriptPath(path)) { const m = codexMeta(path); return { ...m, model: readLaunchContext(basename(path, ".jsonl"))?.options.model || m.model }; }
+  let size = -1, mtimeMs = -1;
+  try { const st = statSync(path); size = st.size; mtimeMs = st.mtimeMs; } catch {}
+  const hit = metaCache.get(path);
+  let meta: ConvMeta;
+  if (hit && hit.size === size && hit.mtimeMs === mtimeMs) meta = hit.meta;
+  else { meta = await readConvMeta(path); if (size >= 0) metaCache.set(path, { size, mtimeMs, meta }); }
+  return { ...meta, model: readLaunchContext(basename(path, ".jsonl"))?.options.model || meta.model };
+}
+async function readConvMeta(path: string): Promise<ConvMeta> {
   let model: string | undefined;
   let title: string | null = null;
   let cwd: string | null = null;
@@ -256,7 +300,6 @@ async function convMeta(path: string): Promise<{ title: string | null; cwd: stri
       if (m && m[1].trim()) aiTitle = m[1].replace(/\s+/g, " ").trim().slice(0, 80);
     }
   }
-  model = readLaunchContext(basename(path, ".jsonl"))?.options.model || model;
   return { title, cwd, first, aiTitle, model };
 }
 
@@ -323,6 +366,9 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
   const epochParam = url.searchParams.get("epoch") || "";
   const sameEpoch = epochParam === conv.epoch;
   const resync = !!epochParam && !sameEpoch;
+  // Client socket id: a reconnect carrying the same one replaces its own stale subscriber (see addSub).
+  const clRaw = url.searchParams.get("cl") || "";
+  const clientKey = /^[A-Za-z0-9_-]{1,64}$/.test(clRaw) ? clRaw : undefined;
   const resumeFrom = Number.isInteger(lastIdRaw) && lastIdRaw >= 0 ? lastIdRaw
     : sameEpoch && Number.isInteger(sinceRaw) && sinceRaw >= -1 ? sinceRaw
     : null;
@@ -339,16 +385,16 @@ function sseStream(conv: ReturnType<typeof getOrCreate>, ctx: AppCtx, req: Reque
       // time, and whether its cursor was stale. Not logged, no _seq.
       write({ t: "hello", epoch: conv.epoch, seq: conv.seq, resync });
       write(conv.statusEvent()); // current phase straight away, not whenever it next changes
-      tlog("stream-open", { conv: conv.id, tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, epoch: epochParam ? (sameEpoch ? "same" : "stale") : undefined, busy: conv.busy ? 1 : 0 });
+      tlog("stream-open", { conv: conv.id, cl: clientKey ?? "-", ip: req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || req.headers.get("x-real-ip") || "-", tail: fromNow ? 1 : 0, resume: resumeFrom ?? undefined, epoch: epochParam ? (sameEpoch ? "same" : "stale") : undefined, busy: conv.busy ? 1 : 0 });
       // Tear this stream down. Both the abort and the lifetime paths close the controller themselves,
       // so cancel() never runs and would not log the close; log it here or the open/close counter goes
       // blind, which is the metric this whole problem was found with. `evicted` is the runner dropping
-      // the oldest subscriber when a conversation piles past its cap.
-      const shut = (why: string) => { tlog("stream-close", { conv: conv.id, why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
+      // the oldest subscriber when a conversation piles past its cap; `replaced` is the same client socket reconnecting.
+      const shut = (why: string) => { tlog("stream-close", { conv: conv.id, cl: clientKey ?? "-", why, busy: conv.busy ? 1 : 0 }); cleanup(); try { controller.close(); } catch {} };
       // replays the gap (resume), this run's buffer (fromNow=false), or nothing — then live. A stale
       // epoch streams future-only: the client is about to reload the whole thing anyway. evict lets
       // the runner shut THIS stream when the conversation exceeds its subscriber cap.
-      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom, () => shut("evicted")) : conv.subscribe(write, fromNow || resync, () => shut("evicted"));
+      unsub = resumeFrom != null ? conv.subscribeSince(write, resumeFrom, (why) => shut(why || "evicted"), clientKey) : conv.subscribe(write, fromNow || resync, (why) => shut(why || "evicted"), clientKey);
       // Heartbeat as a DATA frame. It used to be an SSE comment, which EventSource never surfaces to
       // JavaScript, so the client could not tell a quiet stream from a dead one and guessed with a
       // timer. If the client is gone the enqueue throws (caught) and the stream is torn down.
@@ -392,6 +438,7 @@ function sessionSettingsFrom(raw: unknown, ctx: AppCtx): SessionSettings | undef
 }
 
 export async function appRoutes(req: Request, path: string, ctx: AppCtx): Promise<Response | null> {
+  ensureModelChoices(ctx);
   try { return await handleAppRoutes(req, path, ctx); }
   catch (error: any) { return jsonRes({ error: String(error?.message || "Request failed") }, ctx, req, 400); }
 }
@@ -481,7 +528,12 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     models = models.map((m) => ({ ...m, provider: "claude" as const }));
     moreModels = moreModels.map((m) => ({ ...m, provider: "claude" as const }));
     if (!ctx.guest) { try { models = [...models, ...await getCodexModels()]; } catch {} }
-    return jsonRes({ guest: !!ctx.guest, board: !!ctx.board, sketch: !!ctx.sketchDir, inventory: !!ctx.inventoryFile, models, moreModels, commands, agents, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && (ctx.ttsUrl || ctx.elevenLabs)), voices: ctx.elevenLabs ? ctx.elevenLabs.voices : ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: ctx.elevenLabs ? ctx.elevenLabs.voices[0].id : "af_heart" }, ctx, req);
+    // The default model a NEW chat starts on, on a device that has not picked one: the user's CLI
+    // default from ~/.claude/settings.json, so one setting drives the terminal and the app. A guest
+    // instance uses its configured appDefaultModel instead (its menu already leads with it).
+    let defaultModel: string | undefined = ctx.guest ? ctx.defaultModel : undefined;
+    if (!ctx.guest) { try { const st = JSON.parse(await Bun.file(join(ctx.claudeDir, "settings.json")).text()); if (typeof st?.model === "string" && st.model) defaultModel = st.model; } catch { /* no settings */ } }
+    return jsonRes({ guest: !!ctx.guest, board: !!ctx.board, sketch: !!ctx.sketchDir, inventory: !!ctx.inventoryFile, models, moreModels, defaultModel, commands, agents, defaultCwd: ctx.defaultCwd, voice: !!(ctx.sttUrl && (ctx.ttsUrl || ctx.elevenLabs)), voices: ctx.elevenLabs ? ctx.elevenLabs.voices : ctx.ttsUrl ? TTS_VOICES : [], defaultVoice: ctx.elevenLabs ? ctx.elevenLabs.voices[0].id : "af_heart" }, ctx, req);
   }
 
   // --- MCP server management (the tools the LLM can call in /app chats) ---
@@ -492,7 +544,7 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     const id = new URL(req.url).searchParams.get("id") || "";
     const live = id ? get(id) : undefined;
     const status = live ? await live.mcpStatus() : [];
-    return jsonRes({ servers, status, live: !!live }, ctx, req);
+    return jsonRes({ servers, builtins: builtinMcpNames(), status, live: !!live }, ctx, req);
   }
   // Add or update a server: { name, config, applyTo? }. Takes effect on the next new chat; pass
   // applyTo=<id> to also push it live into that running conversation via setMcpServers.
@@ -909,6 +961,13 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     if (!found) return jsonRes({ error: "not found" }, ctx, req, 404);
     const events = await replayAny(found.path);
     const meta = await convMeta(found.path);
+    const chosen = (await loadModelChoices(modelChoicesFile))[id];
+    if (chosen && !live) {
+      // Swap the trailing concrete-model event for the user's choice (same index, so delta cursors hold).
+      let i = events.length - 1;
+      while (i >= 0 && events[i].t !== "model") i--;
+      if (i >= 0) events[i] = { t: "model", model: chosen } as AppEvent; else events.push({ t: "model", model: chosen } as AppEvent);
+    }
     // Delta fetch: `?since=N` returns only the events after the caller's cursor. The transcript is
     // append-only, so events[0..N] are stable and folding the tail onto the caller's already-reduced
     // items gives the same result as reducing the whole thing (it is a plain fold). Reopening a long
@@ -930,7 +989,7 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
       events: delta ? events.slice(since) : events,
       delta, evTotal: events.length,
       live: !!live, busy: !!live?.busy, pendingAsks: live?.listPendingAsks() || [],
-      epoch: live?.epoch ?? null, seq: live?.seq ?? -1, phase: live?.phase ?? "idle", model: live?.model ?? meta.model ?? null,
+      epoch: live?.epoch ?? null, seq: live?.seq ?? -1, phase: live?.phase ?? "idle", model: live?.model ?? chosen ?? meta.model ?? null,
     }, ctx, req);
   }
 
@@ -956,9 +1015,10 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     if (ctx.guest && model && GUEST_BLOCKED.test(model)) return jsonRes({ error: "This account cannot use Fable. Pick another model." }, ctx, req, 400);
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
-    if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.send(text, typeof b.cid === "string" ? b.cid : undefined); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
+    if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.setClientTz(b.tz); existing.send(text, typeof b.cid === "string" ? b.cid : undefined); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
     const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile, settings: sessionSettingsFrom(b.settings, ctx) || previous?.settings, sharedTools: ctx.sharedTools, agentDepth: b.agentDepth || 0, parentSession: typeof b.parentSession === "string" ? b.parentSession : undefined });
     tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
+    conv.setClientTz(b.tz);
     void conv.run(text, typeof b.cid === "string" ? b.cid : undefined);
     dedupRecord(b.cid, conv.id);
     return jsonRes({ id: conv.id, cwd, model: model || null, epoch: conv.epoch }, ctx, req);
@@ -1012,6 +1072,7 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     if (!rawText) return jsonRes({ error: "empty message" }, ctx, req, 400);
     if (dedupSeen(b.cid)) { tlog("dedup", { route: "send", conv: conv.id, cid: shortCid(b.cid) }); return jsonRes({ ok: true, id: conv.id, deduped: true }, ctx, req); } // redelivery -> ack, don't re-send
     tlog("accept", { route: "send", conv: conv.id, cid: shortCid(b.cid), chars: rawText.length });
+    conv.setClientTz(b.tz);
     conv.send(b.voice ? decorateVoiceTurn(rawText) : rawText, typeof b.cid === "string" ? b.cid : undefined); // voice mode -> append the brief/TTS directive
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id }, ctx, req);
@@ -1024,30 +1085,59 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
   if (req.method === "POST" && path === "/app/api/edit") {
     let b: any = {}; try { b = await req.json(); } catch {}
     const id = String(b.id || "");
-    let index = Number(b.index);
+    const uuid = String(b.uuid || "");
     const rawText = String(b.text ?? "").trim();
-    if (!id || !Number.isInteger(index) || index < 0 || !rawText) return jsonRes({ error: "id, index (>=0) and text required" }, ctx, req, 400);
+    if (!id || !uuid || !rawText) return jsonRes({ error: "id, uuid and text required" }, ctx, req, 400);
     if (dedupSeen(b.cid)) return jsonRes({ ok: true, id, deduped: true }, ctx, req);
     const found = findTranscript(ctx, id);
     if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
     if (id.startsWith("codex-") || id.startsWith("handoff-")) return jsonRes({ error: "Editing earlier turns with file rollback is available for Claude chats. Fork this chat to continue from a separate copy." }, ctx, req, 409);
-    const carriedTurns = (readLaunchContext(id)?.events || []).filter(e => e.t === "user").length;
-    if (index < carriedTurns) return jsonRes({ error: "This turn belongs to the original chat. Edit it there." }, ctx, req, 409);
-    index -= carriedTurns;
-    const points = await resolveEditPoints(found.path, index);
-    if (!points) return jsonRes({ error: "could not resolve the edited turn (reload and retry)" }, ctx, req, 409);
-    // Guard against a stale client view: if the client told us the original text, it must still match
-    // the turn at that index, or we'd fork at the wrong place.
-    if (typeof b.orig === "string" && b.orig.trim() && points.promptText.trim() !== String(b.orig).trim())
-      return jsonRes({ error: "conversation changed — reload and retry" }, ctx, req, 409);
+    if ((readLaunchContext(id)?.events || []).some((e: any) => e.t === "user" && e.uuid === uuid)) return jsonRes({ error: "This turn belongs to the original chat. Edit it there." }, ctx, req, 409);
+    const points = await resolveEditPoints(found.path, uuid);
+    if (!points) { tlog("reject", { route: "edit", conv: id, uuid, why: "no such message" }); return jsonRes({ error: "message not found" }, ctx, req, 404); }
     const meta = await convMeta(found.path);
     let conv = get(id);
     if (!conv) { conv = getOrCreate(id, { cwd: meta.cwd || ctx.defaultCwd, model: b.model || undefined, resume: id, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile, sharedTools: ctx.sharedTools }); await conv.bootForRewind(); }
     const text = b.voice ? decorateVoiceTurn(rawText) : rawText;
-    tlog("accept", { route: "edit", conv: conv.id, cid: shortCid(b.cid), chars: text.length, index });
-    const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text);
+    tlog("accept", { route: "edit", conv: conv.id, cid: shortCid(b.cid), chars: text.length, uuid });
+    conv.setClientTz(b.tz);
+    const rewind = await conv.editTurn(points.forkAtUuid, points.rewindToUuid, text, typeof b.cid === "string" ? b.cid : undefined);
     dedupRecord(b.cid, conv.id);
     return jsonRes({ ok: true, id: conv.id, rewind }, ctx, req);
+  }
+
+  // Delete a user turn and everything after it: the conversation goes back to how it was before
+  // that message. Chat only, files on disk are left alone (Filip, 2026-10-26). A fork cannot do this:
+  // the SDK writes a forked session only when its first new message is sent, so a fork with nothing
+  // to send leaves no trace. Instead the live session is stopped and the transcript is cut right
+  // after the last entry the kept history ends on. The cut tail is kept under DELETED_DIR.
+  if (req.method === "POST" && path === "/app/api/delete-from") {
+    let b: any = {}; try { b = await req.json(); } catch {}
+    const id = String(b.id || "");
+    const uuid = String(b.uuid || "");
+    if (!id || !uuid) return jsonRes({ error: "id and uuid required" }, ctx, req, 400);
+    const found = findTranscript(ctx, id);
+    if (!found) return jsonRes({ error: "no transcript for id" }, ctx, req, 404);
+    if (id.startsWith("codex-") || id.startsWith("handoff-")) return jsonRes({ error: "Delete from here is available for Claude chats only." }, ctx, req, 409);
+    if ((readLaunchContext(id)?.events || []).some((e: any) => e.t === "user" && e.uuid === uuid)) return jsonRes({ error: "This turn belongs to the original chat." }, ctx, req, 409);
+    const points = await resolveEditPoints(found.path, uuid);
+    if (!points) { tlog("reject", { route: "delete-from", conv: id, uuid, why: "no such message" }); return jsonRes({ error: "message not found" }, ctx, req, 404); }
+    if (!points.forkAtUuid) return jsonRes({ error: "first message: delete the conversation instead" }, ctx, req, 400);
+    discard(id);
+    await new Promise((r) => setTimeout(r, 500)); // let the stopped CLI process exit before the file is cut
+    const buf = readFileSync(found.path);
+    let pos = 0, cut = -1;
+    while (pos < buf.length) {
+      const nl = buf.indexOf(0x0a, pos);
+      const end = nl < 0 ? buf.length : nl + 1;
+      try { if (JSON.parse(buf.subarray(pos, end).toString("utf8")).uuid === points.forkAtUuid) cut = end; } catch { /* partial line */ }
+      pos = end;
+    }
+    if (cut < 0) return jsonRes({ error: "could not find the cut point (reload and retry)" }, ctx, req, 409);
+    try { mkdirSync(DELETED_DIR, { recursive: true }); writeFileSync(join(DELETED_DIR, `${id}-${Date.now()}.jsonl.cut`), buf.subarray(cut)); } catch { /* the cut still goes ahead */ }
+    truncateSync(found.path, cut);
+    tlog("accept", { route: "delete-from", conv: id, uuid, cutBytes: buf.length - cut });
+    return jsonRes({ ok: true, id }, ctx, req);
   }
 
   // Live event stream (SSE). Must already be started (GET can't carry the first turn).
@@ -1371,7 +1461,10 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     // Images are usually rendered inline in the chat rather than saved, and "attachment" makes
     // opening one in a new tab download it instead of showing it. Everything else stays an
     // attachment so a click on a file card is still a download.
-    const inline = /^image\//.test(f.type || "");
+    // A file card's preview opens the file in a new tab, so PDFs and plain text render inline too.
+    // HTML never does: served inline it would run script on this origin with the owner's session.
+    const t = f.type || "";
+    const inline = /^image\//.test(t) || t === "application/pdf" || t === "application/json" || (/^text\//.test(t) && !/html/.test(t));
     const safeName = name.replace(/[^A-Za-z0-9._-]/g, "_");
     return new Response(f, { headers: { ...ctx.cors(req), "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${safeName}"`, "Cache-Control": "no-cache", ...(etag ? { ETag: etag } : {}) } });
   }

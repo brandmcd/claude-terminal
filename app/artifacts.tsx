@@ -179,8 +179,12 @@ export function parseAssistant(text: string): Segment[] {
 
 // #region local-ref rewriting + file helpers
 // Download URL for a local path Claude wrote, via the /app proxy route (mirrors main.tsx).
-export function downloadUrl(convId: string | null | undefined, path: string): string {
-  return `/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(path)}`;
+// `v` makes the URL unique per message. Chrome keeps every image a page has shown in an in-memory cache
+// keyed by URL and reuses it without asking the server (Cache-Control/ETag never get a say), so a
+// second message showing a file Claude overwrote at the same path displayed the old picture. The
+// message's position in the thread is stable while it streams and differs from message to message.
+export function downloadUrl(convId: string | null | undefined, path: string, v?: string | number): string {
+  return `/app/api/download?id=${encodeURIComponent(convId || "")}&path=${encodeURIComponent(path)}${v != null && v !== "" ? `&v=${encodeURIComponent(String(v))}` : ""}`;
 }
 
 // True when an href points at a local file Claude produced (not a remote/anchor/data URL).
@@ -197,12 +201,12 @@ export function isMarkdownHref(href: string): boolean {
 // download route; remote/data/blob refs are left alone. Keeps the parent markdown path as safe as today.
 // baseDir is set when rendering a .md file in the viewer: a relative ref inside a note means "next
 // to the note", not "in the chat's cwd".
-function rewriteLocalRefs(html: string, convId: string | null, baseDir?: string | null): string {
+function rewriteLocalRefs(html: string, convId: string | null, v?: string | number, baseDir?: string | null): string {
   // marked percent-encodes a destination, and a note name is usually "Two Words.md"; the download
   // route wants the real path, so undo that before resolving.
   const dec = (p: string) => { try { return decodeURIComponent(p); } catch { return p; } };
   const abs = (p: string) => { const d = dec(p); return baseDir && !/^[~/]/.test(d) ? baseDir.replace(/\/+$/, "") + "/" + d : d; };
-  const dl = (p: string) => downloadUrl(convId, abs(p));
+  const dl = (p: string) => downloadUrl(convId, abs(p), v);
   return html
     .replace(/<img([^>]*?)\ssrc="([^"]+)"([^>]*)>/g, (m, pre, src, post) =>
       /^(https?:|data:|blob:|\/app\/api\/)/i.test(src) ? `<img${pre} src="${src}"${post} loading="lazy">` : `<img${pre} src="${dl(src)}"${post} loading="lazy">`)
@@ -236,22 +240,48 @@ function fmtBytes(n?: number): string | null {
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
 }
 
-// A download card for a local file Claude saved. href is the ALREADY-rewritten download URL (or use
-// downloadUrl()); name/size are display-only.
-export function FileCard({ href, name, size }: { href: string; name: string; size?: number }) {
+// A file card: a thumbnail (images) or type icon, the name and type, and a Download button. The
+// body previews: images open in the full-screen viewer (onPreview), anything else opens in the
+// artifact viewer when onOpen is given (a new tab inside the installed PWA has no way back), else in
+// a new tab (the download route serves PDFs, text and images inline). href is the download URL.
+const IMG_EXT = /^(png|jpe?g|gif|webp|svg|avif|bmp)$/;
+export function FileCard({ href, name, size, onPreview, onOpen }: { href: string; name: string; size?: number; onPreview?: (src: string) => void; onOpen?: () => void }) {
   const ext = extOf(name);
+  const isImg = IMG_EXT.test(ext);
   const icon = EXT_ICON[ext] || "📎";
   const sz = fmtBytes(size);
   return (
-    <a className="ct-file-card" href={href} target="_blank" rel="noreferrer" title={`Download ${name}`}>
-      <span className="ct-file-ic" aria-hidden>{icon}</span>
-      <span className="ct-file-meta">
-        <span className="ct-file-name">{name}</span>
-        <span className="ct-file-sub">{ext ? ext.toUpperCase() : "FILE"}{sz ? ` · ${sz}` : ""}</span>
-      </span>
-      <svg className="ct-file-dl" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>
-    </a>
+    <div className="ct-file-card">
+      <a
+        className="ct-file-open" href={href} target="_blank" rel="noreferrer" title={name}
+        onClick={isImg && onPreview ? (e) => { e.preventDefault(); e.stopPropagation(); onPreview(href); } : !isImg && onOpen ? (e) => { e.preventDefault(); e.stopPropagation(); onOpen(); } : undefined}
+      >
+        {isImg ? <img className="ct-file-thumb" src={href} alt="" loading="lazy" /> : <span className="ct-file-ic" aria-hidden>{icon}</span>}
+        <span className="ct-file-meta">
+          <span className="ct-file-name">{name}</span>
+          <span className="ct-file-sub">{ext ? ext.toUpperCase() : "FILE"}{sz ? ` · ${sz}` : ""}</span>
+        </span>
+      </a>
+      <a className="ct-file-btn" href={href} download={name} title={`Download ${name}`}>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M5 21h14" /></svg>
+        Download
+      </a>
+    </div>
   );
+}
+
+// Local files a reply links to ([name](path), not ![image](path) embeds and not web links), deduped
+// in order. Each gets a FileCard under the message; the inline link stays in the prose.
+const MD_LINK = /(^|[^!])\[([^\]\n]+)\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)/g;
+function localFileLinks(md: string): string[] {
+  const out: string[] = [];
+  for (const m of md.matchAll(MD_LINK)) {
+    const href = m[3];
+    if (/^(https?:|mailto:|tel:|#|data:|blob:|\/app\/api\/|\/\/)/i.test(href)) continue;
+    if (!/\.[A-Za-z0-9]{1,6}$/.test(href)) continue; // a file has an extension; skips bare dirs and anchors
+    if (!out.includes(href)) out.push(href);
+  }
+  return out;
 }
 // #endregion
 
@@ -780,6 +810,11 @@ async function openFile(path: string, convId: string | null, open: (a: Artifact)
   open({ ...base, fileType: "text", code, lang: ext });
 }
 
+// Open a local path in the viewer: a .md file as a note, anything else as a file.
+export function openLocalPath(path: string, convId: string | null, open: (a: Artifact) => void): void {
+  void (isMarkdownHref(path) ? openNote(path, convId, open) : openFile(path, convId, open));
+}
+
 // The body of a "file" artifact. PDFs and unknown types are fetched as a blob and framed from a
 // blob URL, because the download route sends them as attachments and a framed attachment would
 // download instead of display.
@@ -813,12 +848,12 @@ function FileBody({ artifact }: { artifact: Artifact }) {
 }
 
 // #region AssistantContent (drop-in replacement for main.tsx's <Assistant>)
-function Markdown({ text, convId, baseDir, variant, onOpenArtifact }: { text: string; convId: string | null; baseDir?: string | null; variant?: "chat" | "note"; onOpenArtifact?: (a: Artifact) => void }) {
+function Markdown({ text, convId, v, baseDir, variant, onOpenArtifact }: { text: string; convId: string | null; v?: string | number; baseDir?: string | null; variant?: "chat" | "note"; onOpenArtifact?: (a: Artifact) => void }) {
   const html = useMemo(() => {
     const { text: pre, restore } = extractMath(text || "");
     const raw = variant === "note" ? renderNote(pre) : (marked.parse(pre) as string);
-    return rewriteLocalRefs(restore(raw), convId, baseDir);
-  }, [text, convId, baseDir, variant]);
+    return rewriteLocalRefs(restore(raw), convId, v, baseDir);
+  }, [text, convId, v, baseDir, variant]);
   // Tapping a .md link fetches the file and opens it in the artifact viewer (split panel on a wide
   // screen, full-screen sheet on a phone). Without this the link is a download, which on iOS leaves
   // the PWA. fetch() ignores the route's Content-Disposition, so no server change is needed to read.
@@ -838,10 +873,11 @@ function Markdown({ text, convId, baseDir, variant, onOpenArtifact }: { text: st
 // Renders a whole assistant message: markdown runs, code cards, artifact cards, and an image
 // lightbox. onOpenArtifact is called when a card is opened — main.tsx owns where <ArtifactViewer>
 // goes (split-screen panel on desktop, full-screen sheet on mobile).
-export function AssistantContent({ text, convId, onOpenArtifact }: { text: string; convId?: string | null; onOpenArtifact?: (a: Artifact) => void }) {
+export function AssistantContent({ text, convId, onOpenArtifact, v }: { text: string; convId?: string | null; onOpenArtifact?: (a: Artifact) => void; v?: string | number }) {
   const segs = useMemo(() => parseAssistant(text), [text]);
   const cid = convId ?? null;
   const [light, setLight] = useState<string | null>(null);
+  const files = useMemo(() => localFileLinks(segs.filter((x) => x.type === "markdown").map((x: any) => x.text).join("\n")), [segs]);
 
   // Tap an inline image to open a lightbox (images already resolve via rewriteLocalRefs).
   const onImgClick = useCallback((e: React.MouseEvent) => {
@@ -852,16 +888,135 @@ export function AssistantContent({ text, convId, onOpenArtifact }: { text: strin
   return (
     <div className="md-root" onClick={onImgClick}>
       {segs.map((s, i) => {
-        if (s.type === "markdown") return <Markdown key={i} text={s.text} convId={cid} onOpenArtifact={onOpenArtifact} />;
+        if (s.type === "markdown") return <Markdown key={i} text={s.text} convId={cid} v={v} onOpenArtifact={onOpenArtifact} />;
         if (s.type === "code") return <CodeBlock key={i} code={s.code} lang={s.lang} />;
         return <ArtifactCard key={s.artifact.id} artifact={s.artifact} onOpen={(a) => onOpenArtifact?.(a)} />;
       })}
-      {light && (
-        <div className="ct-lightbox" onClick={() => setLight(null)} role="dialog" aria-modal>
-          <img src={light} alt="" />
-          <button className="ct-lightbox-x" onClick={() => setLight(null)} aria-label="Close">×</button>
+      {files.length > 0 && (
+        <div className="ct-file-row">
+          {files.map((f) => {
+            const p = (() => { try { return decodeURIComponent(f); } catch { return f; } })();
+            const open = onOpenArtifact ? () => openLocalPath(p, cid, onOpenArtifact) : undefined;
+            return <FileCard key={f} href={downloadUrl(cid, p, v)} name={p.split("/").pop() || p} onPreview={setLight} onOpen={open} />;
+          })}
         </div>
       )}
+      {light && <Lightbox src={light} onClose={() => setLight(null)} />}
+    </div>
+  );
+}
+
+// Full-screen image viewer with its own pinch-zoom + pan (never the page's), and Android-back-to-close.
+// touch-action:none stops the browser from turning a pinch on the image into a page zoom; the gesture
+// math drives a CSS transform on the image instead. On open it pushes a history entry so the phone's
+// back button (a popstate) closes the viewer rather than navigating the SPA away.
+export function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const st = useRef({ s: 1, tx: 0, ty: 0 });
+  const pts = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<{ dist: number; s: number; mx: number; my: number } | null>(null);
+  const tap = useRef<{ x: number; y: number; img: boolean; moved: boolean } | null>(null);
+  const lastTap = useRef(0);
+  const [zoomed, setZoomed] = useState(false);
+
+  // Back button / history: closing via UI pops our pushed entry; a real back-press pops it for us.
+  const popped = useRef(false);
+  useEffect(() => {
+    history.pushState({ ctLightbox: true }, "");
+    const onPop = () => { popped.current = true; onClose(); };
+    window.addEventListener("popstate", onPop);
+    return () => { window.removeEventListener("popstate", onPop); if (!popped.current) history.back(); };
+  }, [onClose]);
+  // Escape to close on desktop.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const apply = () => { const el = imgRef.current; if (el) el.style.transform = `translate(${st.current.tx}px,${st.current.ty}px) scale(${st.current.s})`; };
+  const clampT = () => {
+    const r = wrapRef.current?.getBoundingClientRect(); if (!r) return;
+    const mx = (r.width * (st.current.s - 1)) / 2, my = (r.height * (st.current.s - 1)) / 2;
+    st.current.tx = Math.max(-mx, Math.min(mx, st.current.tx));
+    st.current.ty = Math.max(-my, Math.min(my, st.current.ty));
+  };
+  // Zoom to `s2` keeping the focal screen point (fx,fy) fixed. transform-origin is the element center.
+  const zoomAt = (fx: number, fy: number, s2: number) => {
+    const r = wrapRef.current?.getBoundingClientRect(); if (!r) return;
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const s1 = st.current.s; s2 = Math.max(1, Math.min(6, s2));
+    st.current.tx = st.current.tx * (s2 / s1) + (fx - cx) * (1 - s2 / s1);
+    st.current.ty = st.current.ty * (s2 / s1) + (fy - cy) * (1 - s2 / s1);
+    st.current.s = s2;
+    if (s2 === 1) { st.current.tx = 0; st.current.ty = 0; }
+    clampT(); apply(); setZoomed(s2 > 1);
+  };
+
+  const onDown = (e: React.PointerEvent) => {
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    pts.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.current.size === 1) tap.current = { x: e.clientX, y: e.clientY, img: e.target === imgRef.current, moved: false };
+    if (pts.current.size === 2) pinch.current = null; // re-seed on the next move
+  };
+  const onMove = (e: React.PointerEvent) => {
+    const p = pts.current.get(e.pointerId); if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.current.size >= 2) {
+      const [a, b] = [...pts.current.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      if (!pinch.current) { pinch.current = { dist, s: st.current.s, mx, my }; return; }
+      st.current.tx += mx - pinch.current.mx; st.current.ty += my - pinch.current.my; // follow the fingers
+      pinch.current.mx = mx; pinch.current.my = my;
+      if (tap.current) tap.current.moved = true;
+      zoomAt(mx, my, pinch.current.s * (dist / pinch.current.dist));
+    } else if (st.current.s > 1) {
+      st.current.tx += dx; st.current.ty += dy; clampT(); apply();
+      if (tap.current && Math.hypot(e.clientX - tap.current.x, e.clientY - tap.current.y) > 8) tap.current.moved = true;
+    } else if (tap.current && Math.hypot(e.clientX - tap.current.x, e.clientY - tap.current.y) > 8) {
+      tap.current.moved = true;
+    }
+  };
+  const onUp = (e: React.PointerEvent) => {
+    pts.current.delete(e.pointerId);
+    if (pts.current.size < 2) pinch.current = null;
+    const t = tap.current;
+    if (t && !t.moved && pts.current.size === 0) {
+      const now = performance.now(), dbl = now - lastTap.current < 300;
+      lastTap.current = dbl ? 0 : now;
+      if (dbl && t.img) zoomAt(t.x, t.y, st.current.s > 1 ? 1 : 2.5);
+      else if (!t.img && st.current.s === 1) onClose();          // tap the backdrop -> close
+      else if (!t.img && st.current.s > 1) zoomAt(t.x, t.y, 1);  // backdrop while zoomed -> reset
+    }
+    tap.current = null;
+  };
+  const onWheel = (e: React.WheelEvent) => { e.preventDefault(); zoomAt(e.clientX, e.clientY, st.current.s * (e.deltaY < 0 ? 1.15 : 1 / 1.15)); };
+
+  return (
+    <div
+      ref={wrapRef}
+      className={"ct-lightbox" + (zoomed ? " zoomed" : "")}
+      role="dialog"
+      aria-modal
+      onPointerDown={(e) => { e.stopPropagation(); onDown(e); }}
+      onPointerMove={(e) => { e.stopPropagation(); onMove(e); }}
+      onPointerUp={(e) => { e.stopPropagation(); onUp(e); }}
+      onPointerCancel={(e) => { e.stopPropagation(); onUp(e); }}
+      // The viewer can sit inside a message bubble (a user's photo); keep taps, long-presses and the
+      // context menu from reaching the bubble's own handlers underneath it.
+      onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.stopPropagation()}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchMove={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onMouseUp={(e) => e.stopPropagation()}
+      onWheel={onWheel}
+    >
+      <img ref={imgRef} src={src} alt="" draggable={false} />
+      <button className="ct-lightbox-x" onClick={onClose} aria-label="Close">×</button>
     </div>
   );
 }
@@ -882,14 +1037,17 @@ function injectArtifactCss() {
   .ct-code pre{margin:0;padding:12px 14px;overflow-x:auto;background:var(--code-bg,#120f0c)}
   .ct-code pre code{font-family:var(--mono);font-size:12.5px;line-height:1.55;background:none;padding:0}
   /* file card */
-  .ct-file-card{display:inline-flex;align-items:center;gap:11px;max-width:100%;margin:4px 0;padding:9px 13px;background:var(--bg-2);border:1px solid var(--line);border-radius:11px;color:var(--text);text-decoration:none;transition:border-color .12s,background .12s}
-  .ct-file-card:hover{border-color:var(--accent);background:var(--bg-3)}
-  .ct-file-ic{font-size:20px;line-height:1;flex:0 0 auto}
-  .ct-file-meta{display:flex;flex-direction:column;min-width:0;gap:1px}
+  .ct-file-row{display:flex;flex-direction:column;gap:8px;margin:6px 0 12px}
+  .ct-file-card{display:flex;align-items:center;gap:10px;max-width:520px;padding:8px 8px 8px 10px;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;transition:border-color .12s}
+  .ct-file-card:hover{border-color:color-mix(in srgb,var(--accent) 55%,var(--line))}
+  .ct-file-open{display:flex;align-items:center;gap:11px;flex:1 1 auto;min-width:0;color:var(--text);text-decoration:none;cursor:pointer}
+  .ct-file-thumb{width:44px;height:44px;object-fit:cover;border-radius:8px;flex:0 0 auto;background:var(--bg-3)}
+  .ct-file-ic{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:8px;background:var(--bg-3);font-size:21px;line-height:1;flex:0 0 auto}
+  .ct-file-meta{display:flex;flex-direction:column;min-width:0;gap:2px}
   .ct-file-name{font-size:13.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .ct-file-sub{font-size:11px;color:var(--text-3);letter-spacing:.03em}
-  .ct-file-dl{flex:0 0 auto;color:var(--text-3)}
-  .ct-file-card:hover .ct-file-dl{color:var(--accent)}
+  .ct-file-btn{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;padding:7px 12px;border-radius:9px;background:var(--accent);color:#fff;font-size:12.5px;font-weight:600;text-decoration:none;transition:filter .12s}
+  .ct-file-btn:hover{filter:brightness(1.08)}
   /* artifact card */
   .ct-art-card{display:flex;align-items:center;gap:12px;width:100%;text-align:left;margin:2px 0 12px;padding:12px 14px;background:var(--bg-2);border:1px solid var(--line);border-radius:12px;color:var(--text);transition:border-color .12s,background .12s}
   .ct-art-card:hover{border-color:var(--accent);background:var(--bg-3)}
@@ -958,8 +1116,9 @@ function injectArtifactCss() {
   .ct-av-error b{display:block;margin-bottom:8px;color:var(--danger,#e0685f)}
   .ct-av-error pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;background:var(--bg-2);border:1px solid var(--line-2);border-radius:8px;padding:12px}
   /* image lightbox */
-  .ct-lightbox{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:calc(24px + env(safe-area-inset-top,0px)) calc(24px + env(safe-area-inset-right,0px)) calc(24px + env(safe-area-inset-bottom,0px)) calc(24px + env(safe-area-inset-left,0px));cursor:zoom-out}
-  .ct-lightbox img{max-width:100%;max-height:100%;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  .ct-lightbox{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:calc(24px + env(safe-area-inset-top,0px)) calc(24px + env(safe-area-inset-right,0px)) calc(24px + env(safe-area-inset-bottom,0px)) calc(24px + env(safe-area-inset-left,0px));cursor:zoom-out;touch-action:none;overscroll-behavior:contain;overflow:hidden}
+  .ct-lightbox.zoomed{cursor:grab}
+  .ct-lightbox img{max-width:100%;max-height:100%;border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,.6);transform-origin:center center;will-change:transform;user-select:none;-webkit-user-select:none;-webkit-user-drag:none;touch-action:none}
   .ct-lightbox-x{position:fixed;top:calc(14px + env(safe-area-inset-top,0px));right:calc(16px + env(safe-area-inset-right,0px));width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:26px;line-height:1}
   .ct-lightbox-x:hover{background:rgba(255,255,255,.22)}
   /* highlight.js — warm dark theme tuned to the app palette */
