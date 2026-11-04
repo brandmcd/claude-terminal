@@ -23,6 +23,18 @@ A companion for running [Claude Code](https://claude.com/claude-code) in the bro
 It is config-driven: a single-person install is a few lines of JSON. You can also track extra
 "users" (separate agents, bots, or sandboxed guests) so their usage shows as its own row.
 
+## Claude and Codex
+
+The chat app (`/app`, described below) runs Claude Code and OpenAI Codex in the same interface. The model picker lists both catalogs. Picking a model from the other provider starts a new chat with the conversation so far copied in, and the original chat stays as it was. Both providers get a `shared-work` MCP server, so a Claude chat can hand part of a job to a Codex chat (or the reverse) and read back its result. See [`docs/codex.md`](docs/codex.md) for setup and current limits.
+
+![A Claude conversation debugging a flaky login test, with a grouped tool-call card and a code block](docs/screenshots/claude-chat.png)
+
+![A Codex conversation drafting release notes from recently merged pull requests](docs/screenshots/codex-chat.png)
+
+![The model picker open, listing Claude models and Codex models in separate sections](docs/screenshots/model-picker.png)
+
+These three screenshots use invented demo data, not real conversations.
+
 ## The desktop
 
 On a wide screen the site opens as a Windows 95 style desktop. The chat app, every terminal tab,
