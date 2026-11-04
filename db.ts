@@ -105,5 +105,6 @@ export function openDb(path: string): Database {
   db.exec(SCHEMA);
   addMissingColumns(db, "hourly", HOURLY_PART_COLS);
   addMissingColumns(db, "external_hourly", HOURLY_PART_COLS);
+  addMissingColumns(db, "external_model_usage", ["input", "cache_read", "cache_creation", "cache_creation_5m", "cache_creation_1h", "total"]);
   return db;
 }

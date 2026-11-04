@@ -1,7 +1,9 @@
 // Clawd, the Claude Code mascot, drawn on a 22x15 pixel grid, plus the elapsed-time label that
 // shows how long a task has been running. Both are shared by the chat view and the desktop shell.
 // Styles are injected once from here so neither caller has to touch styles.css.
-import React, { useEffect, useRef, useState } from "react";
+import React, { createContext, useContext, useEffect, useRef, useState } from "react";
+
+export const MascotProvider = createContext<"claude" | "codex">("claude");
 
 export type ClawdMood = "idle" | "walk" | "needs" | "sleep";
 const MOVES = ["d-hop", "d-wiggle", "d-shuffle", "d-spin", "d-party"] as const;
@@ -10,6 +12,9 @@ let nextMove = 0;
 
 const CSS = `
 .clawd { display: inline-block; position: relative; cursor: pointer; transform-origin: 50% 100%; line-height: 0; vertical-align: middle; -webkit-tap-highlight-color: transparent; }
+.clawd.codex-bot { --clawd: #78b8b0; --clawd-ink: #102b2a; }
+.clawd .c-screen { fill: #102b2a; }
+.clawd .c-prompt { fill: none; stroke: #d7fff6; stroke-width: 1.2; stroke-linecap: square; }
 .clawd svg { display: block; overflow: visible; shape-rendering: crispEdges; }
 .clawd .c-body, .clawd .c-arm, .clawd .c-leg { fill: var(--clawd, #d97757); }
 .clawd .c-eye { fill: var(--clawd-ink, #1a1613); transform-box: fill-box; transform-origin: center; animation: clawd-blink 4.2s infinite; }
@@ -78,9 +83,12 @@ export function confetti(n = 60) {
 
 // `danceKey`: each change starts a dance, so a parent can make Clawd celebrate (a task finishing)
 // without holding a ref. A tap starts the next move in the cycle.
-export function Clawd({ size = 2, mood = "idle", danceKey, move, title, className }: {
-  size?: number; mood?: ClawdMood; danceKey?: number; move?: ClawdMove; title?: string; className?: string;
+export function Clawd({ size = 2, mood = "idle", danceKey, move, title, className, provider }: {
+  provider?: "claude" | "codex"; size?: number; mood?: ClawdMood; danceKey?: number; move?: ClawdMove; title?: string; className?: string;
 }) {
+  const inheritedProvider = useContext(MascotProvider);
+  const codex = (provider ?? inheritedProvider) === "codex";
+  const name = codex ? "Codex bot" : "Clawd";
   injectCss();
   const [dancing, setDancing] = useState<ClawdMove | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -101,9 +109,18 @@ export function Clawd({ size = 2, mood = "idle", danceKey, move, title, classNam
   useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
   const w = 22 * size, h = 15 * size;
   return (
-    <span className={"clawd " + (dancing || mood) + (className ? " " + className : "")} title={title ?? "Clawd (tap to dance)"}
-      role="img" aria-label="Clawd" onClick={(e) => { e.stopPropagation(); start(); }}>
+    <span className={"clawd " + (codex ? "codex-bot " : "") + (dancing || mood) + (className ? " " + className : "")} title={title ?? `${name} (tap to dance)`}
+      role="img" aria-label={name} onClick={(e) => { e.stopPropagation(); start(); }}>
       <svg width={w} height={h} viewBox="0 0 22 15" aria-hidden="true">
+        {codex ? <>
+          <rect className="c-arm l" x="1" y="6" width="2" height="4" />
+          <rect className="c-arm r" x="19" y="6" width="2" height="4" />
+          <rect className="c-body" x="3" y="1" width="16" height="11" rx="1" />
+          <rect className="c-screen" x="5" y="3" width="12" height="7" />
+          <path className="c-prompt" d="M7 5l2 1.5L7 8 M11 8h3" />
+          <rect className="c-leg" x="5" y="12" width="3" height="2" />
+          <rect className="c-leg" x="14" y="12" width="3" height="2" />
+        </> : <>
         <rect className="c-arm l" x="0.5" y="5" width="2.5" height="3" />
         <rect className="c-arm r" x="19" y="5" width="2.5" height="3" />
         <rect className="c-body" x="3" y="1" width="16" height="10" />
@@ -113,6 +130,7 @@ export function Clawd({ size = 2, mood = "idle", danceKey, move, title, classNam
         <rect className="c-leg" x="7.6" y="11" width="1.6" height="3" />
         <rect className="c-leg" x="12.8" y="11" width="1.6" height="3" />
         <rect className="c-leg" x="15.9" y="11" width="1.6" height="3" />
+        </>}
       </svg>
       <span className="c-q" aria-hidden="true">?</span>
       <span className="c-z" aria-hidden="true">z</span>

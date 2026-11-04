@@ -15,7 +15,10 @@ export type AskItem = {
   answered?: string;
 };
 
-export type EmailDraft = { from?: string; fromOptions?: string[]; signatures?: Record<string, string>; to: string; cc?: string; bcc?: string; subject: string; body: string };
+export type EmailDraft = { from?: string; fromOptions?: string[]; signatures?: Record<string, string>; to: string; cc?: string; bcc?: string; subject: string; body: string; attachments?: (string | { name: string; size: number })[] };
+
+const fmtSize = (n: number) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+const attLabel = (a: string | { name: string; size: number }) => typeof a === "string" ? a.split("/").pop() : `${a.name} (${fmtSize(a.size)})`;
 
 export function AskCard({ it, onAnswer }: { it: AskItem; onAnswer: (askId: string, answer: string) => void }) {
   if (it.email) return <EmailCard it={it} draft={it.email} onAnswer={onAnswer} />;
@@ -63,6 +66,7 @@ function EmailCard({ it, draft, onAnswer }: { it: AskItem; draft: EmailDraft; on
         <div className="email-ro"><span>To</span>{shown.to}</div>
         {shown.cc && <div className="email-ro"><span>Cc</span>{shown.cc}</div>}
         <div className="email-ro"><span>Subject</span>{shown.subject}</div>
+        {!!draft.attachments?.length && <div className="email-ro"><span>Attach</span>{draft.attachments.map(attLabel).join(", ")}</div>}
         <div className="email-ro-body">{shown.body}</div>
       </div>
     );
@@ -80,6 +84,7 @@ function EmailCard({ it, draft, onAnswer }: { it: AskItem; draft: EmailDraft; on
       <div className="email-row"><label>Cc</label><input value={f.cc || ""} onChange={set("cc")} /></div>
       {draft.bcc && <div className="email-row"><label>Bcc</label><input value={f.bcc || ""} onChange={set("bcc")} /></div>}
       <div className="email-row"><label>Subject</label><input value={f.subject} onChange={set("subject")} /></div>
+      {!!draft.attachments?.length && <div className="email-row"><label>Attach</label><div className="email-from">{draft.attachments.map(attLabel).join(", ")}</div></div>}
       <textarea className="email-body" value={f.body} onChange={set("body")} rows={Math.min(24, Math.max(6, f.body.split("\n").length + 1))} />
       <div className="email-sig-label">Signature{" "}
         <select className="email-sig-mode" value={sigMode} onChange={pickSigMode}>

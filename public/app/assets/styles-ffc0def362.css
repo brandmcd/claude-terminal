@@ -966,3 +966,18 @@ body.theme-retro .ultra-word, body.theme-retro .ultra-btn > span:first-child, bo
   .uw-flame, .uw-charge { animation: none; }
   .ultra-burst { display: none; }
 }
+
+/* Provider accents preserve the existing theme and layout. */
+body.provider-codex { --accent:#75b6ad; --accent-2:#91cbc3; --user-bg:#263330; }
+body.provider-codex.theme-light { --accent:#287b70; --accent-2:#388e82; --user-bg:#e1eeea; }
+body.provider-codex.theme-retro { --accent:#287b70; --accent-2:#1c655c; --user-bg:#e6f2ec; }
+body.provider-codex .dk-titlebar:not(.dk-inactive) { background:linear-gradient(90deg,#15554f,#347f78); }
+body.provider-codex .dk-startmenu-banner { background:#15554f; }
+.codex-mark { flex-shrink:0; color:var(--accent); }
+.codex-mark-large { width:90px; height:90px; }
+.pk-provider { color:var(--text-3); font-size:11px; padding:8px 10px 3px; }
+.pk-error { color:var(--danger); font-size:12px; padding:8px 10px; }
+.pk-row:disabled { opacity:.6; cursor:wait; }
+
+body.provider-codex.theme-retro .pk-row.on { background:#15554f; }
+body.provider-codex.theme-retro .topbar { background:#c1d0cc; }

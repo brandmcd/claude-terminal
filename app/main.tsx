@@ -14,8 +14,10 @@ import { isAgentTool, AgentToolCard, SpawnedWork, registerTranscriptRenderer } f
 import { isTodoTool, latestTodos, TodoChecklist } from "./todos";
 import { TaskPanel } from "./taskpanel";
 import { BoardStrip } from "./board";
+import { SketchStrip } from "./sketch";
+import { InventoryStrip } from "./inventory";
 import { ConnectionsModal } from "./connections";
-import { Clawd, Elapsed } from "./clawd";
+import { Clawd, Elapsed, MascotProvider } from "./clawd";
 import { Desktop } from "./desktop";
 import { APPS } from "./apps";
 
@@ -86,19 +88,20 @@ function longPressBind(open: (x: number, y: number) => void) {
 }
 
 // #region types
-type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
-type Model = { id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean; supportedEffortLevels?: EffortLevel[] };
+type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+type Provider = "claude" | "codex";
+type Model = { provider?: Provider; id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean; supportedEffortLevels?: EffortLevel[] };
 // A slash command the CLI accepts, from its own `supportedCommands()` list — the same set `/` offers
 // in a terminal tab. Picking one puts "/name" in the composer; the CLI runs it instead of a turn.
 type Command = { name: string; description?: string; argumentHint?: string; aliases?: string[] };
 type Agent = { name: string; description?: string };
 // The settings the chat can set per conversation. Mirrors SessionSettings in app-runner.ts.
 type SessionSettings = { effortLevel?: EffortLevel | null; advisorModel?: string | null; fastMode?: boolean | null; alwaysThinkingEnabled?: boolean | null };
-type Conv = { sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean; queuedText?: string };
+type Conv = { provider?: Provider; model?: string; sessionId: string; title: string; cwd: string | null; mtime: number; pending?: boolean; queuedText?: string };
 type AppEvent =
   | { t: "init"; sessionId: string; model: string; cwd: string; _seq?: number }
-  | { t: "text"; text: string; bid?: string; _seq?: number }
-  | { t: "text_delta"; text: string; bid?: string; _seq?: number }
+  | { t: "text"; model?: string; text: string; bid?: string; _seq?: number }
+  | { t: "text_delta"; model?: string; text: string; bid?: string; _seq?: number }
   | { t: "thinking"; text: string; bid?: string; _seq?: number }
   | { t: "thinking_delta"; text: string; bid?: string; _seq?: number }
   | { t: "thinking_progress"; tokens: number; bid?: string; _seq?: number }
@@ -133,7 +136,7 @@ type Subscription = { available: boolean; subscription: string | null; fiveHour:
 
 type Item =
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string; usage?: TurnUsage; bid?: string }
+  | { kind: "assistant"; model?: string; text: string; usage?: TurnUsage; bid?: string }
   | { kind: "thinking"; text: string; tokens?: number; started?: number; elapsed?: number; _peak?: number; _base?: number; bid?: string }
   | { kind: "tool"; id: string; name: string; input: unknown; result?: unknown; isError?: boolean; progress?: { tokens?: number; toolUses?: number; durationMs?: number; lastTool?: string }; done?: "completed" | "failed" | "stopped" }
   | { kind: "ask"; askId: string; question: string; options: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft; answered?: string }
@@ -145,6 +148,10 @@ type Item =
 // picker entry can carry a context-window suffix (claude-fable-5-1[1m]), so an exact id compare
 // misses and the selector shows the raw id instead of highlighting the right row. Match on the base
 // id (before any "[...]") and return the picker's own id. Unknown, or the list not loaded yet -> unchanged.
+const providerOf = (model?: string | null, row?: Model): Provider => row?.provider || (/^(?:gpt-|o\d(?:-|$)|codex)/i.test(model || "") ? "codex" : "claude");
+function CodexMark({ large = false }: { large?: boolean }) {
+  return <svg className={"codex-mark" + (large ? " codex-mark-large" : "")} width={large ? 90 : 24} height={large ? 90 : 24} viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="m7 10 7 6-7 6M18 22h8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" /></svg>;
+}
 const baseModelId = (id: string) => id.replace(/\[[^\]]*\]$/, "");
 function canonicalModelId(reported: string, list: { id: string }[]): string {
   if (!reported || !list.length) return reported;
@@ -159,6 +166,7 @@ function canonicalModelId(reported: string, list: { id: string }[]): string {
 // "claude-opus-4-8" into "Opus 4.8", dropping a claude- prefix and any trailing yyyymmdd date.
 function prettyModel(id: string): string {
   if (!id) return "Model";
+  if (providerOf(id) === "codex") return id.replace(/^gpt-/, "GPT-").replace(/-codex/, " Codex");
   let t = id.replace(/^claude-/, "").replace(/\[[^\]]*\]$/, "").replace(/-\d{8}$/, "");
   if (t === "default") return "Default";
   const parts = t.split("-");
@@ -360,6 +368,7 @@ const api = {
   del: (id: string) => fetch("/app/api/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
   context: (id: string) => withTimeout(fetch(`/app/api/context?id=${encodeURIComponent(id)}`).then(J)),
   compact: (id: string) => fetch("/app/api/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
+  fork: (id: string) => fetch("/app/api/fork", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) }).then(J),
   usage: () => withTimeout(fetch("/app/api/usage").then(J)),
   // redirect "manual": an expired Cloudflare Access login answers with a cross-origin redirect to the
   // login page, which a followed fetch reports as a plain network error. Seen unfollowed, it is an
@@ -448,7 +457,7 @@ function findBlock(items: Item[], bid: string): number {
 // The one fold from events to items. Pure and order-preserving: everything appends, deltas grow
 // their own block by id, and the few events that update an existing item (tool results, subagent
 // progress, ask answers, usage stamps) find it by its own id.
-function applyEvent(items: Item[], e: AppEvent): Item[] {
+function applyEvent(items: Item[], e: AppEvent, model?: string | null): Item[] {
   switch (e.t) {
     case "user": {
       // A loaded skill arrives as a user message that dumps the whole skill file. Render a compact card.
@@ -461,12 +470,12 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
       if (e.bid) {
         const i = findBlock(items, e.bid);
         if (i >= 0) { const c = items.slice(); const it = c[i] as Extract<Item, { kind: "assistant" }>; c[i] = { ...it, text: it.text + e.text }; return c; }
-        return [...freezeOpen(items), { kind: "assistant", text: e.text, bid: e.bid }];
+        return [...freezeOpen(items), { kind: "assistant", model: e.model || model || undefined, text: e.text, bid: e.bid }];
       }
       // No block id (synthetic text, or an older producer): grow the last bubble if it is one.
       const last = items[items.length - 1];
       if (e.t === "text_delta" && last && last.kind === "assistant") { const c = items.slice(); c[c.length - 1] = { ...last, text: last.text + e.text }; return c; }
-      return [...freezeOpen(items), { kind: "assistant", text: e.text }];
+      return [...freezeOpen(items), { kind: "assistant", model: e.model || model || undefined, text: e.text }];
     }
     case "thinking_delta": {
       const i = e.bid ? findBlock(items, e.bid) : (items[items.length - 1]?.kind === "thinking" ? items.length - 1 : -1);
@@ -542,6 +551,14 @@ function applyEvent(items: Item[], e: AppEvent): Item[] {
     }
     default: return items; // init/busy/status/context/model/hello/hb/compacting/closed/error/tool_start carry no item
   }
+}
+
+function foldEvents(events: AppEvent[], initial: Item[] = [], model?: string | null): Item[] {
+  let current = model;
+  return events.reduce((items, event) => {
+    if (event.t === "init" || event.t === "model") current = event.model;
+    return applyEvent(items, event, current);
+  }, initial);
 }
 
 const contentToText = (c: unknown): string =>
@@ -696,7 +713,7 @@ class ConvStore {
         this.compacting = e.active; this.compactStart = e.active ? (this.compactStart || Date.now()) : 0; this.signal(); return;
       case "compact":
         this.compacting = false; this.compactStart = 0;
-        this.items = applyEvent(this.items, e); this.touch(); this.mgr.hooks?.onContext(this); return;
+        this.items = applyEvent(this.items, e, this.model); this.touch(); this.mgr.hooks?.onContext(this); return;
       case "user": {
         // Our own turn echoed back: matched by the cid we sent (exact), falling back to text for an
         // echo from before cids existed. Anything else is another device's, the terminal's, or a peer
@@ -707,16 +724,16 @@ class ConvStore {
         if (i !== -1) { this.pendingEcho.splice(i, 1); if (this.sendState === "sending") this.setSendState("delivered"); return; }
         const last = this.items[this.items.length - 1];
         if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) return;
-        this.items = applyEvent(this.items, e); this.touch(); return;
+        this.items = applyEvent(this.items, e, this.model); this.touch(); return;
       }
       case "result":
-        this.busy = false; this.items = applyEvent(this.items, e); this.touch();
+        this.busy = false; this.items = applyEvent(this.items, e, this.model); this.touch();
         if (e.usage?.context) this.ctx = { used: e.usage.context, max: this.ctx?.max }; // replay has no context events; the result carries the same number
         this.mgr.hooks?.onResult(this); this.mgr.hooks?.onContext(this); return;
       case "error":
         this.busy = false; this.items = [...freezeOpen(this.items), { kind: "assistant", text: "\n\n_error: " + e.message + "_" }]; this.touch(); return;
       case "closed": this.items = freezeOpen(this.items); this.phase = "idle"; this.busy = false; this.touch(); this.disconnect(); return;
-      default: this.items = applyEvent(this.items, e); this.touch(); return;
+      default: this.items = applyEvent(this.items, e, this.model); this.touch(); return;
     }
   }
 
@@ -781,7 +798,8 @@ class ConvStore {
         const last = items[items.length - 1];
         if (last && last.kind === "user" && sanitizeUserText(last.text) === clean) continue;
       }
-      items = applyEvent(items, e);
+      if (e.t === "init" || e.t === "model") this.model = e.model;
+      items = applyEvent(items, e, this.model);
     }
     this.items = items;
     this.evCount = evTotal;
@@ -892,7 +910,7 @@ class ConvManager {
   }
   private async seed(s: ConvStore) {
     if (s.hydrated || s.items.length) return;
-    try { const d = await api.conversation(s.id); if (!s.hydrated && !s.items.length) s.hydrate((d.events || []).reduce((a: Item[], e: AppEvent) => applyEvent(a, e), [] as Item[]), { busy: d.busy, cwd: d.cwd }); } catch { /* live events still build it */ }
+    try { const d = await api.conversation(s.id); if (!s.hydrated && !s.items.length) s.hydrate(foldEvents(d.events || [], [], d.model), { busy: d.busy, cwd: d.cwd }); } catch { /* live events still build it */ }
   }
   private evict(activeId: string | null) {
     if (this.stores.size <= this.CAP) return;
@@ -987,18 +1005,20 @@ function Assistant({ text, convId }: { text: string; convId?: string | null }) {
 // with the reset time beside it. Always rendered, including before the first /usage reading lands
 // (dim ring, "—"), because whether a turn can run at all is the number people check the footer for.
 // Amber at 80%, red at 95%, the same thresholds the session-limit toast uses.
-function LimitRing({ sub, url }: { sub: Subscription; url?: string }) {
-  const u = sub?.available && sub.fiveHour?.utilization != null ? Math.round(sub.fiveHour.utilization) : null;
+function LimitRing({ sub, url, providerName = "Claude" }: { sub: Subscription; url?: string; providerName?: string }) {
+  const useWeekly = providerName === "Codex" && sub?.fiveHour?.utilization == null;
+  const limitWindow = useWeekly ? sub?.sevenDay : sub?.fiveHour;
+  const u = sub?.available && limitWindow?.utilization != null ? Math.round(limitWindow.utilization) : null;
   const p = Math.max(0, Math.min(100, u ?? 0));
   const r = 9, C = 2 * Math.PI * r;
   const color = p >= 95 ? "var(--error, #EF4444)" : p >= 80 ? "var(--warning, #F59E0B)" : "var(--success, #10B981)";
-  const resetIn = fmtResetIn(sub?.fiveHour?.resetsAt);
+  const resetIn = fmtResetIn(limitWindow?.resetsAt);
   const weekU = sub?.sevenDay?.utilization != null ? Math.round(sub.sevenDay.utilization) : null;
   const weekReset = fmtResetIn(sub?.sevenDay?.resetsAt);
   const title = u == null
-    ? "Subscription session limit (5-hour window): waiting for the first reading"
-    : `Subscription session limit (5-hour window): ${u}% used${resetIn ? `, resets in ${resetIn}` : ""}`
-      + (weekU != null ? `\nWeekly limit: ${weekU}% used${weekReset ? `, resets in ${weekReset}` : ""}` : "")
+    ? `${providerName} subscription usage is unavailable`
+    : `${providerName} subscription ${useWeekly ? "weekly limit (7-day window)" : "session limit (5-hour window)"}: ${u}% used${resetIn ? `, resets in ${resetIn}` : ""}`
+      + (!useWeekly && weekU != null ? `\nWeekly limit: ${weekU}% used${weekReset ? `, resets in ${weekReset}` : ""}` : "")
       + (url ? "\nOpen the usage dashboard" : "");
   const cls = "ctx-ring" + (u == null ? " est" : p >= 95 ? " crit" : p >= 80 ? " warn" : "");
   const body = (
@@ -1176,7 +1196,7 @@ function SendTicks({ state }: { state: ConvStore["sendState"] }) {
   return null;
 }
 
-function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy }: { items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
+function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact, sendStatus, reading, busy, assistantName = "Claude" }: { assistantName?: string; items: Item[]; i: number; busy?: boolean; onAnswer: (askId: string, answer: string) => void; convId: string | null; onMenu?: (x: number, y: number, text: string, kind: "user" | "assistant", i: number) => void; onOpenArtifact?: (a: Artifact) => void; sendStatus?: ConvStore["sendState"]; reading?: "generating" | "playing" }) {
   const it = items[i];
   // Read-aloud feedback for THIS message: a "generating voice…" spinner from the tap until the first
   // audio actually plays (Kokoro TTS can take a moment), then a subtle "playing" state until it ends.
@@ -1282,7 +1302,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
   const tip = usage ? `output ${usage.output}${usage.thinking ? ` (thinking ${usage.thinking})` : ""} · context ${usage.context.toLocaleString()} · total ${usage.total.toLocaleString()} · $${usage.costUsd.toFixed(4)}` : undefined;
   return (
     <div className="msg bubble-assistant" {...menuBind(it.text, "assistant")}>
-      {showRole && <div className="role">Claude</div>}
+      {showRole && <div className="role">{it.model ? (providerOf(it.model) === "codex" ? "Codex" : "Claude") : assistantName}</div>}
       <AssistantContent text={it.text} convId={convId} onOpenArtifact={onOpenArtifact} />
       {raPill}
       {summary && <div className="turn-think" title={tip}>{summary}</div>}
@@ -1296,7 +1316,7 @@ function MessageBlockInner({ items, i, onAnswer, convId, onMenu, onOpenArtifact,
 // turn-final footer), so compare exactly those: during streaming only the tail item changes
 // identity, so only the tail re-renders.
 const MessageBlock = React.memo(MessageBlockInner, (a, b) => {
-  if (a.busy !== b.busy) return false; // a thinking timer's liveness depends on it
+  if (a.busy !== b.busy || a.assistantName !== b.assistantName) return false; // a thinking timer's liveness depends on it
   if (a.i !== b.i || a.convId !== b.convId || a.sendStatus !== b.sendStatus || a.reading !== b.reading) return false;
   if (a.onAnswer !== b.onAnswer || a.onMenu !== b.onMenu || a.onOpenArtifact !== b.onOpenArtifact) return false;
   if (a.items === b.items) return true;
@@ -1325,13 +1345,15 @@ const VIS_STEP = 60;
 // MessageBlock the main thread uses. Registered rather than imported because both live in this file;
 // a second copy of applyEvent would drift the moment either changed.
 registerTranscriptRenderer({
-  fold: (events) => (events as AppEvent[]).reduce((a, e) => applyEvent(a, e), [] as Item[]),
+  fold: (events) => foldEvents(events as AppEvent[]),
   Block: ({ items, i, convId }) => <MessageBlock items={items as Item[]} i={i} convId={convId} onAnswer={() => {}} />,
 });
 
 function App() {
   const [models, setModels] = useState<Model[]>([]);
   const [board, setBoard] = useState(false); // /app/api/models says this instance has the team to-do board
+  const [sketch, setSketch] = useState(false); // ... and the Sketchpad (sketch.tsx)
+  const [inventory, setInventory] = useState(false); // ... and the Parts Inventory (inventory.tsx)
   const [guest, setGuest] = useState(false); // /app/api/models says this is a guest instance: chat only
   const [moreModels, setMoreModels] = useState<Model[]>([]);
   // The CLI's own slash commands and subagents, for the composer's command menu.
@@ -1382,6 +1404,9 @@ function App() {
   const isRealConv = !!activeStore && !activeStore.id.startsWith("new-") && !activeStore.id.startsWith("pending-");
   const rawModel = isRealConv && activeStore!.model ? activeStore!.model : defaultModel;
   const model = canonicalModelId(rawModel, [...models, ...moreModels]);
+  const provider = providerOf(model, [...models, ...moreModels].find((m) => m.id === model));
+  const assistantName = provider === "codex" ? "Codex" : "Claude";
+  useEffect(() => { document.body.classList.toggle("provider-codex", provider === "codex"); return () => document.body.classList.remove("provider-codex"); }, [provider]);
   const [input, setInput] = useState<string>(() => { try { return loadDraft(new URLSearchParams(location.search).get("c")); } catch { return ""; } });
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [uploadError, setUploadError] = useState("");
@@ -1431,6 +1456,9 @@ function App() {
   const [loadingConv, setLoadingConv] = useState(false);
   const [usage5h, setUsage5h] = useState<{ output5h: number; url: string } | null>(null);
   const [subscription, setSubscription] = useState<Subscription>(null);
+  const [codexSubscription, setCodexSubscription] = useState<Subscription>(null);
+  const [modelError, setModelError] = useState("");
+  const [pickingModel, setPickingModel] = useState(false);
   // Shared subscription session-limit warning toast (5h limit high AND the box is contended).
   const [limitToast, setLimitToast] = useState<{ left: number; resetIn: string; n: number } | null>(null);
   const limitDismissed = useRef(false);
@@ -1519,6 +1547,8 @@ function App() {
   const highlightRef = useRef<string>(""); // when set, scroll to + flash the first message containing it
   const activeIdRef = useRef<string | null>(null); // latest activeId for stable callbacks (voice)
   const modelRef = useRef<string>(""); // latest model for stable callbacks (voice)
+  const modelCatalogRef = useRef<Model[]>([]);
+  useEffect(() => { modelCatalogRef.current = [...models, ...moreModels]; }, [models, moreModels]);
   const effortRef = useRef<string>(""); // ditto for the effort default a NEW chat starts on
   const advisorRef = useRef<string>(""); // ditto for the advisor model a NEW chat starts on
   const voiceSinks = useRef<Set<(e: AppEvent) => void>>(new Set()); // voice-mode event subscribers
@@ -1533,8 +1563,12 @@ function App() {
     const eff = isNew ? effortRef.current : (s.settings.effortLevel || effortRef.current);
     const adv = isNew ? advisorRef.current : (s.settings.advisorModel || advisorRef.current);
     const out: SessionSettings = {};
-    if (eff) out.effortLevel = eff as EffortLevel;
-    if (adv) out.advisorModel = adv;
+    const currentModel = isNew ? modelRef.current : s.model;
+    const row = modelCatalogRef.current.find((m) => m.id === currentModel || m.resolvedModel === currentModel);
+    const codex = providerOf(currentModel, row) === "codex";
+    const supported = row?.supportedEffortLevels || (codex ? [] : ["low", "medium", "high", "xhigh", "max"]);
+    if (eff && supported.includes(eff as EffortLevel)) out.effortLevel = eff as EffortLevel;
+    if (adv && !codex) out.advisorModel = adv;
     return Object.keys(out).length ? out : undefined;
   };
 
@@ -1560,15 +1594,15 @@ function App() {
           // what actually happened. Now a cached conversation is topped up by delta, which is cheap
           // enough to do for all of them on every pass.
           const cached = await offline.getConv(c.sessionId).catch(() => null);
-          const d = await api.conversation(c.sessionId, cached?.evCount || 0);
+          const d = await api.conversation(c.sessionId, cached?.items.length ? cached.evCount : 0);
           const events: AppEvent[] = d.events || [];
-          if (d.delta === true && cached) {
+          if (d.delta === true && cached?.items.length) {
             if (!events.length) continue; // already current
-            const merged = events.reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), cached.items as Item[]);
+            const merged = foldEvents(events, cached.items as Item[], d.model || c.model);
             // applyEvent can grow the LAST existing bubble (a text_delta), so rewrite from there.
             await offline.saveConvItems(c.sessionId, merged, Math.max(0, cached.items.length - 1), { busy: !!d.busy, cwd: d.cwd, live: !!d.live, evCount: d.evTotal });
           } else {
-            const built = events.reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+            const built = foldEvents(events, [], d.model || c.model);
             await offline.saveConvItems(c.sessionId, built, 0, { busy: !!d.busy, cwd: d.cwd, live: !!d.live, evCount: d.evTotal });
           }
         } catch { /* skip this one */ }
@@ -1665,6 +1699,18 @@ function App() {
     // what made the "Compacted" card look like it only turned up after the next message.
     setTimeout(() => { s.endCompactFallback(); refreshContext(s.id); flushCompactRef.current(s); }, 300000);
   }, [refreshContext]);
+  // Fork: the server copies this chat's transcript to a new session id (the CLI's --fork-session),
+  // then the copy opens here with the full context. The original stays as it was.
+  const doFork = useCallback(async () => {
+    const id = activeIdRef.current;
+    if (!id) return;
+    try {
+      const r = await api.fork(id);
+      if (!r?.id) throw new Error(r?.error || "fork failed");
+      refreshConvs();
+      await loadConvRef.current(r.id);
+    } catch (e: any) { setUploadError("Fork failed: " + String(e?.message || e)); }
+  }, [refreshConvs]);
   // Which conversations have an offline message queued (resume target) — drives the queued indicator
   // on EXISTING conversations, not just brand-new offline chats.
   const refreshQueue = useCallback(async () => {
@@ -1712,7 +1758,7 @@ function App() {
     // or flaky link shows your chats immediately instead of an empty sidebar until the network answers.
     // refreshConvs() then reconciles it. Only fills if we don't already have rows (network won a race).
     void offline.getCachedList<Conv[]>().then((cached) => { if (cached?.length) setConvs((prev) => (prev.length ? prev : cached)); }).catch(() => {});
-    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setCommands(d.commands || []); setAgents(d.agents || []); setDefaultCwd(d.defaultCwd || ""); setBoard(!!d.board); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (d.guest) { setGuest(true); const saved = localStorage.getItem("ct-app-model") || ""; if (d.models?.[0] && (!saved || /fable/i.test(saved) || !(d.models as Model[]).concat(d.moreModels || []).some((m) => m.id === saved))) setDefaultModel(d.models[0].id); }
+    api.models().then((d) => { setModels(d.models || []); setMoreModels(d.moreModels || []); setCommands(d.commands || []); setAgents(d.agents || []); setDefaultCwd(d.defaultCwd || ""); setBoard(!!d.board); setSketch(!!d.sketch); setInventory(!!d.inventory); cwdRef.current = d.defaultCwd || ""; setVoiceAvail(!!d.voice); setVoices(d.voices || []); if (!localStorage.getItem("ct-voice-name") && d.defaultVoice) setTtsVoiceState(d.defaultVoice); if (d.guest) { setGuest(true); const saved = localStorage.getItem("ct-app-model") || ""; if (d.models?.[0] && (!saved || /fable/i.test(saved) || !(d.models as Model[]).concat(d.moreModels || []).some((m) => m.id === saved))) setDefaultModel(d.models[0].id); }
       else if (!localStorage.getItem("ct-app-model") && d.models?.[0]) setDefaultModel(d.models[0].id);
       // "?voice=1" opens straight into voice mode. The terminal's tab bar links here so a
       // voice session is one tap from the terminal rather than open-app-then-find-the-mic.
@@ -1740,6 +1786,7 @@ function App() {
   // second pull picks it up without waiting a whole interval.
   useEffect(() => {
     const pull = () => api.usage().then((d) => {
+      setCodexSubscription(d?.codex?.available ? d.codex : null);
       setUsage5h(d?.available ? { output5h: d.output5h, url: d.url } : null);
       const s = d?.subscription?.available ? d.subscription : null;
       setSubscription(s);
@@ -2143,6 +2190,7 @@ function App() {
     setEditing(null); setEditError(null); // a stale edit target from another conversation must not carry over
     const switching = activeIdRef.current !== id; // a real switch (not a same-conv reconnect/reload)
     const s = manager.ensure(id);
+    if (!s.model) s.model = convsRef.current.find((c) => c.sessionId === id)?.model || null;
     setActiveStore(s); activeStoreRef.current = s;
     activeIdRef.current = id;
     if (switching) setInput(loadDraft(id)); // swap the composer to this conversation's saved draft
@@ -2173,8 +2221,12 @@ function App() {
     if (!navigator.onLine) { if (!s.items.length) s.showItems([{ kind: "assistant", text: "_This conversation isn't cached for offline viewing._" }]); return; }
     setLoadingConv(true);
     try {
-      const useDelta = s.evCount > 0 && !s.evDirty;
+      // A cursor with no messages behind it (cache lost its items) would fold an empty delta onto nothing
+      // and leave the chat blank on every open, so it needs the full fetch.
+      const useDelta = s.evCount > 0 && !s.evDirty && s.items.length > 0;
       const d = await api.conversation(id, useDelta ? s.evCount : 0);
+      if (d.model) s.model = d.model;
+      else for (const e of (d.events || []) as AppEvent[]) if (e.t === "init" || e.t === "model") s.model = e.model;
       if (activeStoreRef.current !== s) return; // user switched away while we fetched
       // Delta path: the server only sent what we were missing, so fold it instead of rebuilding. Skips
       // reconcile entirely, which is safe because appending can't discard local state the way a full
@@ -2186,7 +2238,7 @@ function App() {
         if (d.live) s.connect(true);
         return;
       }
-      const serverItems: Item[] = (d.events || []).reduce((acc: Item[], e: AppEvent) => applyEvent(acc, e), [] as Item[]);
+      const serverItems: Item[] = foldEvents(d.events || [], [], s.model);
       // A live conversation blocked on an ask_user: the transcript's ask id can't unblock the tool, so
       // swap any unanswered asks for the server's real pending asks.
       if (d.live && Array.isArray(d.pendingAsks) && d.pendingAsks.length) {
@@ -2309,7 +2361,7 @@ function App() {
   // voice bridge identity never churns.
   const submitText = useCallback(async (text: string, opts?: { voice?: boolean }): Promise<string | null> => {
     if (!text.trim()) return null;
-    text = withUltra(text, ultraRef.current); // ultrathink / ultracode ride along as the prompt keyword
+    text = withUltra(text, providerOf(activeStoreRef.current?.model || modelRef.current) === "codex" ? "" : ultraRef.current); // ultrathink / ultracode ride along as the prompt keyword
     stickBottom.current = true; setAtBottom(true); // sending re-anchors to the bottom so you see your turn + the reply
     // Ensure there's a store to send into (a brand-new chat gets a temp store, promoted to its real id
     // when the server assigns one). addOptimisticUser renders the turn + flips busy immediately.
@@ -2367,7 +2419,7 @@ function App() {
     if (editing) {
       const ed = editing;
       setEditing(null); setEditError(null);
-      const err = await doEdit(ed, withUltra(raw, ultraRef.current));
+      const err = await doEdit(ed, withUltra(raw, provider === "codex" ? "" : ultraRef.current));
       // Failed edits stay edits: restore the composer and the banner so it can be retried or cancelled.
       // Falling through to submitText() here is what used to append the edit as a duplicate turn.
       if (err) { setEditing(ed); setEditError(err); setInput(raw); requestAnimationFrame(() => taRef.current?.focus()); }
@@ -2533,11 +2585,22 @@ function App() {
   const onPickModel = async (m: string) => {
     const s = activeStoreRef.current;
     if (s && !s.id.startsWith("new-") && !s.id.startsWith("pending-")) {
-      s.model = m; s.signal(); // this conversation only; the server's model event confirms it for every device
-      if (s.connected) { try { await api.setModel({ id: s.id, model: m }); } catch { /* not live: the next send resumes with s.model */ } }
+      if (pickingModel) return;
+      setPickingModel(true); setModelError("");
+      try {
+        const r = await withTimeout(api.setModel({ id: s.id, model: m }), 30000);
+        if (!r?.ok) throw new Error(r?.error || "Could not change model");
+        if (r.id && r.id !== s.id) {
+          manager.ensure(r.id).model = r.model || m;
+          refreshConvs();
+          await loadConv(r.id);
+          setMenuOpen("");
+        } else { s.model = r.model || m; s.signal(); }
+      } catch (e) { setModelError(e instanceof Error ? e.message : "Could not change model"); }
+      finally { setPickingModel(false); }
       return;
     }
-    setDefaultModel(m); localStorage.setItem("ct-app-model", m); // new-chat page: the default for future chats
+    setModelError(""); setDefaultModel(m); localStorage.setItem("ct-app-model", m); // new-chat page: the default for future chats
   };
 
   // Effort follows the same rule as the model: a live chat gets it applied to that chat, the new-chat
@@ -2628,6 +2691,26 @@ function App() {
       catch (e: any) { if (preview) URL.revokeObjectURL(preview); setUploadError(String(e?.message || e)); }
     }
   };
+  // The Sketchpad (sketch.tsx) saves a drawing on the server, then hands its path here to attach.
+  useEffect(() => {
+    const on = (e: Event) => {
+      const d = (e as CustomEvent).detail;
+      if (d?.path) setAttachments((a) => (a.some((x) => x.path === d.path) ? a : [...a, { name: String(d.name || "sketch.png"), path: String(d.path), isImage: true, preview: d.preview }]));
+    };
+    window.addEventListener("ct-attach", on);
+    return () => window.removeEventListener("ct-attach", on);
+  }, []);
+  // The Parts Inventory (inventory.tsx) "Ask Claude" button puts its question in the composer.
+  useEffect(() => {
+    const on = (e: Event) => {
+      const t = String((e as CustomEvent).detail?.text || "");
+      if (!t) return;
+      setInput(t);
+      requestAnimationFrame(() => { const ta = taRef.current; if (ta) { ta.focus(); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 220) + "px"; } });
+    };
+    window.addEventListener("ct-ask", on);
+    return () => window.removeEventListener("ct-ask", on);
+  }, []);
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []); e.target.value = ""; if (!files.length) return;
     await addFiles(files);
@@ -2690,34 +2773,42 @@ function App() {
   const configEffort = !!modelRow && !modelRow.resolvedModel && !modelRow.supportsEffort && /-5(-|$)/.test(modelRow.id);
   // No row at all (the model list has not loaded, or the chat names a model the list lacks) offers the
   // full set rather than hiding the control; the CLI ignores a level a model does not take.
-  const effortLevels = modelRow?.supportedEffortLevels || (!modelRow || modelRow.supportsEffort || configEffort ? ALL_EFFORT : []);
+  const effortLevels = modelRow?.supportedEffortLevels || (provider === "codex" ? [] : !modelRow || modelRow.supportsEffort || configEffort ? ALL_EFFORT : []);
   // Effort in force here: this conversation's own if it has one, else the remembered new-chat default.
-  const activeEffort = (activeStore && !activeStore.id.startsWith("new-") ? activeStore.settings.effortLevel : defaultEffort) || "";
+  const chosenEffort = (activeStore && !activeStore.id.startsWith("new-") ? activeStore.settings.effortLevel : defaultEffort) || "";
+  const activeEffort = effortLevels.includes(chosenEffort as EffortLevel) ? chosenEffort : "";
   // Same rule for the advisor model.
   const activeAdvisor = (activeStore && !activeStore.id.startsWith("new-") ? activeStore.settings.advisorModel : defaultAdvisor) || "";
   // Everything the advisor can be pointed at. "default" is an alias for whatever the CLI would pick
   // anyway, which is not a meaningful advisor choice, so it is dropped in favour of the explicit
   // "Settings default" option.
   const advisorChoices = useMemo(
-    () => [...models, ...moreModels].filter((m) => m.id !== "default"),
+    () => [...models, ...moreModels].filter((m) => m.id !== "default" && providerOf(m.id, m) === "claude"),
     [models, moreModels],
   );
-  // Picker rows are named for the model they run ("Opus 5.5"), since the CLI's aliases ("Opus",
-  // "Default") do not say which version answers. A versioned row from config.json that is older than
-  // its family's alias row ("Opus 5" next to an alias resolving to Opus 5.5) moves under Older
-  // versions with moreModels; a config row newer than the alias stays on top.
+  // Compare every offered version, including concrete IDs without resolvedModel.
+  // Keep the latest version of each provider’s model families up front; retain older selections below.
   const pickerRows = useMemo(() => {
     const bare = (v?: string) => String(v || "").replace(/^claude-/, "").replace(/\[[^\]]*\]$/, "").replace(/-\d{8}$/, "");
-    const fam = (m: Model) => (bare(m.resolvedModel || m.id).match(/^(fable|opus|sonnet|haiku)\b/) || [])[1] || "";
-    const ver = (id?: string) => { const v = bare(id).match(/-(\d+(?:-\d+)?)$/); return v ? parseFloat(v[1].replace("-", ".")) : 0; };
-    const rank = (m: Model) => { if (m.id === "default") return -1; const i = ["fable", "opus", "sonnet", "haiku"].indexOf(fam(m)); return i < 0 ? 9 : i; };
-    const latest: Record<string, number> = {};
-    for (const m of models) if (m.resolvedModel) latest[fam(m)] = Math.max(latest[fam(m)] || 0, ver(m.resolvedModel));
-    const isOlder = (m: Model) => !m.resolvedModel && !!latest[fam(m)] && ver(m.id) < latest[fam(m)];
-    // The "sonnet" alias and "default" often resolve to the same model; both stay, since Default
-    // follows settings.json and Sonnet pins it.
-    const primary = models.filter((m) => !isOlder(m)).sort((x, y) => rank(x) - rank(y));
-    return { primary, older: [...models.filter(isOlder), ...moreModels] };
+    const fam = (m: Model) => providerOf(m.id, m) === "claude"
+      ? bare(m.resolvedModel || m.id).match(/^(fable|opus|sonnet|haiku)\b/)?.[1] || ""
+      : bare(m.resolvedModel || m.id).match(/^gpt-\d+(?:\.\d+)*-(astra|sol|terra|luna)$/)?.[1] || "";
+    const version = (m: Model) => providerOf(m.id, m) === "codex"
+      ? (bare(m.resolvedModel || m.id).match(/^gpt-(\d+(?:\.\d+)*)-/)?.[1] || "").replaceAll(".", "-")
+      : bare(m.resolvedModel || m.id).match(/-(\d+(?:-\d+)*)$/)?.[1] || "";
+    const compareVersion = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true });
+    const rank = (m: Model) => { const families = providerOf(m.id, m) === "codex" ? ["astra", "sol", "terra", "luna"] : ["fable", "opus", "sonnet", "haiku"]; const i = families.indexOf(fam(m)); return i < 0 ? 9 : i; };
+    const all = [...new Map([...models, ...moreModels].map((m) => [m.id, m])).values()];
+    const latest: Record<string, string> = {};
+    for (const m of all) if (m.id !== "default" && fam(m) && compareVersion(version(m), latest[fam(m)] || "") > 0) latest[fam(m)] = version(m);
+    const isOlder = (m: Model) => !!fam(m) && !!version(m) && compareVersion(version(m), latest[fam(m)] || "") < 0;
+    const current = (m: Model) => fam(m) ? !isOlder(m) : models.some((row) => row.id === m.id);
+    const sort = (a: Model, b: Model) => providerOf(a.id, a).localeCompare(providerOf(b.id, b)) || rank(a) - rank(b) || compareVersion(version(b), version(a));
+    return {
+      primary: all.filter((m) => m.id !== "default" && current(m)).sort(sort),
+      automatic: all.filter((m) => m.id === "default"),
+      older: all.filter((m) => m.id !== "default" && !current(m)).sort(sort),
+    };
   }, [models, moreModels]);
   const pickerName = (m: Model) => (m.id === "default" ? "Default" : m.resolvedModel ? prettyModel(m.resolvedModel) : /^claude-/.test(m.id) ? prettyModel(m.id) : m.label);
   const pickerBlurb = (m: Model) => {
@@ -2728,7 +2819,7 @@ function App() {
   const renderModelRow = (m: Model) => {
     const on = m.id === model;
     return (
-      <button key={m.id} className={"pk-row" + (on ? " on" : "")} onClick={() => void onPickModel(m.id)} aria-pressed={on}>
+      <button key={m.id} className={"pk-row" + (on ? " on" : "")} onClick={() => void onPickModel(m.id)} disabled={pickingModel} aria-pressed={on}>
         <span className="pk-row-main">
           <span className="pk-name">{pickerName(m)}</span>
           <span className="pk-blurb">{pickerBlurb(m)}</span>
@@ -2743,9 +2834,10 @@ function App() {
   // qualifier so the pill stays short and single-line. The dropdown keeps the full name.
   const modelBtnName = modelRow?.resolvedModel ? prettyModel(modelRow.resolvedModel) : (modelLabel.replace(/\s*\([^)]*\)\s*$/, "").trim() || modelLabel);
   // A keyword typed by hand lights the box the same way the picker does. Ultracode wins if both appear.
-  const typedUltra: UltraMode = /\bultracode\b/i.test(input) ? "ultracode" : /\bultrathink\b/i.test(input) ? "ultrathink" : "";
-  const ringMode = ultra || typedUltra;
-  const effortBtnLabel = ultra ? ultraName(ultra) : effortLevels.length === 0 ? "Effort" : activeEffort ? effortName(activeEffort) : "Auto";
+  const typedUltra: UltraMode = provider === "codex" ? "" : /\bultracode\b/i.test(input) ? "ultracode" : /\bultrathink\b/i.test(input) ? "ultrathink" : "";
+  const activeUltra = provider === "codex" ? "" : ultra;
+  const ringMode = activeUltra || typedUltra;
+  const effortBtnLabel = activeUltra ? ultraName(activeUltra) : effortLevels.length === 0 ? "Effort" : activeEffort ? effortName(activeEffort) : "Auto";
   const modelBtnLabel = effortLevels.length > 0 ? `${modelBtnName} · ${effortBtnLabel}` : modelBtnName; // the desktop taskbar still shows both
   const ftcGuest = guest && /^ftc\./.test(location.hostname); // the two FTC team logins share one cap per team
 
@@ -2833,10 +2925,10 @@ function App() {
           i = j - 1; continue;
         }
       }
-      nodes.push(<MessageBlock key={i} items={items} i={i} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={openArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
+      nodes.push(<MessageBlock key={i} assistantName={assistantName} items={items} i={i} busy={busy} onAnswer={answerAsk} convId={activeId} onMenu={onMsgMenu} onOpenArtifact={openArtifact} sendStatus={i === lastUserIdx ? sendState : null} reading={reading?.i === i ? reading.phase : undefined} />);
     }
     return nodes;
-  }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, openArtifact]);
+  }, [items, visible, busy, activeId, sendState, reading, answerAsk, onMsgMenu, openArtifact, assistantName]);
 
   const ui = (
     <div className={"app" + (drawer ? " drawer-open" : "") + (sbHidden ? " sb-hidden" : "")} onTouchStart={onAppTouchStart} onTouchMove={onAppTouchMove} onTouchEnd={onAppTouchEnd}>
@@ -2847,7 +2939,7 @@ function App() {
           <button className="ut-dismiss" onClick={() => setUpdateAvail(false)} aria-label="Dismiss">×</button>
         </div>
       )}
-      {limitToast && (
+      {limitToast && provider === "claude" && (
         <div className="limit-toast" role="status">
           <svg className="lt-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /></svg>
           <span>
@@ -2986,7 +3078,7 @@ function App() {
       <ConnectionsModal open={connOpen} onClose={() => setConnOpen(false)} activeId={activeId} />
       <aside className="sidebar">
         <div className="sb-head">
-          <span className="brand"><Clawd size={1.1} danceKey={finishedKey} /> Claude</span>
+          <span className="brand">{provider === "codex" ? <CodexMark /> : <Clawd size={1.1} danceKey={finishedKey} />} {assistantName}</span>
           {/* One tap cycles retro, dark, light; the icon shows the theme it switches to. Settings still offers "System". */}
           {(() => {
             const next = ({ retro: "dark", dark: "light", light: "retro" } as const)[resolvedTheme(theme)];
@@ -3093,6 +3185,8 @@ function App() {
           )}
         </div>
         {board && !desktopMode && <BoardStrip />}
+        {sketch && !desktopMode && <SketchStrip />}
+        {inventory && !desktopMode && <InventoryStrip />}
         {loadingConv && <div className="load-bar" aria-label="Loading conversation" />}
 
         {/* "/" is not served from the service worker cache (unlike /app), so it reaches Access, which
@@ -3113,9 +3207,9 @@ function App() {
         <div className="scroll" ref={scrollRef} onScroll={onThreadScroll}>
           {items.length === 0 ? (
             <div className="empty">
-              <div className="ct-hero"><Clawd size={5} danceKey={finishedKey} /></div>
+              <div className="ct-hero">{provider === "codex" ? <CodexMark large /> : <Clawd size={5} danceKey={finishedKey} />}</div>
               <h2>{greeting()}. What are we making?</h2>
-              <div>Ask anything. This drives Claude Code in {cwdRef.current || "your project"}.</div>
+              <div>Ask anything. This drives {provider === "codex" ? "Codex" : "Claude Code"} in {cwdRef.current || "your project"}.</div>
             </div>
           ) : (
             <div className="thread">
@@ -3157,7 +3251,12 @@ function App() {
                     <div className="pk-grab" aria-hidden="true" />
                     <div className="pk-sec">
                       <div className="pk-label">Model</div>
-                      {pickerRows.primary.map(renderModelRow)}
+                      {["claude", "codex"].map((p) => {
+                        const rows = pickerRows.primary.filter((m) => providerOf(m.id, m) === p);
+                        return rows.length ? <React.Fragment key={p}><div className="pk-provider">{p === "codex" ? "OpenAI · Codex" : "Anthropic · Claude"}</div><div className="pk-blurb" style={{ padding: "0 10px 6px" }}>{p === "codex" ? "Astra → Sol → Terra → Luna" : "Fable → Opus → Sonnet → Haiku"}</div>{rows.map(renderModelRow)}</React.Fragment> : null;
+                      })}
+                      {pickerRows.automatic.length > 0 && <><div className="pk-provider">Automatic</div>{pickerRows.automatic.map(renderModelRow)}</>}
+                      {modelError && <div className="pk-error" role="alert">{modelError}</div>}
                       {/* Older versions stay in the same panel, collapsed, so every model this box
                           offers is reachable without leaving the one control. */}
                       {pickerRows.older.length > 0 && (
@@ -3166,13 +3265,16 @@ function App() {
                             <span>Older versions</span>
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" className={showOlder ? "flip" : ""}><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
                           </button>
-                          {showOlder && pickerRows.older.map(renderModelRow)}
+                          {showOlder && ["claude", "codex"].map((p) => {
+                            const rows = pickerRows.older.filter((m) => providerOf(m.id, m) === p);
+                            return rows.length ? <React.Fragment key={p}><div className="pk-provider">{p === "codex" ? "OpenAI · Codex" : "Anthropic · Claude"}</div>{rows.map(renderModelRow)}</React.Fragment> : null;
+                          })}
                         </>
                       )}
                     </div>
                     {/* The model the advisor tool consults. Blank defers to advisorModel in
                         ~/.claude/settings.json, which is what a chat uses when nothing is chosen here. */}
-                    {advisorChoices.length > 0 && (
+                    {provider === "claude" && advisorChoices.length > 0 && (
                       <div className="pk-sec pk-inline">
                         <label className="pk-label" htmlFor="pk-advisor">Advisor</label>
                         <select id="pk-advisor" className="pk-select" value={activeAdvisor} onChange={(e) => void onPickAdvisor(e.target.value)}>
@@ -3184,12 +3286,12 @@ function App() {
                   </div>
                 )}
               </div>
-              {(
+              {(provider === "claude" || effortLevels.length > 0) && (
                 <div className="model-picker up">
-                  <button className={"model-btn effort-btn" + (ultra ? " ultra-btn ultra-" + ultra.slice(5) : "")} onClick={() => setMenuOpen((o) => (o === "effort" ? "" : "effort"))} title="Reasoning effort">
+                  <button className={"model-btn effort-btn" + (activeUltra ? " ultra-btn ultra-" + ultra.slice(5) : "")} onClick={() => setMenuOpen((o) => (o === "effort" ? "" : "effort"))} title="Reasoning effort">
                     <span>{effortBtnLabel}</span>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                    {ultra && ultraBurst > 0 && <span key={ultraBurst} className="ultra-burst" aria-hidden="true">{Array.from({ length: 10 }, (_, k) => <i key={k} style={{ "--a": `${k * 36}deg` } as any} />)}</span>}
+                    {activeUltra && ultraBurst > 0 && <span key={ultraBurst} className="ultra-burst" aria-hidden="true">{Array.from({ length: 10 }, (_, k) => <i key={k} style={{ "--a": `${k * 36}deg` } as any} />)}</span>}
                   </button>
                   {menuOpen === "effort" && <div className="picker-scrim" onClick={() => setMenuOpen("")} />}
                   {menuOpen === "effort" && (
@@ -3213,7 +3315,7 @@ function App() {
                       </div>
                       )}
                       {/* The keyword modes. Each stays on for every message until tapped off. */}
-                      <div className="pk-sec">
+                      {provider === "claude" && <div className="pk-sec">
                         <div className="pk-label">Go further</div>
                         <div className="pk-ultra">
                           {((guest ? ["ultrathink", "ultracode"] : ["ultrathink", "ultracode", "ultraresearch"]) as UltraMode[]).map((m) => (
@@ -3223,7 +3325,7 @@ function App() {
                             </button>
                           ))}
                         </div>
-                      </div>
+                      </div>}
                     </div>
                   )}
                 </div>
@@ -3252,7 +3354,7 @@ function App() {
                 same font and wrapping, draws the coloured copy. The caret stays on the real textarea. */}
             <div className="ta-wrap">
             {typedUltra && <div className="ta-mirror" ref={mirrorRef} aria-hidden="true">{ultraSpans(input)}{"\n"}</div>}
-            <textarea ref={taRef} className={typedUltra ? "ta-hl" : undefined} onScroll={(e) => { if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop; }} value={input} onChange={onInput} onKeyDown={onKey} onPaste={onPaste} rows={1} placeholder={pendingAsk ? "Answer the question above…" : ultra === "ultrathink" ? "Ultrathink is on. Ask something hard…" : ultra === "ultracode" ? "Ultracode is on. Describe the whole job…" : ultra === "ultraresearch" ? "Ultraresearch is on. State the research question…" : "Reply to Claude..."} />
+            <textarea ref={taRef} className={typedUltra ? "ta-hl" : undefined} onScroll={(e) => { if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop; }} value={input} onChange={onInput} onKeyDown={onKey} onPaste={onPaste} rows={1} placeholder={pendingAsk ? "Answer the question above…" : activeUltra === "ultrathink" ? "Ultrathink is on. Ask something hard…" : activeUltra === "ultracode" ? "Ultracode is on. Describe the whole job…" : activeUltra === "ultraresearch" ? "Ultraresearch is on. State the research question…" : `Reply to ${assistantName}...`} />
             </div>
             <div className="composer-actions">
               {/* Photo/gallery picker: accept=image/* makes Android/iOS open the photo library (with a
@@ -3275,6 +3377,11 @@ function App() {
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round"><path d="M14 4L10 20" /></svg>
                 </button>
               )}
+              {activeId && (
+                <button className="act-btn" onClick={doFork} title="Fork: copy this chat, with its full context, into a new chat">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><circle cx="6" cy="5" r="2" /><circle cx="18" cy="5" r="2" /><circle cx="12" cy="19" r="2" /><path d="M6 7v2a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V7M12 12v5" /></svg>
+                </button>
+              )}
               <div className="spacer" />
               {dictation.available && (
                 <button
@@ -3289,7 +3396,7 @@ function App() {
                 </button>
               )}
               {voiceAvail && (
-                <button className="act-btn voice-open-btn" onClick={() => setVoiceOpen(true)} title="Voice mode — hands-free spoken conversation, Claude talks back">
+                <button className="act-btn voice-open-btn" onClick={() => setVoiceOpen(true)} title={`Voice mode: hands-free spoken conversation, ${assistantName} talks back`}>
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M4 13v-1a8 8 0 0 1 16 0v1" /><path d="M4 13h2.5a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" /><path d="M20 13h-2.5a1 1 0 0 0-1 1v3a1 1 0 0 0 1 1H19a1 1 0 0 0 1-1z" /><path d="M18 18v1a2 2 0 0 1-2 2h-3" /></svg>
                 </button>
               )}
@@ -3311,14 +3418,14 @@ function App() {
                 {fmtTokens(context.total)}
               </button>
             )}
-            {usage5h && (
+            {provider === "claude" && usage5h && (
               <a className="usage-chip" href={usage5h.url} target="_blank" rel="noreferrer" title="Output tokens in the last 5 hours — open the usage dashboard">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18" /><path d="M7 14l4-4 3 3 5-6" /></svg>
                 <span>{fmtTokens(usage5h.output5h)}</span>
               </a>
             )}
             </div>
-            <LimitRing sub={subscription} url={usage5h?.url} />
+            <LimitRing sub={provider === "codex" ? codexSubscription : subscription} url={usage5h?.url || "/usage/"} providerName={assistantName} />
           </div>
           </div>
         </div>
@@ -3397,26 +3504,33 @@ function App() {
       <VoiceMode bridge={voiceBridge} open={voiceOpen} onClose={() => setVoiceOpen(false)} pendingAsk={pendingAsk} onAnswer={answerAsk} speakFinalOnly={speakFinalOnly} ttsVoice={ttsVoice || undefined} tapToTalk={tapToTalk} />
     </div>
   );
-  if (!desktopMode) return ui;
+  if (!desktopMode) return <MascotProvider.Provider value={provider}>{ui}</MascotProvider.Provider>;
+  const chatProvider = (id: string) => {
+    const c = convs.find((c) => c.sessionId === id);
+    return c?.provider || providerOf(c?.model);
+  };
   const titleOf = (id: string) => convs.find((c) => c.sessionId === id)?.title || "Conversation";
   return (
-    <Desktop
+    <MascotProvider.Provider value={provider}><Desktop
       chat={ui}
+      provider={provider}
       chatTitle={activeId ? titleOf(activeId) : "New chat"}
       chatBusySince={busy ? turnSince : null}
       chatWaiting={!!activeId && !!statuses[activeId]?.waiting}
-      otherBusy={Object.entries(statuses).filter(([id, st]) => st.busy && id !== activeId).map(([id, st]) => ({ id, title: titleOf(id), since: st.since }))}
+      otherBusy={Object.entries(statuses).filter(([id, st]) => st.busy && id !== activeId).map(([id, st]) => ({ id, provider: chatProvider(id), title: titleOf(id), since: st.since }))}
       modelLabel={modelBtnLabel}
       onModelClick={() => setMenuOpen("model")}
       onOpenChat={(id) => void loadConv(id)}
-      chats={convs.slice(0, 12).map((c) => ({ id: c.sessionId, title: titleOf(c.sessionId), busy: !!statuses[c.sessionId]?.busy, waiting: !!statuses[c.sessionId]?.waiting }))}
+      chats={convs.slice(0, 12).map((c) => ({ id: c.sessionId, provider: chatProvider(c.sessionId), title: titleOf(c.sessionId), busy: !!statuses[c.sessionId]?.busy, waiting: !!statuses[c.sessionId]?.waiting }))}
       onNewChat={newChat}
       finishedKey={finishedKey}
       openTerminalId={termArg}
       onTheme={(t) => setTheme(t)}
       guest={guest}
       board={board}
-    />
+      sketch={sketch}
+      inventory={inventory}
+    /></MascotProvider.Provider>
   );
 }
 
@@ -3428,11 +3542,22 @@ function App() {
 //
 // Pinch-zoom also shrinks the visual viewport, so a zoomed-in reader would otherwise see the layout
 // collapse under them: while scale > 1 the last unzoomed height is kept.
+//
+// iOS can also leave visualViewport.height at the keyboard-reduced value after the PWA is
+// backgrounded and reopened, with no resize event to correct it, so the app came back squeezed
+// above an empty "ghost keyboard" band. The keyboard needs a focused text field, so with none
+// focused the full window height is used, and the height is re-measured on resume.
+function editableFocused(): boolean {
+  const el = document.activeElement as HTMLElement | null;
+  if (!el) return false;
+  if (el.isContentEditable || el.tagName === "TEXTAREA") return true;
+  return el.tagName === "INPUT" && !/^(button|checkbox|radio|range|file|submit|reset|color|image)$/.test((el as HTMLInputElement).type);
+}
 function trackViewportHeight(): void {
   const vv = window.visualViewport;
   const apply = () => {
     if (vv && vv.scale > 1.01) return; // pinch-zoomed: leave the layout at its unzoomed size
-    const h = Math.round(vv ? vv.height : window.innerHeight);
+    const h = Math.round(vv && editableFocused() ? vv.height : window.innerHeight);
     document.documentElement.style.setProperty("--app-h", `${h}px`);
     // Nothing on the page is meant to scroll (body is position:fixed), so a non-zero scroll is iOS
     // having pushed the document up to reveal the focused input. With the app already sized to fit,
@@ -3443,6 +3568,12 @@ function trackViewportHeight(): void {
   if (vv) { vv.addEventListener("resize", apply); vv.addEventListener("scroll", apply); }
   window.addEventListener("orientationchange", () => setTimeout(apply, 250));
   window.addEventListener("resize", apply);
+  // iOS settles its viewport numbers a moment after these fire, so measure again shortly after.
+  const settle = () => { apply(); setTimeout(apply, 300); };
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) settle(); });
+  window.addEventListener("pageshow", settle);
+  window.addEventListener("focus", settle);
+  document.addEventListener("focusout", () => setTimeout(apply, 100));
 }
 trackViewportHeight();
 

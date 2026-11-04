@@ -95,7 +95,8 @@
         "gearcats",
         "cougears",
         "in-training",
-        "rtr"
+        "rtr",
+        "kaleb"
       ]
     }
   },
@@ -123,6 +124,9 @@
     ],
     "rtr": [
       "/var/lib/claude-terminal/guests/rtr/projects"
+    ],
+    "kaleb": [
+      "/var/lib/claude-terminal/guests/kaleb/projects"
     ]
   }
 }

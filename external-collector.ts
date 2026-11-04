@@ -40,7 +40,7 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
   const delHours = db.prepare("DELETE FROM external_hourly WHERE peer = ?");
   const delMeta = db.prepare("DELETE FROM external_meta WHERE peer = ?");
   const delModels = db.prepare("DELETE FROM external_model_usage WHERE peer = ?");
-  const insModels = db.prepare("INSERT OR REPLACE INTO external_model_usage (peer, user, mk, model, output) VALUES (?, ?, ?, ?, ?)");
+  const insModels = db.prepare("INSERT OR REPLACE INTO external_model_usage (peer, user, mk, model, output, input, cache_read, cache_creation, cache_creation_5m, cache_creation_1h, total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
   const insCum = db.prepare(
     `INSERT INTO external_cum (peer, user, name, input, output, cache_creation, cache_read, total)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -125,12 +125,7 @@ export async function sampleExternalPeers(configPath: string): Promise<void> {
           // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
           for (const mm of Array.isArray(u.models) ? u.models : []) {
             if (!mm?.mk || !mm?.model) continue;
-            insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output));
-          }
-          // Per-model output, when the peer's export carries it (older peers omit it -> raw fallback).
-          for (const mm of Array.isArray(u.models) ? u.models : []) {
-            if (!mm?.mk || !mm?.model) continue;
-            insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output));
+            insModels.run(peerName, user, String(mm.mk), String(mm.model), num(mm.output), num(mm.input), num(mm.cache_read), num(mm.cache_creation), num(mm.cache_creation_5m), num(mm.cache_creation_1h), num(mm.total));
           }
         }
       });

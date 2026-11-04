@@ -28,6 +28,7 @@ try:
         reply=t or reply
       except Exception: pass
 except Exception: pass
+import re; reply=re.sub(r"<title>[\s\S]*?</title>", "", reply)  # the hidden chat-title line the model opens with
 reply=" ".join(reply.split())[:200]
 print(json.dumps({"id":sid,"kind":"done","app":True,"chat":chat,"reply":reply}))' "$CLAUDE_CODE_SESSION_ID" 2>/dev/null) || exit 0
   curl -fsS -m 5 -X POST "http://127.0.0.1:$PORT/notify/session" \

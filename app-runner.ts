@@ -8,12 +8,16 @@
 // no ANTHROPIC_API_KEY needed. Verified live 2026-08-26.
 
 import { query, createSdkMcpServer, tool, type SDKMessage, type SDKUserMessage, type Query, type McpServerConfig, type McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
-import { mkdirSync, readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, existsSync, writeFileSync, realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { armResume, cancelResume } from "./subscription-resume.ts";
 import { mcpServersForQuery } from "./app-mcp.ts";
+import { CodexConversation, getOrCreateCodex, getCodex, codexLiveStatuses, isCodexModel } from "./codex-runner";
+import { readHandoff, deleteHandoff, readLaunchContext, saveLaunchContext } from "./provider-handoff";
+import { sharedMcpConfig, sharedInstructions } from "./shared-mcp";
 
 // Turn logging, paired with the "[turn] accept" lines app-server writes. An accept with no matching
 // done/error/closed is a turn the runner swallowed; a done with the user still seeing nothing points at
@@ -304,8 +308,8 @@ const TITLE_DIRECTIVE = "<title-request>Before anything else in your reply, outp
 // Sourced from a throwaway streaming query whose supportedModels() is a control request — it spends
 // no tokens and runs no turn. Stale-while-revalidate cached (the probe spawns a CLI subprocess, ~1-2s,
 // so we never do it per request); falls back to the caller's config list when the probe fails.
-export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
-export type AppModel = { id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean; supportedEffortLevels?: EffortLevel[] };
+export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type AppModel = { provider?: "claude" | "codex"; id: string; label: string; description?: string; resolvedModel?: string; supportsEffort?: boolean; supportedEffortLevels?: EffortLevel[] };
 // A slash command the CLI accepts. Sent as ordinary prompt text — the CLI intercepts a leading
 // "/name" and runs the command instead of a turn, which is how the chat palette executes them.
 export type AppCommand = { name: string; description?: string; argumentHint?: string; aliases?: string[] };
@@ -438,6 +442,10 @@ function textOfContent(content: unknown): string {
 export type AskNotifier = (info: { sessionId: string; question: string; multiSelect?: boolean; allowText?: boolean }) => void;
 
 export interface ConvOpts {
+  handoffContext?: string;
+  sharedTools?: { url: string; owner: string; vault: string };
+  agentDepth?: number;
+  parentSession?: string;
   cwd: string;
   model?: string;
   resume?: string; // existing session id to reattach to
@@ -465,7 +473,17 @@ export type PendingAsk = { askId: string; question: string; options: { label: st
 // Send, emailAnswerText() writes the edited fields to EMAIL_APPROVALS, and the email-gate PreToolUse
 // hook in ~/.claude/hooks lets one matching Gmail send through without its "ask" prompt, which the
 // /app chat cannot answer. canonEmail() must stay identical to canon() in that hook.
-export type EmailDraft = { from?: string; fromOptions?: string[]; signatures?: Record<string, string>; to: string; cc?: string; bcc?: string; subject: string; body: string };
+export type EmailAttachment = { path: string; name: string; size: number; sha256: string };
+export type EmailDraft = { from?: string; fromOptions?: string[]; signatures?: Record<string, string>; to: string; cc?: string; bcc?: string; subject: string; body: string; attachments?: EmailAttachment[] };
+// Pins each attachment to its resolved path and content hash, so the approval does not cover a file swapped in later.
+function resolveAttachments(paths: string[]): EmailAttachment[] {
+  return paths.map((p) => {
+    const real = realpathSync(p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+    const st = statSync(real);
+    if (!st.isFile()) throw new Error(`${p} is not a file`);
+    return { path: real, name: real.split("/").pop() || real, size: st.size, sha256: createHash("sha256").update(readFileSync(real)).digest("hex") };
+  });
+}
 // Per-account signatures the card appends below the body, keyed by address. Edit the file to change them.
 const EMAIL_SIGNATURES = join(homedir(), ".config", "ct-email", "signatures.json");
 function emailSignatures(): Record<string, string> {
@@ -497,6 +515,7 @@ const EMAIL_APPROVALS = join(homedir(), ".local", "state", "email-approvals");
 const canonAddrs = (v?: string) => (v || "").split(",").map((a) => a.trim().toLowerCase()).filter(Boolean).sort().join(",");
 function canonEmail(d: Partial<EmailDraft>) {
   return {
+    attachments: (d.attachments || []).map((a) => `${a.path}\t${a.sha256}`).sort().join("\n"),
     from: (d.from || "").trim().toLowerCase(),
     to: canonAddrs(d.to), cc: canonAddrs(d.cc), bcc: canonAddrs(d.bcc),
     subject: (d.subject || "").trim(),
@@ -513,14 +532,14 @@ function emailAnswerText(answer: string, draft: EmailDraft, senders: EmailSender
   const from = String(a.from || draft.from || "").toLowerCase();
   const sender = senders.find((x) => x.email === from);
   if (!sender) return `The user pressed Send with from = ${from || "(none)"}, but no connected account can send as that address. Do not send; tell the user.`;
-  const sent: EmailDraft = { from, to: String(a.to || ""), cc: a.cc || undefined, bcc: a.bcc || undefined, subject: String(a.subject || ""), body: gmailHtml(String(a.body || "")) };
+  const sent: EmailDraft = { from, to: String(a.to || ""), cc: a.cc || undefined, bcc: a.bcc || undefined, subject: String(a.subject || ""), body: gmailHtml(String(a.body || "")), attachments: draft.attachments };
   const fromName = emailFromName();
   try {
     mkdirSync(EMAIL_APPROVALS, { recursive: true, mode: 0o700 });
     const f = join(EMAIL_APPROVALS, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
     writeFileSync(f, JSON.stringify({ ...canonEmail(sent), expires: Date.now() + 15 * 60_000 }), { mode: 0o600 });
   } catch (e) { return `The user pressed Send, but the approval could not be recorded (${e}). Do not send; tell the user.`; }
-  return `The user approved this email and pressed Send. Send it now, once, with mcp__${sender.server}__send_gmail_message, using exactly these field values unchanged, with user_google_email set to \`from\`, include_signature false, body_format html${fromName ? `, from_name "${fromName}"` : ""}:\n` + JSON.stringify(sent, null, 2);
+  return `The user approved this email and pressed Send. Send it now, once, with mcp__${sender.server}__send_gmail_message, using exactly these field values unchanged, with user_google_email set to \`from\`, include_signature false, body_format html${fromName ? `, from_name "${fromName}"` : ""}:\n` + JSON.stringify({ ...sent, attachments: sent.attachments?.length ? sent.attachments.map((x) => ({ path: x.path })) : undefined }, null, 2);
 }
 
 // What Claude Code injects as the user turn when it resumes a session whose last turn was cut off.
@@ -638,7 +657,8 @@ export class Conversation {
   private pendingModel?: string; // a model change waiting for an idle boundary to be pushed to the live query
   settings: SessionSettings = {};   // flag-layer settings for this chat (effort, advisor model, fast mode)
   private pendingSettings?: SessionSettings; // a settings change waiting for an idle boundary, same as pendingModel
-  private titleScan = false;   // true during a new chat's first turn: withhold a leading <title> from the stream
+  private titleScan = false;   // true at the start of each turn: withhold a leading <title> from the stream
+  private titleEmit = false;   // true only on a new chat's first turn: the stripped title also names the chat
   private running = false;     // the run() query loop is alive; a send while false means the subprocess died and must be re-run
   private titleBuf = "";
   // Hung-query watchdog. `running` true only means the for-await loop is parked; if the SDK
@@ -649,8 +669,13 @@ export class Conversation {
   private hungWatch?: ReturnType<typeof setTimeout>;
   private lastRecycleAt = 0;   // rate-limit the recycle so a genuinely unresumable session can't loop
 
+  private handoffContext?: string;
+  private launchOpts: ConvOpts;
+
   constructor(id: string, opts: ConvOpts) {
     this.id = id;
+    this.launchOpts = opts;
+    this.handoffContext = opts.handoffContext;
     this.cwd = opts.cwd;
     this.model = opts.model;
     this.resume = opts.resume;
@@ -783,6 +808,8 @@ export class Conversation {
     this.runStart = this.log.length; // a new turn begins here (replay boundary for late subscribers)
     this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
     this.setPhase(this.inited ? "waiting" : "starting");
+    // The model often repeats the first reply's <title> line on later turns; strip it there too.
+    this.titleScan = true; this.titleEmit = false; this.titleBuf = "";
     const msg: SDKUserMessage = { type: "user", message: { role: "user", content: text + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     // Arm the hung-query watchdog before dispatching. A dead subprocess answers neither a live waiter
     // nor the queue, and its dead inputGen is parked exactly at the waiter below, so the healthy-path
@@ -855,7 +882,14 @@ export class Conversation {
   private async applyPendingModel() {
     if (!this.pendingModel || !this.q || !this.inited || this.closed || this.busy) return;
     const m = this.pendingModel;
-    try { await this.q.setModel(m); this.pendingModel = undefined; }
+    try {
+      await this.q.setModel(m);
+      if (this.launchOpts.sharedTools) {
+        const stored = this.mcpFile ? await mcpServersForQuery(this.mcpFile) : {};
+        await this.applyMcpServers(stored);
+      }
+      this.pendingModel = undefined;
+    }
     catch (e: any) { tlog("setmodel-defer", { conv: this.id, msg: String(e?.message || e).slice(0, 80) }); }
   }
 
@@ -889,9 +923,16 @@ export class Conversation {
   // Returns which servers were added/removed and any connection errors (or null if not running).
   async applyMcpServers(stored: Record<string, McpServerConfig>) {
     if (!this.q?.setMcpServers) return null;
-    const payload = { ...stored, ...(this.askServer ? { "app-ui": this.askServer } : {}) };
+    const payload = { ...stored, ...sharedMcpConfig(this.launchOpts, this.id, "claude", this.model), ...(this.askServer ? { "app-ui": this.askServer } : {}) };
     try { return await this.q.setMcpServers(payload); }
     catch (e: any) { this.emit({ t: "error", message: "setMcpServers: " + (e?.message || e) }); return null; }
+  }
+
+  // Restart one MCP server in THIS conversation (the Connections panel's Fix button). Throws the
+  // SDK's error so the caller can show it.
+  async reconnectMcp(name: string) {
+    if (!this.q?.reconnectMcpServer) throw new Error("this chat is not running");
+    await this.q.reconnectMcpServer(name);
   }
 
   // Re-read skills from disk for this running conversation (after a skill file was created or
@@ -972,16 +1013,18 @@ export class Conversation {
             options: z.array(z.object({ label: z.string().describe("Short option label the user taps"), description: z.string().optional().describe("Optional one-line clarification") })).max(6).optional().describe("Up to 6 tappable options. Required unless allowText is true (a pure free-text prompt)."),
             multiSelect: z.boolean().optional().describe("Let the user select multiple options, then submit. The answer comes back as the chosen labels, comma-separated."),
             allowText: z.boolean().optional().describe("Show a free-text field so the user can type an answer instead of, or in addition to, tapping an option."),
-            email: z.object({ from: z.string().optional().describe("Default sending account; the user can switch to any connected Google account that can send"), to: z.string(), cc: z.string().optional(), bcc: z.string().optional(), subject: z.string(), body: z.string() }).optional().describe("Before sending ANY email, pass the draft here (options not needed; question is a one-line note above it). The user gets an editable compose card (to, cc, subject, body) with Send and Cancel. On Send the result holds the final fields; send exactly those. Leave the sign-off name and signature out of body: the card appends the chosen account's signature. This tool never sends by itself."),
+            email: z.object({ from: z.string().optional().describe("Default sending account; the user can switch to any connected Google account that can send"), to: z.string(), cc: z.string().optional(), bcc: z.string().optional(), subject: z.string(), body: z.string(), attachments: z.array(z.string()).optional().describe("Absolute paths of files to attach (the Gmail send tool only reads ~/.workspace-mcp/attachments/). The card lists them read-only; the approval covers these exact files and their contents.") }).optional().describe("Before sending ANY email, pass the draft here (options not needed; question is a one-line note above it). The user gets an editable compose card (to, cc, subject, body) with Send and Cancel. On Send the result holds the final fields; send exactly those. Leave the sign-off name and signature out of body: the card appends the chosen account's signature. This tool never sends by itself."),
           },
-          async (args: { question: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: EmailDraft }) => {
+          async (args: { question: string; options?: { label: string; description?: string }[]; multiSelect?: boolean; allowText?: boolean; email?: Omit<EmailDraft, "attachments"> & { attachments?: string[] } }) => {
             if (this.closed) return { content: [{ type: "text" as const, text: "(conversation closed)" }] };
             const options = args.options ?? [];
             if (!options.length && !args.allowText && !args.email) return { content: [{ type: "text" as const, text: "(ask_user needs at least one option, or allowText: true)" }] };
             const askId = `${this.id}-ask-${this.askCounter++}`;
-            let email = args.email;
+            let email: EmailDraft | undefined;
             let senders: EmailSender[] = [];
-            if (email) {
+            if (args.email) {
+              try { email = { ...args.email, attachments: resolveAttachments(args.email.attachments || []) }; }
+              catch (e) { return { content: [{ type: "text" as const, text: `(email attachments could not be read: ${e instanceof Error ? e.message : e}. Nothing was shown to the user.)` }] }; }
               try { senders = emailSenders(this.mcpFile ? await mcpServersForQuery(this.mcpFile) : {}); } catch {}
               const opts = senders.map((x) => x.email);
               const want = (email.from || "").toLowerCase();
@@ -1036,7 +1079,7 @@ export class Conversation {
       this.runStart = this.log.length; // first turn's replay boundary
       this.emit({ t: "user", text: first, ...(cid ? { cid } : {}) });
       this.setPhase("starting");
-      this.titleScan = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
+      this.titleScan = true; this.titleEmit = true; this.titleBuf = ""; // this is the conversation's first turn -> ask for a title
       yield { type: "user", message: { role: "user", content: first + "\n\n" + TITLE_DIRECTIVE + "\n\n" + this.turnContext() }, parent_tool_use_id: null };
     }
     while (!this.closed) {
@@ -1087,8 +1130,8 @@ export class Conversation {
         thinking: { type: "adaptive" }, // let Claude think; we render it streaming
         autoCompactEnabled: true, // compact automatically before the context window fills (default, set explicit)
         enableFileCheckpointing: true, // back up files before edits so an edit-and-rerun can roll them back (Query.rewindFiles)
-        systemPrompt: { type: "preset", preset: "claude_code", append: APP_UI_SYSTEM_APPEND }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
-        mcpServers: { ...stored, "app-ui": this.askServer }, // ask_user + any managed MCP servers
+        systemPrompt: { type: "preset", preset: "claude_code", append: APP_UI_SYSTEM_APPEND + (this.launchOpts.sharedTools ? "\n\n" + sharedInstructions("claude", this.model) : "") + (this.handoffContext ? "\n\n" + this.handoffContext : "") }, // keep Claude Code's prompt + teach it the chat UI's inline images/artifacts
+        mcpServers: { ...stored, ...sharedMcpConfig(this.launchOpts, this.id, "claude", this.model), "app-ui": this.askServer }, // ask_user + any managed MCP servers
       },
     });
     if (first === undefined && !this.inited) this.setPhase("starting"); // a resume: the subprocess is coming up before any turn is queued
@@ -1144,7 +1187,7 @@ export class Conversation {
       if (end < 0) { if (this.titleBuf.length > 200) this.flushTitle(bid); return; } // wait for close (capped)
       else {
         const title = this.titleBuf.slice(this.titleBuf.indexOf(open) + open.length, end).replace(/\s+/g, " ").trim().slice(0, 80);
-        if (title) this.emit({ t: "title", title });
+        if (title && this.titleEmit) this.emit({ t: "title", title });
         const rest = this.titleBuf.slice(end + "</title>".length).replace(/^\s*\n/, "");
         this.titleScan = false; this.titleBuf = "";
         if (rest) this.emit({ t: "text_delta", text: rest, bid });
@@ -1362,13 +1405,26 @@ export class Conversation {
 // #endregion
 
 // #region registry (one Conversation per session id / new-chat key)
-const conversations = new Map<string, Conversation>();
+type LiveConversation = Conversation | CodexConversation;
+const conversations = new Map<string, LiveConversation>();
 let tmpCounter = 0;
 
 // Open (or reattach to) a conversation. For a brand-new chat pass resume=undefined and
 // a `first` turn to run(); we return the temp key immediately and the real session id
 // arrives on the init event. For an existing chat pass its session id as both key+resume.
-export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
+export function getOrCreate(key: string | null, opts: ConvOpts): LiveConversation {
+  const saved = key ? readLaunchContext(key) : null;
+  if (saved) opts = { ...saved.options, ...opts, model: opts.model || saved.options.model, agentDepth: saved.options.agentDepth, handoffContext: saved.options.handoffContext };
+  const handoff = key ? readHandoff(key) : null;
+  if (handoff) opts = { ...opts, cwd: handoff.cwd, model: handoff.model, resume: undefined, handoffContext: handoff.context };
+  if (isCodexModel(opts.model) || (!handoff && key?.startsWith("codex-"))) {
+    const c = getOrCreateCodex(handoff ? null : key, opts);
+    conversations.set(c.id, c);
+    c.onEvent((e) => { if (e.t === "closed") setTimeout(() => reapIfIdle(c), 60_000); });
+    if (key) conversations.set(key, c);
+    if (handoff && key) c.onEvent((e) => { if (e.t === "init") { saveLaunchContext(e.sessionId, opts, handoff.events); deleteHandoff(key); } });
+    return c;
+  }
   // A closed conversation is a dead query. It can outlive close() in the map when a viewer reattached
   // before the one-shot reap, so treat it as absent and build a fresh one that resumes the session.
   if (key && conversations.has(key) && !conversations.get(key)!.isClosed) {
@@ -1376,20 +1432,26 @@ export function getOrCreate(key: string | null, opts: ConvOpts): Conversation {
     c.lastActivity = Date.now();
     return c;
   }
-  const id = key || `new-${Date.now().toString(36)}-${tmpCounter++}`;
+  const id = (handoff ? null : key) || `new-${Date.now().toString(36)}-${tmpCounter++}`;
   const c = new Conversation(id, opts);
   conversations.set(id, c);
+  if (key) conversations.set(key, c);
+  if (handoff && key) c.onEvent((e) => { if (e.t === "init") { saveLaunchContext(e.sessionId, opts, handoff.events); deleteHandoff(key); } });
   // once the SDK assigns a real session id, register the conversation under it too
   const unsub = c.onEvent((e) => {
-    if (e.t === "init" && e.sessionId && !get(e.sessionId)) conversations.set(e.sessionId, c);
+    if (e.t === "init" && e.sessionId) {
+      if (!get(e.sessionId)) conversations.set(e.sessionId, c);
+      saveLaunchContext(e.sessionId, opts, handoff?.events || saved?.events || []);
+    }
+    if (e.t === "model") { opts.model = e.model; if (!c.id.startsWith("new-")) saveLaunchContext(c.id, opts, handoff?.events || saved?.events || []); }
     if (e.t === "closed") setTimeout(() => reapIfIdle(c), 60_000);
   });
   void unsub;
   return c;
 }
 
-export function get(key: string): Conversation | undefined {
-  const c = conversations.get(key);
+export function get(key: string): LiveConversation | undefined {
+  const c = conversations.get(key) || getCodex(key);
   return c && !c.isClosed ? c : undefined; // closed -> not live, so the client resumes via /start
 }
 
@@ -1438,7 +1500,7 @@ function cliSessionStatuses(): Record<string, LiveStatus> {
 // Live status for every in-memory conversation, keyed by session id (for the list indicators),
 // merged with the CLI session registry so terminal-driven conversations are not reported idle.
 export function liveStatuses(): Record<string, LiveStatus> {
-  const out: Record<string, LiveStatus> = { ...cliSessionStatuses() };
+  const out: Record<string, LiveStatus> = { ...cliSessionStatuses(), ...codexLiveStatuses() };
   for (const c of new Set(conversations.values())) {
     const mine = c.statusInfo();
     const cli = out[c.id];
@@ -1460,7 +1522,7 @@ export function liveActivity(): { id: string; busy: boolean; waiting: boolean; a
   return out;
 }
 
-function reapIfIdle(c: Conversation) {
+function reapIfIdle(c: LiveConversation) {
   if (c.hasSubscribers()) return;
   for (const [k, v] of conversations) if (v === c) conversations.delete(k);
 }

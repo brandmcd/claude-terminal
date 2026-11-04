@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Claude usage leaderboard</title>
+<title>Claude and Codex usage</title>
 <script src="apexcharts.min.js"></script>
 <script>
   // Applied before the stylesheet paints anything, so a returning light/dark-pinned
@@ -162,6 +162,14 @@
   .modes button:hover { color:var(--ink); }
   .modes button[aria-pressed="true"] { background:var(--card); color:var(--ink); box-shadow:0 1px 2px rgba(20,22,27,.14); }
   .modes button:focus-visible { outline:2px solid var(--grad-a); outline-offset:2px; }
+  .leaderboard-heading { font-size:16px; font-weight:650; margin:26px 4px 0; }
+  .codex-activity { margin:14px 4px 10px; font-size:12px; color:var(--muted); }
+  .codex-activity p { margin:0 0 6px; }
+  .codex-activity summary { cursor:pointer; }
+  .codex-activity table { width:100%; max-width:420px; border-collapse:collapse; margin-top:8px; font-variant-numeric:tabular-nums; }
+  .codex-activity th, .codex-activity td { padding:4px 0; text-align:left; border-bottom:1px solid var(--line); }
+  .codex-activity th:last-child, .codex-activity td:last-child { text-align:right; }
+  .codex-usage .track span em { background:#398a7d !important; }
   .err { background:var(--card); border:1px solid var(--danger); border-radius:14px; padding:16px; color:var(--danger); }
 
   /* Theme toggle. One small button, cycles device -> light -> dark -> device and
@@ -185,7 +193,7 @@
   </a>
   <header>
     <div>
-      <h1>Claude usage leaderboard</h1>
+      <h1>Claude and Codex usage</h1>
       <p class="sub" id="sub">loading</p>
     </div>
     <div class="headright">
@@ -201,12 +209,30 @@
 
   <!-- Shared claude.ai subscription limit (session 5h + weekly 7d). Hidden until data exists. -->
   <div class="panel" id="subPanel" style="display:none">
-    <h2>Session limit</h2>
+    <h2>Claude session limit</h2>
     <p id="subNote">The rolling 5-hour session limit and the 7-day weekly limit, shared across everyone on this box.</p>
     <div class="util" id="subUtil"></div>
     <div class="billfoot" id="subFoot"></div>
   </div>
 
+  <div class="panel codex-usage" id="codexPanel">
+    <h2>Codex usage</h2>
+    <p id="codexNote" role="status">Loading the OpenAI subscription limits.</p>
+    <div class="util" id="codexUtil"></div>
+    <div class="codex-activity" id="codexActivity" style="display:none">
+      <p id="codexLifetime"></p>
+      <details id="codexDaily">
+        <summary>Recent daily token activity</summary>
+        <table aria-label="Codex daily tokens">
+          <thead><tr><th scope="col">Date</th><th scope="col">Tokens</th></tr></thead>
+          <tbody id="codexDailyRows"></tbody>
+        </table>
+      </details>
+    </div>
+    <div class="billfoot" id="codexFoot" style="display:none"></div>
+  </div>
+
+  <h2 class="leaderboard-heading">Claude token leaderboard</h2>
   <div class="cards" id="cards"></div>
 
   <div class="panel" id="monthlyPanel">
@@ -258,8 +284,8 @@ function learnColors(d){ for(const u of (d && d.users) || []) if(u.color) COLORS
 // tokens, the ones that actually eat into the subscription limit. The payload already
 // carries both shapes (month_output / month_total, output_5h / tokens_5h,
 // hourly_parts.output / hourly), so the toggle is pure presentation and costs no fetch.
-let MODE = "all";
-try { const m = localStorage.getItem("ct-usage-mode"); if(m === "all" || m === "output" || m === "weighted") MODE = m; } catch(e) {}
+let MODE = "weighted";
+try { const m = localStorage.getItem("ct-usage-mode-total-v2"); if(m === "all" || m === "output" || m === "weighted") MODE = m; } catch(e) {}
 const outputOnly = () => MODE === "output";
 // "weighted" counts every token, but each one multiplied by its model's cost relative to
 // Sonnet 5 (Fable 5x, Opus 2.5x, Haiku 0.5x). Falls back to the raw total for a peer that
@@ -269,14 +295,12 @@ const wOr = (w, raw) => (typeof w === "number" ? w : raw);
 // hourly_parts is always present today; the fallback keeps a card rendering rather than
 // throwing if a peer ever exports the older shape.
 const hourlyOut = u => (u.hourly_parts && u.hourly_parts.output) || u.hourly.map(()=>0);
-const hourlyOf = u => outputOnly() || weighted() ? hourlyOut(u) : u.hourly;
-// Weighted mode counts OUTPUT ONLY, each token scaled by its model's output price relative to
-// Sonnet 5. Input and cache traffic are left out entirely — the same rule Output-only follows,
-// for the same reason: they barely move the limit, and mixing them in buried the signal.
-const monthOf  = u => weighted() ? wOr(u.weighted_month_output, u.month_output) : outputOnly() ? u.month_output : u.month_total;
-const fiveOf   = u => outputOnly() || weighted() ? u.output_5h : u.tokens_5h;   // the 5h window has no per-model split
-const rowOf    = r => outputOnly() || weighted() ? r.output : r.total;
-const totOf    = u => weighted() ? wOr(u.weighted_output, u.output_total) : u.output_total;
+const hourlyOf = u => weighted() ? (u.weighted_hourly || u.hourly) : outputOnly() ? hourlyOut(u) : u.hourly;
+// Weighted total includes both providers and every category at its own price.
+const monthOf = u => weighted() ? wOr(u.weighted_month_effective_total, u.month_total) : outputOnly() ? u.month_output : u.month_total;
+const fiveOf = u => weighted() ? wOr(u.weighted_tokens_5h, u.tokens_5h) : outputOnly() ? u.output_5h : u.tokens_5h;
+const rowOf = r => weighted() ? wOr(r.weighted_total, r.total) : outputOnly() ? r.output : r.total;
+const totOf = u => weighted() ? wOr(u.weighted_effective_total, u.tokens_total) : u.output_total;
 const allOf    = u => u.tokens_total;
 
 const fmt = n => n>=1e9 ? (n/1e9).toFixed(n>=1e10?1:2)+"B" : n>=1e6 ? (n/1e6).toFixed(n>=1e7?0:2)+"M" : n>=1e3 ? (n/1e3).toFixed(0)+"k" : String(Math.round(n));
@@ -462,10 +486,10 @@ function build(d){
         ${u.active ? '<span class="now"><span class="pulse"></span>active</span>' : ''}
       </div>
       <div class="spark" id="spark-${u.user}"></div>
-      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>${weighted()?"weighted output tokens":outputOnly()?"output tokens":"tokens"} this month</span></div>
+      <div class="big"><b class="num" id="mo-${u.user}">0</b><span>${weighted()?"weighted tokens":outputOnly()?"output tokens":"tokens"} this month</span></div>
       <div class="meta">
         <span>last 5h <b class="num" id="fivh-${u.user}">0</b></span>
-        <span>${weighted()?"weighted output":"total output"} <b class="num" id="tot-${u.user}">0</b></span>
+        <span>${weighted()?"weighted total":"total output"} <b class="num" id="tot-${u.user}">0</b></span>
         ${weighted()?"":`<span>all tokens <b class="num" id="all-${u.user}">0</b></span>`}
         <span>sessions <b>${u.sessions}</b></span>
         <span>last used <b>${ago(u.last_used)}</b></span>
@@ -513,7 +537,7 @@ function refresh(d){
 }
 
 // #region Shared subscription limit (session 5h + weekly 7d)
-// Split a limit bar by who used the window: each person's weighted output since the window
+// Split a limit bar by who used the window: each person's weighted Claude output since the window
 // opened, as a share of the filled part. Usage the box can't attribute (claude.ai web/phone)
 // is already inside utilization, so the segments are proportions of the fill, not absolutes.
 function subSegments(win){
@@ -580,6 +604,51 @@ function renderSubscription(d){
 setInterval(() => { if(DATA) renderSubscription(DATA); }, 1000);
 // #endregion
 
+let CODEX_USAGE = null;
+const usageEscape = (value) => String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function renderCodexUsage(){
+  const d = CODEX_USAGE;
+  if(!d) return;
+  const note = document.getElementById("codexNote"), util = document.getElementById("codexUtil"), foot = document.getElementById("codexFoot");
+  util.innerHTML = ""; foot.style.display = "none";
+  const account = d.accountUsage, total = account?.summary?.lifetimeTokens;
+  const hasTotal = typeof total === "number" && Number.isFinite(total);
+  const daily = (Array.isArray(account?.dailyUsageBuckets) ? account.dailyUsageBuckets : [])
+    .filter(row => typeof row.startDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(row.startDate) && typeof row.tokens === "number" && Number.isFinite(row.tokens))
+    .sort((a,b) => b.startDate.localeCompare(a.startDate)).slice(0,7);
+  document.getElementById("codexActivity").style.display = hasTotal || daily.length ? "" : "none";
+  const lifetime = document.getElementById("codexLifetime");
+  lifetime.style.display = hasTotal ? "" : "none";
+  lifetime.textContent = hasTotal ? "Lifetime tokens: " + total.toLocaleString() : "";
+  document.getElementById("codexDaily").style.display = daily.length ? "" : "none";
+  document.getElementById("codexDailyRows").innerHTML = daily.map(row => '<tr><td>'+usageEscape(row.startDate)+'</td><td>'+row.tokens.toLocaleString()+'</td></tr>').join("");
+  if(!d.available){
+    note.textContent = d.error || (d.authenticated === false ? "Codex isn't signed in on this server." : "Codex usage is unavailable.");
+    return;
+  }
+  note.textContent = (d.subscription ? "OpenAI " + d.subscription + " subscription. " : "OpenAI subscription. ") + "Limits are separate from Claude usage.";
+  const windows = d.fiveHour || d.sevenDay
+    ? [{label:"Session (5h)",win:d.fiveHour,seconds:5*3600},{label:"Weekly (7d)",win:d.sevenDay,seconds:7*86400}].filter(w => w.win)
+    : (Array.isArray(d.windows) ? d.windows : []).map(w => ({label:w.label || "Usage limit",win:w,seconds:0}));
+  util.innerHTML = windows.map(w => subCell(usageEscape(w.label), {utilization:w.win.utilization,resets_at:w.win.resetsAt}, w.seconds)).join("");
+  if(!windows.length) note.textContent += " No rate-limit windows were reported.";
+  if(d.fetchedAt){
+    const time = new Date(d.fetchedAt);
+    if(!isNaN(time.getTime())) { foot.textContent = "Updated " + time.toLocaleString(); foot.style.display = ""; }
+  }
+}
+async function loadCodexUsage(){
+  try {
+    const r = await fetch("/app/api/codex/usage", {cache:"no-store",signal:AbortSignal.timeout(12000)});
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    CODEX_USAGE = await r.json();
+  } catch(e) { CODEX_USAGE = {available:false,error:"Could not load Codex usage (" + e.message + ")."}; }
+  renderCodexUsage();
+}
+loadCodexUsage();
+setInterval(loadCodexUsage, 60000);
+setInterval(renderCodexUsage, 1000);
+
 async function load(first){
   try {
     const r = await fetch("api?t="+Date.now(), {cache:"no-store"});
@@ -607,11 +676,7 @@ function applyModeText(){
   for(const b of document.querySelectorAll("#modes button"))
     b.setAttribute("aria-pressed", String(b.dataset.mode === MODE));
   document.getElementById("sub").textContent = weighted()
-    ? "Ranked by WEIGHTED OUTPUT tokens this calendar month: output only, each token scaled by what "
-      + "its model costs relative to Sonnet 5 \u2014 Fable 5\u00d7, Opus 2.5\u00d7, Sonnet 4.6 1.5\u00d7, "
-      + "Sonnet 5 1\u00d7, Haiku 0.5\u00d7. So an hour of Fable output reads five times heavier than the "
-      + "same hour of Sonnet, which is about what it does to the limit. Input and cache traffic are "
-      + "excluded here, as in Output only. Switch to All tokens for raw counts."
+    ? "Ranked by weighted total tokens from Claude and Codex this calendar month. Input, output, cache writes and cache reads each use their model's list price, normalized to one Sonnet 5 output token ($10 per million). Peers without category detail use the available data."
     : outputOnly()
     ? "Ranked by output tokens used this calendar month. Output is what actually counts against the "
       + "subscription limit, so input and cache traffic are left out of every figure below. "
@@ -619,23 +684,20 @@ function applyModeText(){
     : "Ranked by every token used this calendar month: input, output and cache. Cache reads make the "
       + "raw total huge but barely move the needle against the subscription limit \u2014 switch to "
       + "output only for that. Numbers come straight off each session's transcript and refresh on their own.";
-  document.getElementById("monthlyTitle").textContent = weighted() ? "Weighted output by month" : outputOnly() ? "Output by month" : "Tokens by month";
+  document.getElementById("monthlyTitle").textContent = weighted() ? "Weighted tokens by month" : outputOnly() ? "Output by month" : "Tokens by month";
   document.getElementById("monthlySub").textContent = outputOnly()
     ? "Output tokens each person used, month by month."
     : "Every token each person used, month by month: input, output and cache.";
   document.getElementById("hourlyTitle").textContent =
-    outputOnly() || weighted() ? "Output per hour, last 7 days" : "Tokens per hour, last 7 days";
-  // The hourly/monthly series have no per-model split, so they stay raw even in weighted mode.
-  // Say so rather than letting the cards and the charts silently disagree.
-  const ms = document.getElementById("monthlySub");
-  if(weighted()) ms.textContent = "Output tokens weighted by model cost, month by month (Fable 5\u00d7, Opus 2.5\u00d7, Haiku 0.5\u00d7).";
+    weighted() ? "Weighted tokens per hour, last 7 days" : outputOnly() ? "Output per hour, last 7 days" : "Tokens per hour, last 7 days";
+  if(weighted()) document.getElementById("monthlySub").textContent = "Claude and Codex input, output and cache tokens, weighted by each model's category prices.";
 }
 
 document.getElementById("modes").addEventListener("click", e => {
   const b = e.target.closest("button[data-mode]");
   if(!b || b.dataset.mode === MODE) return;
   MODE = b.dataset.mode;
-  try { localStorage.setItem("ct-usage-mode", MODE); } catch(err) {}
+  try { localStorage.setItem("ct-usage-mode-total-v2", MODE); } catch(err) {}
   applyModeText();
   if(!DATA) return;
   rank(DATA);

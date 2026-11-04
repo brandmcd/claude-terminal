@@ -12,6 +12,7 @@ import { openSync, fstatSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { openDb } from "./db.ts";
 import { hourKey, trackedUsers as listUsers, userTranscripts } from "./transcripts.ts";
+import { sampleCodexUsage } from "./codex-collector.ts";
 import { sampleModelUsage } from "./model-collector.ts";
 import { sampleCloudCost } from "./cost-collector.ts";
 import { sampleExternalPeers } from "./external-collector.ts";
@@ -71,7 +72,10 @@ function collectUser(user: string): void {
   // One flat list per user: every project dir walked, other tracked users' nested dirs
   // removed. See transcripts.ts.
   const files = userTranscripts(cfg, user);
-  const sessions = files.length;
+  let codexSessions = 0;
+  if (db.query("SELECT name FROM sqlite_master WHERE name='codex_offsets'").get())
+    codexSessions = (db.query("SELECT count(*) AS n FROM codex_offsets WHERE user=?").get(user) as any).n;
+  const sessions = files.length + codexSessions;
   for (const f of files) {
     let size: number;
     let fd: number;
@@ -153,6 +157,10 @@ try {
 } catch (e) {
   console.error("model usage sample failed:", e);
 }
+
+// Include Codex in the same raw and per-model aggregates before publishing.
+try { await sampleCodexUsage(CONFIG_PATH); }
+catch (e) { console.error("Codex usage sample failed:", e); }
 
 // Pull usage from any configured external peers (other claude-terminal instances) into
 // the external_* tables. Runs BEFORE the tick so the SSE push reflects fresh peer data.

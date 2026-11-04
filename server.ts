@@ -191,6 +191,13 @@ const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 // output-token's worth of spend. Ratios land where you would expect — a Fable output token is 5.
 interface Price { input: number; output: number; write5m: number; write1h: number; read: number }
 const MODEL_PRICES: Record<string, Price> = {
+  // Standard list prices, https://developers.openai.com/api/docs/pricing (2026-11-04).
+  // Codex writes use the standard short-lived write rate when no duration is recorded.
+  "gpt-6-astra":   { input: 10, output: 50, write5m: 12.5, write1h: 25, read: 1 },
+  "gpt-6.1-sol":   { input: 2, output: 10, write5m: 2.5, write1h: 5, read: 0.1 },
+  "gpt-6.1-terra": { input: 1, output: 5, write5m: 1.25, write1h: 2.5, read: 0.05 },
+  "gpt-6-sol":     { input: 2, output: 10, write5m: 2.5, write1h: 5, read: 0.2 },
+  "gpt-6-luna":    { input: 0.1, output: 0.5, write5m: 0.125, write1h: 0.25, read: 0.01 },
   "claude-fable-5-1":  { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 0.25 },
   "claude-mythos-5-1": { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 0.25 },
   "claude-fable-5":    { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 1 },
@@ -287,7 +294,9 @@ function modelMonthQuery() {
   qModelMonthChecked = true;
   try {
     if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get())
-      qModelMonth = db.query(`SELECT user, substr(minute_utc,1,7) AS mk, model, sum(output) AS output
+      qModelMonth = db.query(`SELECT user, substr(minute_utc,1,7) AS mk, model, sum(output) AS output, sum(input) AS input, sum(cache_read) AS cache_read,
+        sum(cache_creation) AS cache_creation, sum(cache_creation_5m) AS cache_creation_5m,
+        sum(cache_creation_1h) AS cache_creation_1h, sum(total) AS total
         FROM model_usage GROUP BY user, mk, model`);
   } catch { qModelMonth = null; }
   return qModelMonth;
@@ -300,14 +309,26 @@ function externalModelMonthQuery() {
   qExtModelMonthChecked = true;
   try {
     if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='external_model_usage'").get())
-      qExtModelMonth = db.query(`SELECT peer, user, mk, model, sum(output) AS output
+      qExtModelMonth = db.query(`SELECT peer, user, mk, model, sum(output) AS output, sum(input) AS input, sum(cache_read) AS cache_read,
+        sum(cache_creation) AS cache_creation, sum(cache_creation_5m) AS cache_creation_5m,
+        sum(cache_creation_1h) AS cache_creation_1h, sum(total) AS total
         FROM external_model_usage GROUP BY peer, user, mk, model`);
   } catch { qExtModelMonth = null; }
   return qExtModelMonth;
 }
-// This fork weights output by list price, sonnet-5 output = 1. Filip's board applies its own
-// weight table to the model ids we export, so the export carries ids and raw output, not weights.
+// Keep legacy output weights for subscription attribution. The peer export also carries
+// every token category, list prices and weighted totals for newer consumers.
 const outputWeight = (model: string) => priceFor(model).output / BASELINE;
+const MODEL_PARTS = ["input", "output", "cache_read", "cache_creation", "cache_creation_5m", "cache_creation_1h", "total"];
+function modelParts(r: any): any { return Object.fromEntries(MODEL_PARTS.map(k => [k, r[k] || 0])); }
+function effectiveTokens(r: any): number {
+  const p = priceFor(r.model);
+  const w1 = r.cache_creation_1h || 0;
+  return ((r.input || 0) * p.input + (r.output || 0) * p.output
+    + Math.max(0, (r.cache_creation || 0) - w1) * p.write5m
+    + w1 * p.write1h + (r.cache_read || 0) * p.read) / BASELINE;
+}
+
 
 // Weighted output per local user since a limit window opened (resets_at minus its length), so the
 // page can split each limit bar by who used it. Local transcripts only: claude.ai web/phone use
@@ -319,7 +340,7 @@ function windowShares(resetsAt: string | null, windowSec: number): Record<string
     qWindowChecked = true;
     try {
       if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='model_usage'").get())
-        qWindow = db.query("SELECT user, model, SUM(output) AS output FROM model_usage WHERE minute_utc >= ? GROUP BY user, model");
+        qWindow = db.query("SELECT user, model, SUM(output) AS output FROM model_usage WHERE minute_utc >= ? AND model NOT LIKE 'gpt-%' GROUP BY user, model");
     } catch { qWindow = null; }
   }
   const end = Date.parse(resetsAt);
@@ -396,7 +417,7 @@ function buildExport() {
   const mmq = modelMonthQuery();
   const byUserModels: Record<string, { mk: string; model: string; output: number }[]> = {};
   if (mmq) for (const r of mmq.all() as any[])
-    (byUserModels[r.user] ??= []).push({ mk: r.mk, model: r.model, output: r.output || 0 });
+    (byUserModels[r.user] ??= []).push({ mk: r.mk, model: r.model, ...modelParts(r) });
   const users: any[] = [];
   for (const { user } of qUsers.all() as any[]) {
     const cum = (qCum.get(user) as any) || { input: 0, output: 0, cache_creation: 0, cache_read: 0, total: 0 };
@@ -424,7 +445,16 @@ function buildExport() {
   if (cfg.exportCombinePeers) mergePeersIntoOwner(users, cutoff);
   coverModelGaps(users);
   mergeExportGroups(users);
-  return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(), users };
+  for (const row of users) {
+    const months: Record<string, number> = {};
+    for (const m of row.models || []) months[m.mk] = (months[m.mk] || 0) + effectiveTokens(m);
+    row.weighted_effective_total = Object.values(months).reduce((a, b) => a + b, 0);
+    row.weighted_month_effective_total = months[new Date().toISOString().slice(0, 7)] || 0;
+    row.weighted_months = months;
+  }
+  return { peer: cfg.exportName || OWNER, generated_at: new Date().toISOString(),
+    weight_baseline: "claude-sonnet-5 output ($10/MTok) = 1 weighted token",
+    model_prices: MODEL_PRICES, users };
 }
 
 // Sums external peer rows into the owner's export row: cumulative parts, hourly buckets
@@ -455,7 +485,7 @@ function mergePeersIntoOwner(users: any[], cutoff: string): void {
   const extModels = emmq ? (emmq.all() as any[]) : [];
   for (const { peer, user } of eq.users.all() as any[]) {
     for (const r of extModels)
-      if (r.peer === peer && r.user === user) row.models.push({ mk: r.mk, model: r.model, output: r.output || 0 });
+      if (r.peer === peer && r.user === user) row.models.push({ mk: r.mk, model: r.model, ...modelParts(r) });
     const cum = (eq.cum.get(peer, user) as any) || {};
     addParts(row.cumulative, cum);
     for (const r of eq.hours.all(peer, user) as any[]) {
@@ -506,8 +536,8 @@ function mergeExportGroups(users: any[]): void {
       for (const m of r.models || []) {
         const k = `${m.mk}\u0000${m.model}`;
         const acc = byModel.get(k);
-        if (acc) acc.output += m.output || 0;
-        else byModel.set(k, { mk: m.mk, model: m.model, output: m.output || 0 });
+        if (acc) for (const field of MODEL_PARTS) (acc as any)[field] = ((acc as any)[field] || 0) + (m[field] || 0);
+        else byModel.set(k, { mk: m.mk, model: m.model, ...modelParts(m) });
       }
       meta.sessions += r.meta.sessions || 0;
       for (const m of JSON.parse(r.meta.models || "[]")) models.add(m);
@@ -552,9 +582,14 @@ function buildLeaderboard() {
   // per-model output imported from external peers (keyed the same way as their board rows). A
   // user/month with raw output but no model rows falls back to raw output, weight 1.
   const wByMonth: Record<string, Record<string, number>> = {};
+  const effectiveByMonth: Record<string, Record<string, number>> = {};
+  const codexByMonth: Record<string, Record<string, number>> = {};
   const mmq = modelMonthQuery();
-  if (mmq) for (const r of mmq.all() as any[])
-    (wByMonth[r.mk] ??= {})[r.user] = (wByMonth[r.mk][r.user] || 0) + (r.output || 0) * outputWeight(r.model);
+  if (mmq) for (const r of mmq.all() as any[]) {
+    if (r.model.startsWith("gpt-")) (codexByMonth[r.mk] ??= {})[r.user] = (codexByMonth[r.mk][r.user] || 0) + (r.total || 0);
+    (effectiveByMonth[r.mk] ??= {})[r.user] = (effectiveByMonth[r.mk][r.user] || 0) + effectiveTokens(r);
+    if (!r.model.startsWith("gpt-")) (wByMonth[r.mk] ??= {})[r.user] = (wByMonth[r.mk][r.user] || 0) + (r.output || 0) * outputWeight(r.model);
+  }
   const emmq = externalModelMonthQuery();
   if (emmq) for (const r of emmq.all() as any[]) {
     const k = extKey(r.peer, r.user);
@@ -623,7 +658,7 @@ function buildLeaderboard() {
     const cents = splitCents(wtd, subUsdFor(mk) * 100);
     const rows = allUsers.map((u) => ({
       user: u, name: nameOf[u],
-      total: outs[u], output: parts[u].output, parts: partsOf(parts[u]),
+      total: outs[u], weighted_total: effectiveByMonth[mk]?.[u] ?? outs[u], output: parts[u].output, parts: partsOf(parts[u]),
       pct: total ? Math.round((1000 * outs[u]) / total) / 10 : 0,
       share_usd: cents[u] / 100,
     }));
@@ -632,7 +667,8 @@ function buildLeaderboard() {
   }
 
   const cur: Record<string, number> = {};
-  for (const u of allUsers) cur[u] = byMonth[monthPrefix]?.[u]?.total || 0;
+  // Codex counts on the leaderboard but does not draw from the Claude subscription.
+  for (const u of allUsers) cur[u] = Math.max(0, (byMonth[monthPrefix]?.[u]?.total || 0) - (codexByMonth[monthPrefix]?.[u] || 0));
   const curTotal = Object.values(cur).reduce((a, b) => a + b, 0);
   const curCents = splitCents(cur, subUsdFor(monthPrefix) * 100);
   for (const u of users) {
@@ -643,12 +679,25 @@ function buildLeaderboard() {
   // Weighted ("effective") figures alongside the raw ones, so the board can show what the usage
   // actually cost against the limit rather than treating every model's token as equal.
   const wt = weightedTotals();
+  const weightedHours = new Map<string, Map<string, any>>();
+  if (db && qWeighted) for (const r of db.query(`SELECT user, substr(minute_utc,1,13) AS hour, model,
+    sum(input) AS input, sum(output) AS output, sum(cache_creation) AS cache_creation,
+    sum(cache_creation_1h) AS cache_creation_1h, sum(cache_read) AS cache_read
+    FROM model_usage WHERE minute_utc >= ? GROUP BY user, hour, model`).all(
+      hourKeyOf(new Date(now.getTime() - HOURLY_HOURS * 3600e3))) as any[]) {
+    let hours = weightedHours.get(r.user);
+    if (!hours) weightedHours.set(r.user, hours = new Map());
+    const b = hours.get(r.hour) || { total: 0 };
+    b.total += effectiveTokens(r); hours.set(r.hour, b);
+  }
   for (const u of users as any[]) {
     const w = wt[u.user];
+    const wh = weightedHours.get(u.user) || new Map();
+    u.weighted_hourly = sparkSeries(wh, now, HOURLY_HOURS);
+    u.weighted_tokens_5h = rolling(wh, "total", now);
     u.weighted_output = w ? w.output : null;
     u.weighted_month_output = w ? w.month_output : null;
-    // Every category at its own price. Not shown on the board (Weighted mode is output-only),
-    // but it is the number to quote for "what did this cost".
+    // Every category at its own model price, used by Weighted mode.
     u.weighted_effective_total = w ? w.effective_total : null;
     u.weighted_month_effective_total = w ? w.month_effective_total : null;
   }
@@ -698,7 +747,7 @@ function buildLeaderboard() {
   }
 
   // Ranked on the full token count now, not output alone.
-  users.sort((a, b) => b.month_total - a.month_total || b.tokens_total - a.tokens_total);
+  users.sort((a, b) => (b.weighted_month_effective_total ?? b.month_total) - (a.weighted_month_effective_total ?? a.month_total));
 
   return {
     generated_at: now.toISOString().replace(/\.\d+Z$/, "+00:00"),
@@ -1040,6 +1089,7 @@ const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
   { id: "claude-haiku-4-5", label: "Haiku 4.5" },
 ];
 const appCtx: AppCtx = {
+  sharedTools: cfg.appGuest ? undefined : { url: `http://127.0.0.1:${PORT}`, owner: OWNER, vault: join(HOME, "vault") },
   allowed,
   cors,
   publicDir: PUBLIC_DIR,
@@ -1061,6 +1111,8 @@ const appCtx: AppCtx = {
   defaultModel: typeof cfg.appDefaultModel === "string" ? cfg.appDefaultModel : undefined,
   maxEffort: typeof cfg.appMaxEffort === "string" ? cfg.appMaxEffort : undefined,
   board: !!cfg.appBoard, // the team to-do board window and /app/api/board (board.ts)
+  sketchDir: typeof cfg.appSketchDir === "string" ? cfg.appSketchDir : undefined, // Sketchpad window + /app/api/sketches
+  inventoryFile: typeof cfg.appInventoryFile === "string" ? cfg.appInventoryFile : undefined, // Parts Inventory window + /app/api/inventory
   favoritesFile: join(STATE_DIR, "claude-app-favorites.json"),
   titlesFile: join(STATE_DIR, "claude-app-titles.json"),
   readsFile: join(STATE_DIR, "claude-app-reads.json"),

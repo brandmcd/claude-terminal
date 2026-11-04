@@ -10,6 +10,9 @@
 //   POST /app/api/mcp                 { name, config, applyTo? }
 //   POST /app/api/mcp/delete          { name, applyTo? }
 //   POST /app/api/mcp/apply           { id }
+//   POST /app/api/mcp/reconnect       { id, name } -> { ok, error?, status:[…] }
+//   POST /app/api/mcp/signin/start    { name } -> { url, port }
+//   POST /app/api/mcp/signin/finish   { name, callbackUrl, applyTo? } -> { ok, reconnectError?, status }
 //   GET  /app/api/memory              -> { projects:[{id,label,files:[{name,path,size}]}] }
 //   GET  /app/api/memory/file?path=   -> { content }
 //   POST /app/api/memory/file         { path, content } -> { ok, backup }
@@ -134,12 +137,25 @@ type McpStatus = {
   serverInfo?: { name?: string; version?: string };
 };
 
-const MCP_DOT: Record<string, string> = {
-  connected: "var(--success)",
-  failed: "var(--danger)",
-  "needs-auth": "var(--warning)",
-  pending: "var(--text-3)",
-  disabled: "var(--text-3)",
+// One plain-words state per row: [dot color, label, needs a Fix button].
+function describeMcp(st: McpStatus | undefined, live: boolean, tools: number | null): [string, string, boolean] {
+  if (!live) return ["var(--text-3)", "Not checked (open a chat to test it)", false];
+  if (!st) return ["var(--danger)", "Not loaded in this chat", true];
+  const n = tools !== null ? " · " + tools + (tools === 1 ? " tool" : " tools") : "";
+  switch (st.status) {
+    case "connected": return ["var(--success)", "Connected" + n, false];
+    case "failed": return ["var(--danger)", "Failed to connect", true];
+    case "needs-auth": return ["var(--warning)", "Needs sign-in", true];
+    case "pending": return ["var(--warning)", "Connecting…", false];
+    case "disabled": return ["var(--text-3)", "Turned off", false];
+    default: return ["var(--text-3)", st.status || "Unknown", true];
+  }
+}
+
+// Servers with a localhost OAuth redirect (workspace-mcp) support the paste-back sign-in.
+const signInPortOf = (s: McpEntry) => {
+  const m = /^http:\/\/(?:localhost|127\.0\.0\.1):(\d+)\//.exec(s.env?.GOOGLE_OAUTH_REDIRECT_URI || "");
+  return m ? m[1] : null;
 };
 
 function toolCountOf(s: McpStatus | undefined): number | null {
@@ -168,6 +184,12 @@ export function McpSection({ activeId }: { activeId: string | null }) {
   const [fUrl, setFUrl] = useState("");
   const [fPairs, setFPairs] = useState("");
   const [saving, setSaving] = useState(false);
+
+  // Fix flow: the row being repaired, and the sign-in step if a reconnect was not enough.
+  const [fixing, setFixing] = useState<string | null>(null);
+  const [signin, setSignin] = useState<null | { name: string; url: string; port: string }>(null);
+  const [paste, setPaste] = useState("");
+  const [signErr, setSignErr] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -265,6 +287,60 @@ export function McpSection({ activeId }: { activeId: string | null }) {
     } catch (e) { setErr(msg(e)); }
   };
 
+  const statusMap = (list: McpStatus[]) => {
+    const map: Record<string, McpStatus> = {};
+    for (const s of list || []) if (s && s.name) map[s.name] = s;
+    return map;
+  };
+
+  // Show the sign-in step: the helper on the box starts a Google sign-in and returns its URL.
+  const beginSignIn = async (name: string) => {
+    setSignErr(""); setPaste(""); setFixing(name);
+    try {
+      const r = await postJson("/app/api/mcp/signin/start", { name });
+      if (r.error) { setErr(name + ": " + r.error); return; }
+      setSignin({ name, url: String(r.url), port: String(r.port) });
+    } catch (e) { setErr(msg(e)); }
+    finally { setFixing(null); }
+  };
+
+  // Fix: reconnect first (most failures are a bad start), then fall back to signing in again.
+  const fix = async (name: string) => {
+    setErr(""); setOk(""); setSignin(null);
+    const canSignIn = !!signInPortOf(servers[name] || {});
+    if (!activeId || !live) {
+      if (canSignIn) await beginSignIn(name);
+      else setErr("Open a chat first; Fix reconnects the server inside that chat.");
+      return;
+    }
+    setFixing(name);
+    try {
+      const r = await postJson("/app/api/mcp/reconnect", { id: activeId, name });
+      const map = statusMap(r.status as McpStatus[]);
+      if (Object.keys(map).length) setStatus(map);
+      if (map[name]?.status === "connected") { setOk(name + " reconnected."); return; }
+      if (canSignIn) { setFixing(null); await beginSignIn(name); return; }
+      setErr(name + " still fails: " + (r.error || map[name]?.error || map[name]?.status || "no status"));
+    } catch (e) { setErr(msg(e)); }
+    finally { setFixing(null); }
+  };
+
+  const finishSignIn = async () => {
+    if (!signin) return;
+    setSignErr("");
+    if (!paste.trim()) { setSignErr("Paste the localhost address first."); return; }
+    setFixing(signin.name);
+    try {
+      const r = await postJson("/app/api/mcp/signin/finish", { name: signin.name, callbackUrl: paste.trim(), applyTo: activeId || undefined });
+      if (r.error) { setSignErr(String(r.error)); return; }
+      const map = statusMap(r.status as McpStatus[]);
+      if (Object.keys(map).length) setStatus(map);
+      setOk(signin.name + " signed in." + (r.reconnectError ? " Reconnect failed: " + r.reconnectError : activeId && live ? "" : " It connects on your next chat."));
+      setSignin(null); setPaste("");
+    } catch (e) { setSignErr(msg(e)); }
+    finally { setFixing(null); }
+  };
+
   if (dead) return <Dead text={dead} onRetry={() => { void refresh(); }} />;
 
   const names = Object.keys(servers).sort();
@@ -333,17 +409,22 @@ export function McpSection({ activeId }: { activeId: string | null }) {
             const type = s.type || "stdio";
             const detail = type === "stdio" ? [s.command, ...(s.args || [])].join(" ") : s.url || "";
             const tools = toolCountOf(st);
+            const [color, label, broken] = describeMcp(st, !!activeId && live, tools);
+            const port = signInPortOf(s);
+            const busy = fixing === n;
             return (
-              <div className="ms-row" key={n}>
+              <div className={"ms-row" + (broken ? " ms-row-bad" : "")} key={n}>
                 <div className="ms-row-top">
-                  <span className="ms-dot" style={{ background: st ? MCP_DOT[st.status || ""] || "var(--text-3)" : "var(--text-3)" }} title={st?.status || "not connected in this chat"} />
+                  <span className="ms-dot" style={{ background: color }} />
                   <span className="ms-name">{n}</span>
                   <span className="ms-badge">{type}</span>
-                  <span className="ms-state">
-                    {st?.status || (live ? "not connected" : "no chat open")}
-                    {tools !== null ? " · " + tools + (tools === 1 ? " tool" : " tools") : ""}
-                  </span>
+                  <span className="ms-state" style={{ color: broken ? color : undefined }}>{label}</span>
                   <span className="ms-row-acts">
+                    {broken ? (
+                      <button className="ms-ic ms-fix" disabled={busy} onClick={() => { void fix(n); }}>{busy ? "fixing…" : "Fix"}</button>
+                    ) : port && signin?.name !== n ? (
+                      <button className="ms-ic" disabled={busy} onClick={() => { void beginSignIn(n); }}>{busy ? "starting…" : "sign in again"}</button>
+                    ) : null}
                     <button className="ms-ic" onClick={() => startEdit(n)}>edit</button>
                     {confirmName === n ? (
                       <>
@@ -357,8 +438,28 @@ export function McpSection({ activeId }: { activeId: string | null }) {
                 </div>
                 {detail && <div className="ms-sub"><code>{detail}</code></div>}
                 {st?.error && <div className="ms-rowerr">{st.error}</div>}
-                {st?.status === "needs-auth" && (
+                {st?.status === "needs-auth" && !port && (
                   <div className="ms-sub">Needs authorising. Open this server's login from a terminal session (<code>/mcp</code>).</div>
+                )}
+                {signin?.name === n && (
+                  <div className="ms-form ms-signin">
+                    <div className="ms-step">1. Open the Google sign-in and approve access.</div>
+                    <a className="ms-btn ms-primary ms-link" href={signin.url} target="_blank" rel="noopener noreferrer">Open Google sign-in ↗</a>
+                    <div className="ms-step">
+                      2. Google then sends your browser to <code>http://localhost:{signin.port}/oauth2callback?…</code>, which
+                      will not load. That is expected. Copy the whole address from the address bar.
+                    </div>
+                    <label className="ms-label" htmlFor={"ms-paste-" + n}>3. Paste the localhost address here</label>
+                    <textarea
+                      id={"ms-paste-" + n} className="ms-in ms-ta ms-ta-s" value={paste} onChange={(e) => setPaste(e.target.value)}
+                      placeholder={"http://localhost:" + signin.port + "/oauth2callback?state=…&code=…"} spellCheck={false} autoCapitalize="none" autoCorrect="off"
+                    />
+                    <Err text={signErr} />
+                    <div className="ms-actions">
+                      <button className="ms-btn ms-primary" disabled={busy} onClick={() => { void finishSignIn(); }}>{busy ? "Finishing…" : "Finish sign-in"}</button>
+                      <button className="ms-btn ms-cancel" onClick={() => { setSignin(null); setSignErr(""); }}>Cancel</button>
+                    </div>
+                  </div>
                 )}
               </div>
             );
@@ -631,6 +732,16 @@ export function injectManageCss() {
   .ms-ic.ms-danger{color:var(--danger,#e0685f);font-weight:600}
   .ms-sub{margin-top:8px;font-size:12px;line-height:1.5;color:var(--text-3,#8a8078);word-break:break-word}
   .ms-clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  .ms-row-bad{border-color:color-mix(in srgb,var(--danger,#e0685f) 45%,var(--line-2,#2c2621))}
+  .ms-ic.ms-fix{color:var(--bg,#1a1613);background:var(--accent,#d97757);font-weight:600;padding:6px 12px}
+  .ms-ic.ms-fix:hover{color:var(--bg,#1a1613);filter:brightness(1.06)}
+  .ms-ic:disabled{opacity:.6;cursor:default}
+  .ms-signin{margin:12px 0 0}
+  .ms-step{font-size:12.5px;line-height:1.55;color:var(--text-2,#b8afa5);margin:0 0 8px;word-break:break-word}
+  .ms-step code{font-family:var(--mono,ui-monospace,Menlo,Consolas,monospace);font-size:11.5px}
+  .ms-btn.ms-link{display:inline-block;margin:0 0 14px;text-decoration:none}
+  .ms-signin .ms-actions{margin:10px 0 0;align-items:center}
+  .ms-signin .ms-actions .ms-primary{margin-top:0}
   .ms-rowerr{margin-top:8px;font-size:12px;line-height:1.5;color:var(--danger,#e0685f);word-break:break-word}
   .ms-hint{font-size:11.5px;color:var(--text-3,#8a8078);margin-top:5px}
 

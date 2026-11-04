@@ -6,7 +6,7 @@
 // is streamed, chunked by sentence, and each sentence is sent to the NAS Kokoro service
 // via /app/api/tts -> audio, played in a queue so Claude starts talking before the whole
 // reply is done. After Claude finishes speaking it auto-resumes listening (hands-free);
-// if the user starts talking while Claude speaks, playback stops (barge-in).
+// talking over a reply does not stop it; the Interrupt button does.
 //
 // Self-contained on purpose: the only coupling to main.tsx is the VoiceBridge props
 // contract below. All styles are injected from here (kept out of styles.css).
@@ -512,8 +512,10 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
     // VAD via analyser RMS
     const data = new Uint8Array(analyser.fftSize);
     const segStart = performance.now();
-    let speech = false, lastVoice = segStart, floor = 0.015, floorN = 0;
-    const SIL_MS = 1100, MAX_UTTER_MS = 20000, MAX_IDLE_MS = 30000;
+    let speech = false, speechStart = 0, lastVoice = segStart, floor = 0.015, floorN = 0;
+    // Short commands ("skip", "repeat") send after a brief pause; once an answer runs past
+    // LONG_AFTER_MS it gets a longer pause so thinking mid-answer doesn't end the turn.
+    const SIL_SHORT_MS = 1700, SIL_LONG_MS = 2600, LONG_AFTER_MS = 4000, MAX_UTTER_MS = 180000, MAX_IDLE_MS = 30000;
 
     const tick = () => {
       if (!activeRef.current || phaseRef.current !== "listening") return;
@@ -525,9 +527,10 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
       if (fresh && now - segStart < LISTEN_GUARD_MS) { rafRef.current = requestAnimationFrame(tick); return; }
       if (floorN < 12) { floor = (floor * floorN + rms) / (floorN + 1); floorN++; } // ambient calibration
       const thr = Math.max(0.05, floor * 2.2);
-      if (rms > thr) { if (!speech) speech = true; lastVoice = now; }
+      if (rms > thr) { if (!speech) { speech = true; speechStart = now; } lastVoice = now; }
       const finish = (send: boolean) => { onstopSendRef.current = send; clearRaf(); if (send) setPhaseR("transcribing"); try { rec.stop(); } catch {} };
-      if (speech && now - lastVoice > SIL_MS) return finish(true);
+      const silMs = lastVoice - speechStart > LONG_AFTER_MS ? SIL_LONG_MS : SIL_SHORT_MS;
+      if (speech && now - lastVoice > silMs) return finish(true);
       if (speech && now - segStart > MAX_UTTER_MS) return finish(true);
       if (!speech && now - segStart > MAX_IDLE_MS) return finish(false); // restart segment, drop buffer
       rafRef.current = requestAnimationFrame(tick);
@@ -690,8 +693,6 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   useEffect(() => {
     if (!open) return;
     let raf = 0;
-    const data = new Uint8Array(2048);
-    let loud = 0;
     const loop = () => {
       raf = requestAnimationFrame(loop);
       const player = playerRef.current;
@@ -712,20 +713,7 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
         else startListening();
         return;
       }
-      const analyser = analyserRef.current;
-      if (!analyser) return; // no live mic (tap-to-talk between turns) -> no barge-in
-      const speakingOrThinking = phaseRef.current === "speaking" || phaseRef.current === "thinking";
-      if (!speakingOrThinking) return;
-      // barge-in detection (higher bar than listening; echoCancellation removes most TTS bleed)
-      analyser.getByteTimeDomainData(data);
-      let sum = 0; for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
-      const rms = Math.sqrt(sum / data.length);
-      setLevel(Math.min(1, rms * 6));
-      if (rms > 0.12) { loud++; } else { loud = Math.max(0, loud - 1); }
-      if (loud > 8 && player.isActive) { // sustained user speech over the TTS
-        player.stop(); ttsChainRef.current = Promise.resolve(); turnDoneRef.current = true; loud = 0;
-        startListening();
-      }
+      // No voice barge-in: car noise and speaker bleed cut replies short. The Interrupt button still stops playback.
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
@@ -733,6 +721,22 @@ export function VoiceMode({ bridge, open, onClose, pendingAsk, onAnswer, speakFi
   // #endregion
 
   // #region open/close lifecycle
+  // Keep the screen on while voice mode is open; a sleeping phone suspends the page and the mic.
+  // The OS drops the lock whenever the page is hidden, so re-request on becoming visible.
+  useEffect(() => {
+    if (!open) return;
+    const wl = (navigator as any).wakeLock;
+    if (!wl?.request) return;
+    let lock: any = null, gone = false;
+    const acquire = async () => {
+      if (gone || document.visibilityState !== "visible" || (lock && !lock.released)) return;
+      try { lock = await wl.request("screen"); if (gone) lock.release().catch(() => {}); } catch { /* denied or unsupported */ }
+    };
+    void acquire();
+    document.addEventListener("visibilitychange", acquire);
+    return () => { gone = true; document.removeEventListener("visibilitychange", acquire); lock?.release?.().catch(() => {}); };
+  }, [open]);
+
   useEffect(() => {
     if (!open) { teardown(); return; }
     let cancelled = false;
