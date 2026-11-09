@@ -9,18 +9,18 @@
 // copied from FTA-Buddy's version-poll + reload-toast, minus its cache-first service worker
 // (we deliberately don't precache the shell, so there's nothing to go stale).
 import { join, basename } from "path";
-import { rmSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
 
 const APP = import.meta.dir; // app/
 const OUT = join(APP, "..", "public", "app");
 const ASSETS = join(OUT, "assets");
 
-// clean old hashed files so stale bundles don't pile up
-rmSync(ASSETS, { recursive: true, force: true });
+// Keep immutable bundles: open tabs and service-worker clients may still request
+// the previous build while a new shell is being published.
 mkdirSync(ASSETS, { recursive: true });
 
-// KaTeX stylesheet + fonts for math rendering. Copied on every build because the rm above wipes
-// ASSETS; served static (no content hash) and referenced by index.html. The CSS points at fonts/
+// KaTeX stylesheet + fonts for math rendering. Copied on every build to match
+// the installed dependency; served static and referenced by index.html. The CSS points at fonts/
 // with relative urls, so the fonts sit beside it under assets/katex/.
 import { cpSync } from "fs";
 const KATEX = join(APP, "..", "node_modules", "katex", "dist");

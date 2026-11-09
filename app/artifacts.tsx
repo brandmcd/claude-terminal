@@ -812,6 +812,7 @@ async function openFile(path: string, convId: string | null, open: (a: Artifact)
 
 // Open a local path in the viewer: a .md file as a note, anything else as a file.
 export function openLocalPath(path: string, convId: string | null, open: (a: Artifact) => void): void {
+  path = path.replace(/:(\d+)(?::\d+)?$/, "");
   void (isMarkdownHref(path) ? openNote(path, convId, open) : openFile(path, convId, open));
 }
 
@@ -822,6 +823,7 @@ function FileBody({ artifact }: { artifact: Artifact }) {
   const [blob, setBlob] = useState<{ url: string; type: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
+    setBlob(null); setErr(null);
     if (artifact.fileType !== "blob" || !artifact.url) return;
     let live = true, made = "";
     fetch(artifact.url, { cache: "no-cache" })

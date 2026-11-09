@@ -50,8 +50,8 @@
       "label": "Sonnet 5"
     },
     {
-      "id": "claude-fable-5-1",
-      "label": "Fable 5.1"
+      "id": "claude-fable-5-2",
+      "label": "Fable 5.2"
     },
     {
       "id": "claude-fable-5",
@@ -128,5 +128,10 @@
     "kaleb": [
       "/var/lib/claude-terminal/guests/kaleb/projects"
     ]
-  }
+  },
+  "downloadRoots": [
+    "/home/ctuser",
+    "/mnt/HC_Volume_107049549/ctuser",
+    "/mnt/HC_Volume_106914936/ctuser"
+  ]
 }

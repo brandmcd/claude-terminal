@@ -177,6 +177,7 @@ const qMeta = db?.query("SELECT * FROM meta WHERE user = ?") as any;
 // https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-22), not inferred:
 //
 //   model              input   5m write   1h write   cache read   output    ($/MTok)
+//   Fable 5.2 / Mythos 5.2    8    10         16         0.20        40     <- from the CLI 2.1.321 model catalog, 2026-11-09
 //   Fable 5.1 / Mythos 5.1   10    12.50      20         0.25        50     <- 0.025x read, not 0.1x
 //   Fable 5   / Mythos 5     10    12.50      20         1.00        50
 //   Opus 5.5                  4     5.00       8         0.20        20     <- 0.05x read, not 0.1x
@@ -203,6 +204,7 @@ const MODEL_PRICES: Record<string, Price> = {
   "gpt-6.1-terra": { input: 1, output: 5, write5m: 1.25, write1h: 2.5, read: 0.05 },
   "gpt-6-sol":     { input: 2, output: 10, write5m: 2.5, write1h: 5, read: 0.2 },
   "gpt-6-luna":    { input: 0.1, output: 0.5, write5m: 0.125, write1h: 0.25, read: 0.01 },
+  "claude-fable-5-2":  { input: 8, output: 40, write5m: 10, write1h: 16, read: 0.2 },
   "claude-fable-5-1":  { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 0.25 },
   "claude-mythos-5-1": { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 0.25 },
   "claude-fable-5":    { input: 10, output: 50, write5m: 12.5, write1h: 20, read: 1 },
@@ -1104,7 +1106,7 @@ const APP_MODELS: { id: string; label: string }[] = cfg.appModels || [
 // selectable even when a box's CLI probe reports a shorter menu (a guest missing Fable / Opus 4.8).
 // The id is passed straight to --model, so a model the probe omitted still works.
 const APP_MORE_MODELS: { id: string; label: string }[] = cfg.appMoreModels || [
-  { id: "claude-fable-5-1", label: "Fable 5.1" },
+  { id: "claude-fable-5-2", label: "Fable 5.2" },
   { id: "claude-fable-5", label: "Fable 5" },
   { id: "claude-opus-5-5", label: "Opus 5.5" },
   { id: "claude-opus-5", label: "Opus 5" },
@@ -1142,6 +1144,7 @@ const appCtx: AppCtx = {
   guest: !!cfg.appGuest,
   defaultModel: typeof cfg.appDefaultModel === "string" ? cfg.appDefaultModel : undefined,
   maxEffort: typeof cfg.appMaxEffort === "string" ? cfg.appMaxEffort : undefined,
+  codexModels: Array.isArray(cfg.appCodexModels) ? (cfg.appCodexModels as string[]) : undefined, // GPT ids a guest may use via ct-guest-gate
   board: !!cfg.appBoard, // the team to-do board window and /app/api/board (board.ts)
   sketchDir: typeof cfg.appSketchDir === "string" ? cfg.appSketchDir : undefined, // Sketchpad window + /app/api/sketches
   inventoryFile: typeof cfg.appInventoryFile === "string" ? cfg.appInventoryFile : undefined, // Parts Inventory window + /app/api/inventory

@@ -357,10 +357,11 @@ export function useSpawnedList(sessionId: string | null, local: SpawnedEntry[], 
   const anyRunning = local.some((e) => e.running);
 
   useEffect(() => {
-    if (!sessionId || !active) return;
+    if (!sessionId || sessionId.startsWith("new-")) return;
     let live = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
+    let remoteRunning = false;
     const run = async () => {
       if (!live || dead.current) return;
       setLoading(true);
@@ -368,6 +369,7 @@ export function useSpawnedList(sessionId: string | null, local: SpawnedEntry[], 
         const r = await fetchSpawnedList(sessionId);
         if (!live) return;
         fails.current = 0;
+        remoteRunning = r.some(e => e.running);
         setRemote(r); setErr(null);
       } catch (e: unknown) {
         if (!live) return;
@@ -379,7 +381,7 @@ export function useSpawnedList(sessionId: string | null, local: SpawnedEntry[], 
         if (live) setLoading(false);
       }
       // Re-arm only while something is in flight and the tab is actually being looked at.
-      if (live && !dead.current && anyRunning && !(typeof document !== "undefined" && document.hidden)) {
+      if (live && !dead.current && (active || anyRunning || remoteRunning) && !(typeof document !== "undefined" && document.hidden)) {
         timer = setTimeout(run, POLL_MS);
       }
     };

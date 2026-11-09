@@ -1,3 +1,4 @@
+import { chatTitle } from "../chat-title";
 // Chat-app front-end. A Claude-app-style UI that drives Claude Code through the
 // headless Agent SDK via the /app* routes in app-server.ts. The terminal stays one
 // click away (the "Terminal" link -> "/").
@@ -234,7 +235,7 @@ class SignedOut extends Error {}
 // Cloudflare rejects request bodies over 100 MB on this plan; nginx's client_max_body_size matches.
 // Files larger than one chunk go up in pieces (app-server.ts /app/api/upload, chunked mode), so there
 // is no overall size limit beyond free disk space.
-const UPLOAD_CHUNK = 64 * 1024 * 1024;
+const UPLOAD_CHUNK = 8 * 1024 * 1024;
 // Reject a request that hasn't resolved within `ms`. A hung POST on a weak link never rejects on its
 // own, so without this a send would sit "sending" forever and never fall back to the offline queue.
 function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
@@ -391,7 +392,7 @@ const api = {
   // login page, which a followed fetch reports as a plain network error. Seen unfollowed, it is an
   // opaqueredirect, so the poll can tell "signed out" apart from "link down".
   statuses: () => withTimeout(fetch("/app/api/statuses", { redirect: "manual" }).then((r) => { if (r.type === "opaqueredirect") throw new SignedOut(); return J(r); })),
-  search: (q: string) => withTimeout(fetch(`/app/api/search?q=${encodeURIComponent(q)}`).then(J)),
+  search: (q: string, offset: number, signal: AbortSignal) => withTimeout(fetch(`/app/api/search?q=${encodeURIComponent(q)}&offset=${offset}`, { signal }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })),
   answerAsk: (id: string, askId: string, answer: string) =>
     fetch("/app/api/ask-answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, askId, answer }) }).then(J),
 };
@@ -592,7 +593,7 @@ const contentToText = (c: unknown): string =>
 const EMPTY_ITEMS: Item[] = []; // stable identity for the no-conversation view
 
 export interface StoreHooks {
-  onInit: (store: ConvStore, sessionId: string) => void; // a new-chat temp id learned its real session id
+  onInit: (store: ConvStore, sessionId: string, previousId?: string) => void; // a new-chat temp id learned its real session id
   onResult: (store: ConvStore) => void;                  // a turn finished (reorder the sidebar)
   onEvent: (store: ConvStore, e: AppEvent) => void;      // raw event tap (voice mode + stall clock)
   onContext: (store: ConvStore) => void;                 // refresh the context gauge
@@ -927,8 +928,10 @@ class ConvManager {
     // forever with nothing able to close it. Close it before taking its place.
     const other = this.stores.get(newId);
     if (other && other !== store) other.abandon();
-    this.stores.delete(store.id);
+    const previousId = store.id;
+    this.stores.delete(previousId);
     this.stores.set(newId, store); store.id = newId; store.hydrated = true; store.signal();
+    this.hooks?.onInit(store, newId, previousId);
   }
   // The local store holding a chat that was STARTED offline. It has no server id yet (new-/pending-),
   // so a drained queue item can only be matched back to it by the text of the turn it is waiting on.
@@ -1548,6 +1551,8 @@ function App() {
   const editChipsRef = useRef(false); // the composer chips came from an edited turn (cleared on chat switch)
   const [attachments, setAttachments] = useState<{ name: string; path: string; isImage?: boolean; preview?: string }[]>([]);
   const [uploadError, setUploadError] = useState("");
+  const [uploading, setUploading] = useState(0);
+  const uploadingRef = useRef(0);
   const [drawer, setDrawer] = useState(false);
   // Wide screens: the menu button hides the sidebar instead of opening the drawer. Persisted.
   const [sbHidden, setSbHidden] = useState<boolean>(() => { try { return localStorage.getItem("ct-sidebar-hidden") === "1"; } catch { return false; } });
@@ -1643,6 +1648,7 @@ function App() {
   const [search, setSearch] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   // navigator.onLine lies on flaky mobile (says "online" with no working link). `reachable` is the
   // truth from an actual 4s request heartbeat: false when requests are failing, which lets the banner
@@ -1749,18 +1755,26 @@ function App() {
       }
     })();
   }, []);
+  const listRequestRef = useRef(0);
+  const deletedConvsRef = useRef(new Set<string>());
   const refreshConvs = useCallback(() => {
+    const request = ++listRequestRef.current;
     api.convs(0)
       .then((d) => {
+        if (request !== listRequestRef.current) return;
+        const delegated = new Set<string>(d.delegatedIds || []);
         const list: Conv[] = d.conversations || [];
         const favs: Conv[] = d.favorites || [];
         const merged = dedupeConvs([...favs, ...list]).sort((a, b) => b.mtime - a.mtime); // most-recent first
-        setConvs(merged); offline.cacheList(merged);
+        setConvs((prev) => {
+          const all = dedupeConvs([...merged, ...prev]).filter(c => !deletedConvsRef.current.has(c.sessionId) && !delegated.has(c.sessionId)).sort((a, b) => b.mtime - a.mtime);
+          void offline.cacheList(all); return all;
+        });
         nextOffsetRef.current = typeof d.nextOffset === "number" ? d.nextOffset : list.length;
         setHasMore(!!d.hasMore);
         if (!prewarmedRef.current && merged.length) { prewarmedRef.current = true; setTimeout(() => prewarmCache(merged), 1500); }
       })
-      .catch(async () => { const cached = await offline.getCachedList<Conv[]>(); if (cached) setConvs(cached); }); // offline: serve the last cached list
+      .catch(async () => { const cached = await offline.getCachedList<Conv[]>(); if (cached && request === listRequestRef.current) setConvs(prev => prev.length ? prev : cached); }); // offline: serve the last cached list
   }, [prewarmCache]);
   const loadMoreConvs = useCallback(() => {
     if (loadingMoreRef.current || !hasMore) return;
@@ -1768,7 +1782,8 @@ function App() {
     api.convs(nextOffsetRef.current)
       .then((d) => {
         const more: Conv[] = d.conversations || [];
-        setConvs((prev) => dedupeConvs([...prev, ...more]).sort((a, b) => b.mtime - a.mtime));
+        const delegated = new Set<string>(d.delegatedIds || []);
+        setConvs((prev) => dedupeConvs([...prev, ...more]).filter(c => !deletedConvsRef.current.has(c.sessionId) && !delegated.has(c.sessionId)).sort((a, b) => b.mtime - a.mtime));
         nextOffsetRef.current = typeof d.nextOffset === "number" ? d.nextOffset : nextOffsetRef.current;
         setHasMore(!!d.hasMore);
       })
@@ -2182,6 +2197,35 @@ function App() {
   };
   const onAppTouchEnd = () => { swipe.current = null; };
 
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findIndex, setFindIndex] = useState(0);
+  const [findCount, setFindCount] = useState(0);
+  const findInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const onFind = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && activeIdRef.current && !window.matchMedia("(max-width: 820px)").matches) {
+        e.preventDefault(); setFindOpen(true); setTimeout(() => findInputRef.current?.focus(), 0);
+      }
+    };
+    window.addEventListener("keydown", onFind);
+    return () => window.removeEventListener("keydown", onFind);
+  }, []);
+  useEffect(() => { setFindIndex(0); }, [findQuery, activeId]);
+  useLayoutEffect(() => {
+    const root = scrollRef.current;
+    if (!root) return;
+    root.querySelectorAll(".chat-find-hit").forEach(n => n.classList.remove("chat-find-hit"));
+    if (!findOpen || !findQuery.trim()) { setFindCount(0); return; }
+    stickBottom.current = false; forceBottom.current = false;
+    if (visible < items.length) { setVisible(items.length); return; }
+    const query = findQuery.trim().toLowerCase();
+    const matches = Array.from(root.querySelectorAll(".thread > *")).filter(n => (n.textContent || "").toLowerCase().includes(query));
+    setFindCount(matches.length);
+    const node = matches[((findIndex % matches.length) + matches.length) % matches.length];
+    if (node) { node.classList.add("chat-find-hit"); node.scrollIntoView({ block: "center" }); }
+  }, [findOpen, findQuery, findIndex, items, visible]);
+
   // autoscroll: jump to the end when a conversation is opened, else follow only if near bottom.
   // useLayoutEffect (pre-paint) so a cache->network reconcile re-pins to the bottom BEFORE the browser
   // paints — otherwise the reconcile paints near the top and this yanks it down a second time (the
@@ -2269,7 +2313,13 @@ function App() {
   // context-gauge refresh. Only the active store drives the view side effects.
   useEffect(() => {
     manager.hooks = {
-      onInit: (store, sid) => {
+      onInit: (store, sid, previousId) => {
+        setConvs(cs => {
+          const old = cs.find(c => c.sessionId === previousId || c.sessionId === sid);
+          const first = store.items.find(it => it.kind === "user");
+          const title = old?.title || (first?.kind === "user" ? chatTitle(first.text) : "New chat");
+          return [{ ...old, sessionId: sid, title, cwd: old?.cwd || store.cwd || null, model: store.model || undefined, mtime: Date.now(), pending: false }, ...cs.filter(c => c.sessionId !== previousId && c.sessionId !== sid)];
+        });
         if (store === activeStoreRef.current) { activeIdRef.current = sid; history.replaceState(null, "", `/app?c=${sid}`); }
         setTimeout(refreshConvs, 400);
       },
@@ -2369,7 +2419,7 @@ function App() {
     if (!s.model) s.model = convsRef.current.find((c) => c.sessionId === id)?.model || null;
     setActiveStore(s); activeStoreRef.current = s;
     activeIdRef.current = id;
-    if (switching) setInput(loadDraft(id)); // swap the composer to this conversation's saved draft
+    if (switching) { setInput(loadDraft(id)); setAttachments([]); } // swap the composer to this conversation's saved draft
     if (!resync) {
       setSearch(""); setSearchHits([]); // opening a result clears the search so the full list is back
       stopReadAloud(); setReading(null); // don't keep reading a message from the conversation you just left
@@ -2547,16 +2597,27 @@ function App() {
     return () => clearInterval(t);
   }, []);
 
-  // #region search: debounced content search (title filtering is instant + client-side below)
+  // Search every page, showing early matches while older history is scanned.
   useEffect(() => {
     const q = search.trim();
-    if (q.length < 2) { setSearchHits([]); setSearching(false); return; }
+    setSearchHits([]); setSearchError("");
+    if (q.length < 2) { setSearching(false); return; }
     setSearching(true);
-    let cancelled = false;
-    const t = setTimeout(() => {
-      api.search(q).then((d) => { if (!cancelled) { setSearchHits(d.results || []); setSearching(false); } }).catch(() => { if (!cancelled) setSearching(false); });
-    }, 350);
-    return () => { cancelled = true; clearTimeout(t); };
+    const controller = new AbortController();
+    const t = setTimeout(async () => {
+      let offset = 0;
+      try {
+        do {
+          const d = await api.search(q, offset, controller.signal);
+          if (controller.signal.aborted) return;
+          setSearchHits(prev => [...prev, ...(d.results || [])].filter((h, i, a) => a.findIndex(x => x.sessionId === h.sessionId) === i));
+          if (!d.hasMore || !(d.nextOffset > offset)) break;
+          offset = d.nextOffset;
+        } while (!controller.signal.aborted);
+      } catch (e) { if (!controller.signal.aborted) setSearchError("Search failed. Change the query to retry."); }
+      finally { if (!controller.signal.aborted) setSearching(false); }
+    }, 250);
+    return () => { controller.abort(); clearTimeout(t); };
   }, [search]);
   // #endregion
 
@@ -2578,6 +2639,7 @@ function App() {
     // Stable client id so a redelivery (offline queue OR a timeout requeue) is deduped server-side
     // instead of posting the same turn twice, and so the server's echo of this turn matches it exactly.
     const cid = newId();
+    if (isNewChat) setConvs(cs => [{ sessionId: s!.id, title: chatTitle(text), cwd: cwdRef.current || null, model: modelRef.current || undefined, mtime: Date.now() }, ...cs]);
     s!.addOptimisticUser(text, cid); // renders the turn, flips busy, sets sendState "sending"
     const body = { text, cid, resume: s!.id.startsWith("new-") ? undefined : s!.id, model: (s!.id.startsWith("new-") ? modelRef.current : s!.model) || undefined, cwd: cwdRef.current || undefined, voice: opts?.voice || undefined , settings: startSettings(s!) };
     const queue = async () => {
@@ -2586,8 +2648,8 @@ function App() {
       // placeholder into the sidebar, flagged pending, so it's visible + clearly "waiting to send".
       if (isNewChat) {
         const firstLine = text.replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
-        const pid = "pending-" + Date.now();
-        setConvs((cs) => [{ sessionId: pid, title: firstLine, cwd: cwdRef.current || null, mtime: Date.now(), pending: true, queuedText: text }, ...cs]);
+        const pid = s!.id;
+        setConvs((cs) => [{ sessionId: pid, title: firstLine, cwd: cwdRef.current || null, mtime: Date.now(), pending: true, queuedText: text }, ...cs.filter(c => c.sessionId !== pid)]);
       }
       s!.setBusy(false); s!.setSendState("queued"); // visibly waiting to send, not lost
     };
@@ -2603,6 +2665,7 @@ function App() {
   }, []);
 
   const doSend = async () => {
+    if (uploadingRef.current) return;
     const raw = input.trim();
     if (!raw && !attachments.length) return; // busy is allowed: the turn queues (processed after the current one)
     let text = raw;
@@ -2763,9 +2826,10 @@ function App() {
   };
   const deleteConv = useCallback(async (id: string) => {
     setConvMenu(null);
+    deletedConvsRef.current.add(id);
     setConvs((cs) => cs.filter((c) => c.sessionId !== id)); // optimistic
     void offline.deleteConvCache(id); // drop its cached messages too
-    try { await api.del(id); } catch { refreshConvs(); return; }
+    try { await api.del(id); } catch { deletedConvsRef.current.delete(id); refreshConvs(); return; }
     if (activeIdRef.current === id) newChatRef.current?.();
   }, [refreshConvs]);
   const renameConv = async (id: string, current: string) => {
@@ -2942,11 +3006,19 @@ function App() {
 
   const addFiles = async (files: File[]) => {
     setUploadError("");
+    const target = activeIdRef.current;
+    uploadingRef.current += files.length; setUploading(uploadingRef.current);
     for (const f of files) {
       const isImage = f.type.startsWith("image/");
-      const preview = isImage ? URL.createObjectURL(f) : undefined; // local thumbnail, no server round-trip
-      try { const r = await api.upload(activeId, f); setAttachments((a) => [...a, { name: f.name, path: r.path, isImage, preview }]); }
-      catch (e: any) { if (preview) URL.revokeObjectURL(preview); setUploadError(String(e?.message || e)); }
+      const preview = isImage ? URL.createObjectURL(f) : undefined;
+      try {
+        const r = await api.upload(target, f);
+        if (activeIdRef.current !== target) {
+          if (preview) URL.revokeObjectURL(preview);
+          setUploadError(`${f.name} uploaded to ${r.path}. Chat changed; attach it in the intended chat.`);
+        } else setAttachments(a => [...a, { name: f.name, path: r.path, isImage, preview }]);
+      } catch (e: any) { if (preview) URL.revokeObjectURL(preview); setUploadError(String(e?.message || e)); }
+      finally { uploadingRef.current--; setUploading(uploadingRef.current); }
     }
   };
   // The Sketchpad (sketch.tsx) saves a drawing on the server, then hands its path here to attach.
@@ -3384,7 +3456,8 @@ function App() {
                   <div className="hit-snippet">{h.snippet}</div>
                 </div>
               ))}
-              {!titleMatches.length && !contentMatches.length && !searching && <div className="conv-group-label">No matches</div>}
+              {searchError && <div className="conv-group-label" role="alert">{searchError}</div>}
+              {!titleMatches.length && !contentMatches.length && !searching && !searchError && <div className="conv-group-label">No matches</div>}
             </div>
           ) : (
             <>
@@ -3414,7 +3487,15 @@ function App() {
       </aside>
 
       <main className="main">
+        {findOpen && <div className="chat-find" role="search">
+          <input ref={findInputRef} autoFocus aria-label="Find in this chat" placeholder="Find in this chat" value={findQuery} onChange={e => { setFindQuery(e.target.value); setFindIndex(0); }} onKeyDown={e => { if (e.key === "Escape") setFindOpen(false); if (e.key === "Enter") { e.preventDefault(); setFindIndex(i => i + (e.shiftKey ? -1 : 1)); } }} />
+          <span role="status">{findCount ? ((findIndex % findCount + findCount) % findCount) + 1 : 0} / {findCount}</span>
+          <button disabled={!findCount} aria-label="Previous match" onClick={() => setFindIndex(i => i - 1)}>↑</button>
+          <button disabled={!findCount} aria-label="Next match" onClick={() => setFindIndex(i => i + 1)}>↓</button>
+          <button aria-label="Close find" onClick={() => setFindOpen(false)}>×</button>
+        </div>}
         <div className="topbar">
+          {activeId && <button className="icon-btn chat-find-toggle" title="Find in this chat (Ctrl/Cmd+F)" aria-label="Find in this chat" onClick={() => { setFindOpen(v => !v); setTimeout(() => findInputRef.current?.focus(), 0); }}>⌕</button>}
           <button className="icon-btn" onClick={toggleSidebar} aria-label="Menu" title="Show or hide conversations">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
           </button>
@@ -3486,7 +3567,7 @@ function App() {
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M6 13l6 6 6-6" /></svg>
             </button>
           )}
-          <SpawnedWork items={items} sessionId={activeId} onJump={jumpToAgent} onOpenConversation={loadConv} />
+          <SpawnedWork items={items} sessionId={activeId} busy={busy} onJump={jumpToAgent} onOpenConversation={loadConv} />
           {todos && !desktopMode && <TodoChecklist todos={todos} />}
           {editing && (
             <div className={"edit-banner" + (editError ? " error" : "")} role={editError ? "alert" : undefined}>
@@ -3592,6 +3673,7 @@ function App() {
               )}
           </div>
           <div className={"composer" + (dragOver ? " drag-over" : "") + (ringMode ? " ultra-on ultra-" + ringMode.slice(5) : "")} onDrop={onDrop} onDragOver={onDragOver} onDragLeave={() => setDragOver(false)}>
+            {uploading > 0 && <div className="attach-err" role="status">Uploading {uploading} file{uploading === 1 ? "" : "s"}…</div>}
             {uploadError && (
               <div className="attach-err" role="alert">
                 <span>{uploadError}</span>
@@ -3665,7 +3747,7 @@ function App() {
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
                 </button>
               )}
-              <button className="send-btn" onClick={doSend} disabled={!input.trim() && !attachments.length} title={busy ? "Queue this message (sent after the current turn)" : "Send"}>
+              <button className="send-btn" onClick={doSend} disabled={uploading > 0 || (!input.trim() && !attachments.length)} title={busy ? "Queue this message (sent after the current turn)" : "Send"}>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 20V5M6 11l6-6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
               </button>
             </div>

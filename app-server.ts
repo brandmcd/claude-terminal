@@ -1,3 +1,4 @@
+import { chatTitle, isAttachmentTitle } from "./chat-title";
 // app-server.ts
 // HTTP routes for the chat-app front-end (the "looks like the Claude app" interface).
 // Kept in its own module so the shared server.ts gains only a one-line hook (same tactic
@@ -5,6 +6,7 @@
 // to this sidecar, and /_ct/app* strips to the same). Returns a Response for an app route,
 // or null to let server.ts keep matching its own routes.
 
+import { delegationIndex } from "./delegated";
 import { dirname, join, resolve, basename } from "path";
 import { homedir } from "os";
 import { readdirSync, statSync, unlinkSync, rmSync, readFileSync, writeFileSync, mkdirSync, truncateSync, promises as fsp } from "fs";
@@ -15,8 +17,8 @@ import { listSpawned, getSpawnedTranscript, type SpawnedCtx } from "./spawned";
 import { applyOp, readBoard, type Op } from "./board";
 import { getOrCreate, get, discard, liveStatuses, replayTranscript, decorateVoiceTurn, cleanDictation, warmDictation, getSubscriptionUsage, getCapabilities, resolveEditPoints, onModelChoice, builtinMcpNames, type AppEvent, type AskNotifier, type SessionSettings } from "./app-runner";
 
-import { getCodexModels, getCodexUsage, getCodexUsageReady, isCodexModel, isCodexTranscriptPath, listCodexConversations, findCodexTranscript, codexMeta, replayCodexTranscript, deleteCodexConversation, forkCodexConversation } from "./codex-runner";
-import { readHandoff, handoffAtPath, findHandoff, listHandoffs, deleteHandoff, createHandoff, readLaunchContext, saveLaunchContext, deleteLaunchContext } from "./provider-handoff";
+import { getCodexModels, getCodexUsage, getCodexUsageReady, isCodexModel, codexModelId, isCodexTranscriptPath, listCodexConversations, findCodexTranscript, codexMeta, replayCodexTranscript, deleteCodexConversation, forkCodexConversation } from "./codex-runner";
+import { continuedChatIds, readHandoff, handoffAtPath, findHandoff, listHandoffs, deleteHandoff, createHandoff, readLaunchContext, saveLaunchContext, deleteLaunchContext } from "./provider-handoff";
 
 async function replayAny(path: string): Promise<AppEvent[]> {
   const h = handoffAtPath(path);
@@ -58,6 +60,7 @@ export interface AppCtx {
   moreModels: { id: string; label: string }[]; // the "Other…" dialog list
   guest?: boolean; // cfg.appGuest: hide Fable, lead with defaultModel, and tell the client to show only the chat
   defaultModel?: string; // cfg.appDefaultModel: what a new chat runs on when the client names no model
+  codexModels?: string[]; // cfg.appCodexModels: GPT ids a guest may pick (FTC and FRC accounts, 2026-11-06)
   maxEffort?: string; // cfg.appMaxEffort: highest effort the menu offers and the server accepts (FTC accounts: "xhigh")
   board?: boolean; // cfg.appBoard: serve the team to-do board (board.ts) and show its window
   sketchDir?: string; // cfg.appSketchDir: where the Sketchpad window saves PNGs; unset hides the window
@@ -82,6 +85,10 @@ export interface AppCtx {
 // twice. In-memory + short TTL: a redelivery only races within a few seconds of the original.
 // Models a guest instance may not pick (ct-guest-gate refuses them too).
 const GUEST_BLOCKED = /fable/i;
+// A guest reaches Codex only when its config lists GPT ids (cfg.appCodexModels), and only those ids.
+// Its Codex CLI talks to ct-guest-gate, which holds the owner login and enforces the weekly cap.
+const codexOff = (ctx: AppCtx) => !!ctx.guest && !ctx.codexModels?.length;
+const codexBlocked = (ctx: AppCtx, model?: string | null) => !!model && isCodexModel(model) && !!ctx.guest && !ctx.codexModels?.includes(codexModelId(model));
 const seenSends = new Map<string, { at: number; id: string }>();
 // Where delete-from keeps the transcript tail it cut off, one file per delete (outside the projects
 // dir so no collector or conversation list ever reads it).
@@ -164,7 +171,7 @@ async function saveAutoTitles(file: string) { if (autoTitleMap) await Bun.write(
 // Effective sidebar title: a user rename wins, then the cached AI title, then the CLI summary, then
 // the stripped first line. Never null for a conversation that has any user text.
 function pickTitle(id: string, meta: { title: string | null; first?: string | null; aiTitle?: string | null }, titles: Record<string, string>, autos: Record<string, string>): string | null {
-  return titles[id] || meta.aiTitle || autos[id] || meta.title || meta.first || null;
+  return titles[id] || readLaunchContext(id)?.options.handoffTitle || [meta.aiTitle, autos[id], meta.title].find(title => title && !isAttachmentTitle(title)) || (meta.first ? chatTitle(meta.first) : null);
 }
 // #endregion (title generation now rides the first turn inline; see app-runner TITLE_DIRECTIVE)
 
@@ -249,9 +256,11 @@ async function listConversations(ctx: AppCtx): Promise<{ path: string; sessionId
   await Promise.all(rows.map(async (r) => {
     if (now - r.statMtime < RECENT_MS) r.mtime = await lastActivityMs(r.path, r.size, r.statMtime);
   }));
-  const all = [...rows, ...(!ctx.guest ? await listCodexConversations() : []), ...(!ctx.guest ? listHandoffs() : [])];
+  const all = [...rows, ...(!codexOff(ctx) ? await listCodexConversations() : []), ...(!ctx.guest ? listHandoffs() : [])];
   all.sort((a, b) => b.mtime - a.mtime);
-  return all;
+  const delegated = delegationIndex().children;
+  const continued = continuedChatIds(new Set(all.map(row => row.sessionId)));
+  return all.filter(row => !delegated.has(row.sessionId) && !continued.has(row.sessionId));
 }
 
 // Pull a title + cwd from a transcript. Cached on size+mtime: the conversations list calls this
@@ -291,7 +300,7 @@ async function readConvMeta(path: string): Promise<ConvMeta> {
       const c = o.message.content;
       let txt = typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join("") : "";
       txt = txt.replace(HIDDEN_TAG, "").trim(); // drop the appended <turn-context>/<voice-mode> block
-      if (txt && !txt.startsWith("<")) first = txt.replace(/\s+/g, " ").slice(0, 400);
+      if (txt && !txt.startsWith("<")) first = txt.slice(0, 16000);
     }
     if (!aiTitle && o.type === "assistant" && o.message) {
       const c = o.message.content;
@@ -305,7 +314,7 @@ async function readConvMeta(path: string): Promise<ConvMeta> {
 
 function findTranscript(ctx: AppCtx, sessionId: string): { path: string; project: string } | null {
   if (!/^[A-Za-z0-9-]{6,}$/.test(sessionId)) return null;
-  if (sessionId.startsWith("codex-")) return ctx.guest ? null : findCodexTranscript(sessionId);
+  if (sessionId.startsWith("codex-")) return codexOff(ctx) ? null : findCodexTranscript(sessionId);
   if (sessionId.startsWith("handoff-")) return ctx.guest ? null : findHandoff(sessionId);
   let projects: string[] = [];
   try { projects = readdirSync(ctx.dataDir); } catch { return null; }
@@ -527,7 +536,14 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     }
     models = models.map((m) => ({ ...m, provider: "claude" as const }));
     moreModels = moreModels.map((m) => ({ ...m, provider: "claude" as const }));
-    if (!ctx.guest) { try { models = [...models, ...await getCodexModels()]; } catch {} }
+    if (!codexOff(ctx)) {
+      try {
+        let codex = await getCodexModels();
+        if (ctx.guest) codex = codex.filter((m) => ctx.codexModels!.includes(m.id));
+        if (ctx.maxEffort) codex = codex.map((m) => ({ ...m, supportedEffortLevels: (m.supportedEffortLevels || []).filter((lv) => effortAllowed(ctx, lv)) }));
+        models = [...models, ...codex];
+      } catch {}
+    }
     // The default model a NEW chat starts on, on a device that has not picked one: the user's CLI
     // default from ~/.claude/settings.json, so one setting drives the terminal and the app. A guest
     // instance uses its configured appDefaultModel instead (its menu already leads with it).
@@ -655,7 +671,24 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
   if (req.method === "GET" && path === "/app/api/spawned") {
     const id = new URL(req.url).searchParams.get("id") || "";
     try {
-      const r = await listSpawned(spawnCtx, id);
+      let r = await listSpawned(spawnCtx, id);
+      if ("error" in r && r.error === "not found" && findTranscript(ctx, id))
+        r = { sessionId: id, items: [], counts: { subagent: 0, workflow: 0, tab: 0 }, warnings: [] };
+      if (!("error" in r)) {
+        for (const child of delegationIndex().descendants(id)) {
+          const transcript = findTranscript(ctx, child.id);
+          if (!transcript) continue;
+          const meta = await convMeta(transcript.path);
+          const live = get(child.id);
+          let bytes = 0, mtime = 0;
+          try { const st = statSync(transcript.path); bytes = st.size; mtime = st.mtimeMs; } catch {}
+          r.items.push({ key: `delegated:${child.id}`, kind: "subagent", label: (meta.aiTitle || meta.title || meta.first || child.model || "Delegated agent").slice(0, 160),
+            detail: child.model || meta.model || null, toolUseId: null,
+            status: live?.busy || live?.listPendingAsks().length ? "running" : "unknown", statusFrom: live?.busy ? "Agent is working" : "Open transcript for the agent's result",
+            startedAt: null, endedAt: null, durationMs: null, mtime, bytes, hasTranscript: true, resultPreview: null });
+          r.counts.subagent++;
+        }
+      }
       if ("error" in r) return jsonRes(r, ctx, req, r.error === "not found" ? 404 : 400);
       return jsonRes(r, ctx, req);
     } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 400); }
@@ -667,6 +700,16 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     const sinceRaw = u.searchParams.get("since");
     const since = sinceRaw == null ? null : parseInt(sinceRaw, 10);
     try {
+      if (key.startsWith("delegated:")) {
+        const child = delegationIndex().descendants(id).find(row => `delegated:${row.id}` === key);
+        const transcript = child && findTranscript(ctx, child.id);
+        if (!child || !transcript) return jsonRes({ error: "not found" }, ctx, req, 404);
+        const events = await replayAny(transcript.path);
+        const meta = await convMeta(transcript.path);
+        // Replayed streams can coalesce text blocks; always send a complete snapshot.
+        return jsonRes({ sessionId: id, key, kind: "subagent", label: meta.aiTitle || meta.title || meta.first || "Delegated agent", detail: child.model || null,
+          cwd: meta.cwd, events, delta: false, evTotal: events.length, truncated: false, bytes: statSync(transcript.path).size, synthesized: false, note: null }, ctx, req);
+      }
       const r = await getSpawnedTranscript(spawnCtx, id, key, Number.isInteger(since as number) ? (since as number) : null);
       if ("error" in r) return jsonRes({ error: r.error }, ctx, req, r.status || 400);
       return jsonRes(r, ctx, req);
@@ -880,7 +923,7 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
       const favIds = await loadFavs(ctx.favoritesFile);
       const present = new Set(out.map((o) => o.sessionId));
       for (const id of favIds) {
-        if (present.has(id)) continue;
+        if (present.has(id) || delegationIndex().children.has(id) || continuedChatIds(new Set(rows.map(row => row.sessionId))).has(id)) continue;
         const t = findTranscript(ctx, id);
         if (!t) continue;
         const meta = await convMeta(t.path);
@@ -894,7 +937,7 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
         favorites.push({ sessionId: id, title, cwd: meta.cwd, mtime, project: t.project });
       }
     }
-    return jsonRes({ conversations: out, favorites, nextOffset: i, hasMore }, ctx, req);
+    return jsonRes({ conversations: out, favorites, nextOffset: i, hasMore, delegatedIds: [...delegationIndex().children.keys(), ...continuedChatIds(new Set(rows.map(row => row.sessionId)))] }, ctx, req);
   }
 
   // Delete a conversation: remove its transcript (+ any subagents sidecar dir) and drop it from
@@ -918,37 +961,40 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     return jsonRes({ ok: true }, ctx, req);
   }
 
-  // Full-text message search across conversations. Title matching is done client-side
-  // (instant, offline-friendly); this searches message CONTENT and returns a snippet +
-  // match count per conversation so you can find a specific message.
+  // Search in bounded pages so old chats remain searchable without one huge request.
   if (req.method === "GET" && path === "/app/api/search") {
-    const q = (new URL(req.url).searchParams.get("q") || "").trim().toLowerCase();
-    if (q.length < 2) return jsonRes({ results: [], q }, ctx, req);
+    const url = new URL(req.url);
+    const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+    if (q.length < 2) return jsonRes({ results: [], q, hasMore: false }, ctx, req);
+    const offset = Math.max(0, Math.floor(Number(url.searchParams.get("offset")) || 0));
     const titles = await loadTitles(ctx.titlesFile);
     const autoTitles = await loadAutoTitles(ctx.autoTitlesFile);
-    const rows = (await listConversations(ctx)).slice(0, 200); // recent-first
+    const rows = await listConversations(ctx);
     const results: { sessionId: string; title: string; cwd: string | null; mtime: number; snippet: string; count: number }[] = [];
-    for (const r of rows) {
-      let text: string;
-      try { text = await Bun.file(r.path).text(); } catch { continue; }
-      if (!text.toLowerCase().includes(q) && !readLaunchContext(r.sessionId)?.events.length) continue;
+    const deadline = Date.now() + 750;
+    let i = offset;
+    for (; i < rows.length && i < offset + 50; i++) {
+      if (req.signal.aborted || (i > offset && Date.now() >= deadline)) break;
+      const r = rows[i];
+      const meta = await convMeta(r.path);
+      if (ctx.historyHide.some(h => (meta.cwd || "").startsWith(h))) continue;
+      const title = pickTitle(r.sessionId, meta, titles, autoTitles) || "(untitled)";
       let count = 0, snippet = "";
-      const searchEvents = await replayAny(r.path);
-      for (const event of searchEvents) {
+      // Match decoded, reconstructed messages: raw JSON misses escaped characters and
+      // words split across streaming deltas (especially Codex transcripts).
+      for (const event of await replayAny(r.path)) {
         const msg = event.t === "user" || event.t === "text" ? event.text : "";
-        if (!msg) continue;
         const idx = msg.toLowerCase().indexOf(q);
         if (idx < 0) continue;
         count++;
-        if (!snippet) { const s = Math.max(0, idx - 40); snippet = (s > 0 ? "…" : "") + msg.slice(s, idx + q.length + 70).replace(/\s+/g, " ").trim() + "…"; }
+        if (!snippet) {
+          const start = Math.max(0, idx - 40), end = Math.min(msg.length, idx + q.length + 90);
+          snippet = (start ? "…" : "") + msg.slice(start, end).replace(/\s+/g, " ").trim() + (end < msg.length ? "…" : "");
+        }
       }
-      if (!count) continue; // matched only in system/metadata lines
-      const meta = await convMeta(r.path);
-      if (ctx.historyHide.some((h) => (meta.cwd || "").startsWith(h))) continue;
-      results.push({ sessionId: r.sessionId, title: titles[r.sessionId] || meta.aiTitle || autoTitles[r.sessionId] || meta.title || meta.first || "(untitled)", cwd: meta.cwd, mtime: r.mtime, snippet, count });
-      if (results.length >= 40) break;
+      if (count || title.toLowerCase().includes(q)) results.push({ sessionId: r.sessionId, title, cwd: meta.cwd, mtime: r.mtime, snippet: snippet || "Matched conversation title", count });
     }
-    return jsonRes({ results, q }, ctx, req);
+    return jsonRes({ results, q, nextOffset: i, hasMore: i < rows.length }, ctx, req);
   }
 
   // Replay a past conversation into the normalized event list the UI renders.
@@ -1010,13 +1056,14 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     const previous = stored ? await convMeta(stored.path) : null;
     let model: string | undefined = typeof b.model === "string" && b.model ? b.model : previous?.model || ctx.defaultModel;
     if (resume && !stored && !get(resume)) return jsonRes({ error: "Conversation not found" }, ctx, req, 404);
-    if (ctx.guest && (isCodexModel(model) || resume?.startsWith("codex-") || resume?.startsWith("handoff-"))) return jsonRes({ error: "Codex is available only to the owner account." }, ctx, req, 403);
+    if ((codexOff(ctx) && (isCodexModel(model) || resume?.startsWith("codex-"))) || (ctx.guest && resume?.startsWith("handoff-"))) return jsonRes({ error: "Codex is available only to the owner account." }, ctx, req, 403);
+    if (codexBlocked(ctx, model)) return jsonRes({ error: "This model is unavailable for this account." }, ctx, req, 403);
     if (resume && previous?.model && isCodexModel(model) !== isCodexModel(previous.model)) return jsonRes({ error: "Use the model selector to transfer this conversation to another provider." }, ctx, req, 409);
     if (ctx.guest && model && GUEST_BLOCKED.test(model)) return jsonRes({ error: "This account cannot use Fable. Pick another model." }, ctx, req, 400);
     // if already live under this session id, just send into it
     const existing = resume ? get(resume) : undefined;
     if (existing) { tlog("accept", { route: "start", conv: existing.id, cid: shortCid(b.cid), chars: text.length, mode: "resumed-live" }); existing.setClientTz(b.tz); existing.send(text, typeof b.cid === "string" ? b.cid : undefined); dedupRecord(b.cid, existing.id); return jsonRes({ id: existing.id, resumed: true }, ctx, req); }
-    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile, settings: sessionSettingsFrom(b.settings, ctx) || previous?.settings, sharedTools: ctx.sharedTools, agentDepth: b.agentDepth || 0, parentSession: typeof b.parentSession === "string" ? b.parentSession : undefined });
+    const conv = getOrCreate(resume || null, { cwd, model, resume, notifier: ctx.notifyAsk, mcpFile: ctx.mcpFile, settings: sessionSettingsFrom(b.settings, ctx) || previous?.settings, sharedTools: ctx.sharedTools, agentDepth: b.agentDepth || 0, parentSession: typeof b.parentSession === "string" ? (get(b.parentSession)?.id || b.parentSession) : undefined });
     tlog("accept", { route: "start", conv: conv.id, cid: shortCid(b.cid), chars: text.length, mode: resume ? "resume" : "new" });
     conv.setClientTz(b.tz);
     void conv.run(text, typeof b.cid === "string" ? b.cid : undefined);
@@ -1035,7 +1082,7 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     if (id.startsWith("codex-")) {
       const fork = await forkCodexConversation(id);
       const seed = readLaunchContext(id);
-      if (seed) saveLaunchContext(fork.id, { ...seed.options, resume: fork.id }, seed.events);
+      if (seed) saveLaunchContext(fork.id, { ...seed.options, resume: fork.id, handoffFork: true }, seed.events);
       return jsonRes({ ok: true, ...fork }, ctx, req);
     }
     if (id.startsWith("handoff-")) {
@@ -1054,7 +1101,7 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     if (!out.length) return jsonRes({ error: "transcript is empty" }, ctx, req, 409);
     await Bun.write(join(ctx.dataDir, found.project, newId + ".jsonl"), out.join("\n") + "\n");
     const seed = readLaunchContext(id);
-    if (seed) saveLaunchContext(newId, { ...seed.options, resume: newId }, seed.events);
+    if (seed) saveLaunchContext(newId, { ...seed.options, resume: newId, handoffFork: true }, seed.events);
     const titles = await loadTitles(ctx.titlesFile);
     const base = pickTitle(id, await convMeta(found.path), titles, await loadAutoTitles(ctx.autoTitlesFile));
     titles[newId] = ((base || "Chat").replace(/ \(fork\)$/, "") + " (fork)").slice(0, 200);
@@ -1159,12 +1206,14 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     const meta = found ? await convMeta(found.path) : null;
     if (!conv && !found) return jsonRes({ error: "conversation not found" }, ctx, req, 404);
     if (typeof b.model !== "string" || !b.model) return jsonRes({ error: "model required" }, ctx, req, 400);
-    if (ctx.guest && (GUEST_BLOCKED.test(b.model) || isCodexModel(b.model))) return jsonRes({ error: "This model is unavailable for this account." }, ctx, req, 403);
+    if (ctx.guest && (GUEST_BLOCKED.test(b.model) || (codexOff(ctx) && isCodexModel(b.model)) || codexBlocked(ctx, b.model))) return jsonRes({ error: "This model is unavailable for this account." }, ctx, req, 403);
     if (isCodexModel(conv?.model || meta?.model) !== isCodexModel(b.model)) {
+      // Guests have no provider handoffs, so a switch between Claude and GPT needs a new chat.
+      if (ctx.guest) return jsonRes({ error: "Start a new chat to switch between Claude and GPT models." }, ctx, req, 409);
       if (conv?.busy || conv?.listPendingAsks().length) return jsonRes({ error: "Stop or finish the current turn before changing providers." }, ctx, req, 409);
       const events = found ? await replayAny(found.path) : [];
       try {
-        const h = createHandoff(id, b.model, conv?.cwd || meta?.cwd || ctx.defaultCwd, meta?.aiTitle || meta?.title || meta?.first || "Continued chat", events);
+        const h = createHandoff(id, b.model, conv?.cwd || meta?.cwd || ctx.defaultCwd, pickTitle(id, meta || { title: null }, await loadTitles(ctx.titlesFile), await loadAutoTitles(ctx.autoTitlesFile)) || "Continued chat", events);
         return jsonRes({ ok: true, id: h.id, model: h.model, forked: true }, ctx, req);
       } catch (e: any) { return jsonRes({ error: e.message }, ctx, req, 400); }
     }
@@ -1220,6 +1269,17 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     return jsonRes({ ok: !!conv }, ctx, req);
   }
 
+  if (req.method === "POST" && path === "/app/api/email-compose") {
+    try {
+      const b = await req.json() as any;
+      const conv = b.id ? get(String(b.id)) : undefined;
+      if (!conv || !("composeEmail" in conv)) return jsonRes({ error: "Active Codex conversation required" }, ctx, req, 400);
+      const { id, ...draft } = b;
+      const result = await (conv as any).composeEmail(draft);
+      return jsonRes({ result }, ctx, req);
+    } catch (error) { return jsonRes({ error: String(error) }, ctx, req, 400); }
+  }
+
   // The user tapped an option for an ask_user prompt -> unblock the tool + let Claude continue.
   if (req.method === "POST" && path === "/app/api/ask-answer") {
     let b: any = {}; try { b = await req.json(); } catch {}
@@ -1239,9 +1299,11 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     const file = form.get("file");
     const id = String(form.get("id") || "");
     const conv = id ? get(id) : undefined;
-    const cwd = conv?.cwd || ctx.defaultCwd;
+    let cwd = conv?.cwd;
+    if (!cwd && id) { const t = findTranscript(ctx, id); if (t) cwd = (await convMeta(t.path)).cwd || undefined; }
+    cwd ||= ctx.defaultCwd;
     if (!(file instanceof File)) return jsonRes({ error: "no file" }, ctx, req, 400);
-    const safe = file.name.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "upload";
+    const safe = file.name.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 120) || "upload";
     const destDir = join(cwd, "uploads");
     // Never overwrite an earlier upload. iOS names every camera capture "image.jpg", so writing to the
     // bare name replaced the previous photo and every older chat that showed one rendered the newest.
@@ -1263,13 +1325,20 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
       if (!/^[A-Za-z0-9-]{8,64}$/.test(uploadId)) return jsonRes({ error: "bad uploadId" }, ctx, req, 400);
       const offset = Number(form.get("offset"));
       const part = join(destDir, `.${safe}.${uploadId}.part`);
+      const receipt = part + ".done";
+      // A lost final response must not turn a successfully completed upload into a 409.
+      try {
+        const saved = JSON.parse(await Bun.file(receipt).text());
+        if (form.get("done") === "1" && saved.size === offset + file.size && await Bun.file(saved.path).exists()) return jsonRes({ ok: true, path: saved.path }, ctx, req);
+        return jsonRes({ error: "upload already completed" }, ctx, req, 409);
+      } catch { /* no completion receipt yet */ }
       let have = 0; try { have = statSync(part).size; } catch {}
       if (!Number.isSafeInteger(offset) || offset < 0 || offset > have) return jsonRes({ error: `bad offset ${offset}, have ${have}` }, ctx, req, 409);
       try {
         mkdirSync(destDir, { recursive: true });
         const fh = await fsp.open(part, offset === 0 ? "w" : "r+");
         try { await fh.write(new Uint8Array(await file.arrayBuffer()), 0, file.size, offset); } finally { await fh.close(); }
-        if (form.get("done") === "1") { const dest = await claimName(); await fsp.rename(part, dest); return jsonRes({ ok: true, path: dest }, ctx, req); }
+        if (form.get("done") === "1") { const dest = await claimName(); await fsp.rename(part, dest); await Bun.write(receipt, JSON.stringify({ path: dest, size: offset + file.size })); return jsonRes({ ok: true, path: dest }, ctx, req); }
       } catch (e: any) { return jsonRes({ error: String(e?.message || e) }, ctx, req, 500); }
       return jsonRes({ ok: true, received: offset + file.size }, ctx, req);
     }
@@ -1394,7 +1463,9 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     let base = conv?.cwd || undefined;
     if (!base && /^[A-Za-z0-9-]{6,}$/.test(id)) { const t = findTranscript(ctx, id); if (t) base = (await convMeta(t.path)).cwd || undefined; }
     base = base || ctx.defaultCwd;
-    const relPath = /^~(\/|$)/.test(rel) ? join(process.env.HOME || homedir(), rel.slice(1)) : rel;
+    // Coding agents commonly link /path/file.ts:42; the suffix is a line reference.
+    const fileRel = rel.replace(/:(\d+)(?::\d+)?$/, "");
+    const relPath = /^~(\/|$)/.test(fileRel) ? join(process.env.HOME || homedir(), fileRel.slice(1)) : fileRel;
     const target = resolve(relPath.startsWith("/") ? relPath : join(base, relPath));
     const under = (root: string) => target === root || target.startsWith(root.replace(/\/+$/, "") + "/");
     if (!under(base) && !ctx.downloadRoots.some(under)) return jsonRes({ error: "path outside conversation" }, ctx, req, 403);
@@ -1418,7 +1489,9 @@ async function handleAppRoutes(req: Request, path: string, ctx: AppCtx): Promise
     base = base || ctx.defaultCwd;
     // "~/vault/note.md" is how Claude routinely writes a path; expand it before resolving, or it
     // lands under the chat's cwd and 404s. The traversal guard below still applies.
-    const relPath = /^~(\/|$)/.test(rel) ? join(process.env.HOME || homedir(), rel.slice(1)) : rel;
+    // Coding agents commonly link /path/file.ts:42; the suffix is a line reference.
+    const fileRel = rel.replace(/:(\d+)(?::\d+)?$/, "");
+    const relPath = /^~(\/|$)/.test(fileRel) ? join(process.env.HOME || homedir(), fileRel.slice(1)) : fileRel;
     let target = resolve(relPath.startsWith("/") ? relPath : join(base, relPath)); // resolve() so a ".." in the path cannot walk out of a root
     // Traversal guard. The chat's own cwd always counts; the configured roots cover the rest of the
     // owner's filesystem, so a file Claude wrote outside the directory the chat happens to sit in

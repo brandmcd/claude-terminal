@@ -11,6 +11,13 @@ export function readLaunchContext(id: string): LaunchContext | null {
   if (!/^[A-Za-z0-9-]{6,}$/.test(id)) return null;
   try { return JSON.parse(readFileSync(join(contextDir, id + ".json"), "utf8")); } catch { return null; }
 }
+export function listLaunchContexts(): { id: string; context: LaunchContext }[] {
+  try { return readdirSync(contextDir).flatMap(name => {
+    const id = name.replace(/\.json$/, "");
+    const context = name.endsWith(".json") ? readLaunchContext(id) : null;
+    return context ? [{ id, context }] : [];
+  }); } catch { return []; }
+}
 export function saveLaunchContext(id: string, options: ConvOpts, events: AppEvent[] = []) {
   if (!/^[A-Za-z0-9-]{6,}$/.test(id)) return;
   mkdirSync(contextDir, { recursive: true, mode: 0o700 });
@@ -36,6 +43,29 @@ export function listHandoffs() {
     const h = readHandoff(f.replace(/\.json$/, ""));
     return h ? [{ path: join(dir, f), sessionId: h.id, project: "provider-handoff", mtime: h.mtime }] : [];
   }); } catch { return []; }
+}
+// A model change continues a conversation. Keep its old transcript addressable,
+// but don't make the user navigate both halves in the sidebar.
+export function continuedChatIds(visibleIds: Set<string>): Set<string> {
+  const hidden = new Set<string>();
+  const sources = new Map<string, string>();
+  for (const { id, context } of listLaunchContexts()) {
+    if (context.options.handoffFork) continue;
+    const source = context.options.handoffContext?.match(/The original chat remains available as ([A-Za-z0-9-]+)\./)?.[1];
+    if (source && source !== id) sources.set(id, source);
+  }
+  for (const row of listHandoffs()) {
+    const h = readHandoff(row.sessionId);
+    if (h && !h.title.endsWith(" (fork)")) sources.set(h.id, h.source);
+  }
+  for (const id of visibleIds) {
+    const seen = new Set([id]);
+    let source = sources.get(id);
+    while (source && !seen.has(source)) {
+      seen.add(source); hidden.add(source); source = sources.get(source);
+    }
+  }
+  return hidden;
 }
 export function deleteHandoff(id: string) {
   if (readHandoff(id)) unlinkSync(join(dir, id + ".json"));

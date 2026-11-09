@@ -1,13 +1,18 @@
+import { resolveAttachments, emailSignatures, emailSenders, emailAnswerText, type EmailDraft } from "./app-runner.ts";
+import { mcpServersForQuery } from "./app-mcp.ts";
+import { chatTitle, providerChatTitle } from "./chat-title";
+import { CODEX_TITLE_REQUEST, CodexTitleStream } from "./codex-title";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { createEmailGate } from "./codex-email-gate.ts";
 import { CodexClient, type RpcMessage } from "./codex-client.ts";
 import { sharedMcpConfig, sharedInstructions, richChatInstructions } from "./shared-mcp.ts";
 import type { AppEvent, AppModel, ConvOpts, LiveStatus, PendingAsk, Phase, SessionSettings, TurnUsage } from "./app-runner.ts";
 
 type Event = AppEvent & { _seq?: number };
-type Metadata = { id: string; threadId?: string; cwd: string; model?: string; title: string; first: string; createdAt: number; updatedAt: number; settings: SessionSettings; mode?: "plan" | "default"; sharedTools?: ConvOpts["sharedTools"]; agentDepth?: number; parentSession?: string; handoffContext?: string };
+type Metadata = { id: string; threadId?: string; cwd: string; model?: string; title: string; generatedTitle?: boolean; first: string; createdAt: number; updatedAt: number; settings: SessionSettings; mode?: "plan" | "default"; sharedTools?: ConvOpts["sharedTools"]; agentDepth?: number; parentSession?: string; handoffContext?: string };
 type Sub = (event: AppEvent) => void;
 const ID = /^codex-[a-f0-9-]{36}$/i;
 const stateDir = () => process.env.CODEX_APP_STATE_DIR || join(process.env.CODEX_HOME || join(homedir(), ".codex"), "ct-app");
@@ -110,6 +115,7 @@ export class CodexConversation {
   lastUsage?: TurnUsage;
   private meta: Metadata;
   private client?: CodexClient;
+  private emailGate?: Awaited<ReturnType<typeof createEmailGate>>;
   private booting?: Promise<void>;
   private closed = false;
   private phaseSince = Date.now();
@@ -122,6 +128,7 @@ export class CodexConversation {
   private turnDone?: () => void;
   private queue = Promise.resolve();
   private streamed = new Set<string>();
+  private titleStreams = new Map<string, CodexTitleStream>();
   private asks = new Map<string, { meta: PendingAsk; resolve: (answer: string) => void }>();
   private subs = new Map<Sub, { evict?: (why?: string) => void; key?: string }>();
   private hooks = new Set<Sub>();
@@ -188,11 +195,26 @@ export class CodexConversation {
     const ask = this.asks.get(askId); if (!ask) return false;
     this.asks.delete(askId); this.emit({ t: "ask_done", askId, answer }); ask.resolve(answer); return true;
   }
-  private ask(question: string, options: PendingAsk["options"], allowText = true): Promise<string> {
-    const askId = randomUUID(); const meta = { askId, question, options, allowText };
-    return new Promise(resolve => { this.asks.set(askId, { meta, resolve }); this.emit({ t: "ask", ...meta });
+  private ask(question: string, options: PendingAsk["options"], allowText = true, timeoutMs?: number, email?: EmailDraft): Promise<string> {
+    const askId = randomUUID(); const meta = { askId, question, options, allowText, ...(email ? { email } : {}) };
+    return new Promise(resolve => {
+      const timer = timeoutMs ? setTimeout(() => this.answerAsk(askId, "Cancelled"), timeoutMs) : undefined;
+      this.asks.set(askId, { meta, resolve: answer => { clearTimeout(timer); resolve(answer); } }); this.emit({ t: "ask", ...meta });
       if (!this.hasSubscribers()) this.opts.notifier?.({ sessionId: this.id, question, allowText });
     });
+  }
+  async composeEmail(args: { question?: string; from?: string; to: string; cc?: string; bcc?: string; subject: string; body: string; attachments?: string[] }) {
+    if (this.closed || !this.busy) throw new Error("Conversation is not active");
+    for (const key of ["to", "subject", "body"] as const) if (typeof args[key] !== "string") throw new Error(`${key} must be a string`);
+    const senders = emailSenders(this.mcpOverride || (this.opts.mcpFile ? await mcpServersForQuery(this.opts.mcpFile) : {}));
+    const fromOptions = senders.map(s => s.email);
+    if (!fromOptions.length) throw new Error("No connected email account can send");
+    const signatures = emailSignatures();
+    const email: EmailDraft = { ...args, attachments: resolveAttachments(args.attachments || []), fromOptions,
+      from: fromOptions.includes((args.from || "").toLowerCase()) ? args.from!.toLowerCase() : fromOptions[0],
+      signatures: Object.fromEntries(fromOptions.filter(a => signatures[a]).map(a => [a, signatures[a]])) };
+    const answer = await this.ask(args.question || "Review your email", [], true, 900_000, email);
+    return emailAnswerText(answer, email, senders);
   }
   private checkSettings(patch: SessionSettings) {
     if (patch.advisorModel) throw new Error("Codex does not support advisorModel");
@@ -223,7 +245,11 @@ export class CodexConversation {
       if (!this.mcpOverride && this.opts.mcpFile && existsSync(this.opts.mcpFile)) stored = JSON.parse(readFileSync(this.opts.mcpFile, "utf8"));
       const config = { mcp_servers: codexMcpConfig({ ...stored, ...sharedMcpConfig(this.opts, this.id, "codex", this.model) }) };
       const developerInstructions = [richChatInstructions, this.opts.sharedTools ? sharedInstructions("codex", this.model) : "", this.opts.handoffContext || ""].filter(Boolean).join("\n\n");
-      const client = new CodexClient(this.cwd);
+      this.emailGate ||= await createEmailGate(async reason => {
+        if (this.closed || !this.busy) return false;
+        return await this.ask(reason, [{ label: "Send email" }, { label: "Cancel" }], false, 300_000) === "Send email";
+      });
+      const client = new CodexClient(this.cwd, [], { CT_EMAIL_GATE_SOCKET: this.emailGate.socket });
       client.onNotification((method, params) => this.notification(method, params));
       client.onRequest = message => this.serverRequest(message);
       client.onExit = error => {
@@ -251,7 +277,7 @@ export class CodexConversation {
     const generation = this.interruptGeneration;
     this.runStart = this.log.length;
     this.emit({ t: "user", text, ...(cid ? { cid } : {}) });
-    if (!this.meta.first) { this.meta.first = text; this.meta.title = text.replace(/\s+/g, " ").slice(0, 80); this.persist(); }
+    if (!this.meta.first) { this.meta.first = text; this.meta.title = chatTitle(text); this.persist(); }
     this.setPhase("starting");
     const next = this.queue.then(async () => {
       if (this.closed) return;
@@ -261,12 +287,12 @@ export class CodexConversation {
         if (this.closed || generation !== this.interruptGeneration) { this.finish(); return; }
         const mode = /^\/(plan|default)\b\s*/.exec(text);
         if (mode) { this.meta.mode = mode[1] as "plan" | "default"; text = text.slice(mode[0].length) || (this.meta.mode === "plan" ? "Create a plan for the current task." : "Continue with the current task."); this.persist(); }
-        this.turnStarted = Date.now(); this.tokenBaseline = this.tokenUsage?.total; this.lastUsage = undefined; this.streamed.clear(); this.tools.clear();
+        this.turnStarted = Date.now(); this.tokenBaseline = this.tokenUsage?.total; this.lastUsage = undefined; this.streamed.clear(); this.tools.clear(); this.titleStreams.clear();
         const finished = new Promise<void>(resolve => { this.turnDone = resolve; });
         this.setPhase("waiting");
         const effort = this.settings.effortLevel || null;
         const result = await this.client!.request("turn/start", {
-          threadId: this.meta.threadId, input: [{ type: "text", text, text_elements: [] }],
+          threadId: this.meta.threadId, input: [{ type: "text", text: this.meta.generatedTitle ? text : text + "\n\n" + CODEX_TITLE_REQUEST, text_elements: [] }],
           model: this.model, effort, serviceTier: this.settings.fastMode ? "priority" : "default",
           ...(this.meta.mode ? { collaborationMode: { mode: this.meta.mode, settings: { model: this.model, reasoning_effort: effort, developer_instructions: null } } } : {}),
         });
@@ -277,16 +303,19 @@ export class CodexConversation {
     this.queue = next.catch(() => {}); return next;
   }
   private finish() {
+    for (const [bid, stream] of this.titleStreams) { const text = stream.finish(); if (text) this.emit({ t: "text_delta", text, bid }); }
+    this.titleStreams.clear();
     this.turnId = undefined; this.setPhase("idle"); this.persist(); const done = this.turnDone; this.turnDone = undefined; done?.();
   }
   async interrupt() {
     this.interruptGeneration++;
+    for (const id of this.asks.keys()) this.answerAsk(id, "Cancelled");
     if (this.client && this.meta.threadId && this.turnId) await this.client.request("turn/interrupt", { threadId: this.meta.threadId, turnId: this.turnId });
   }
   close() {
     if (this.closed) return;
     this.closed = true; for (const id of this.asks.keys()) this.answerAsk(id, "Cancelled");
-    this.client?.close(); this.client = undefined; this.finish(); this.emit({ t: "closed" });
+    this.client?.close(); this.client = undefined; this.emailGate?.close(); this.emailGate = undefined; this.finish(); this.emit({ t: "closed" });
     conversations.delete(this.id);
   }
   async contextUsage(): Promise<any | null> {
@@ -311,11 +340,25 @@ export class CodexConversation {
   async reloadSkills() { await this.boot(); return this.client!.request("skills/list", { cwds: [this.cwd], forceReload: true }); }
   async bootForRewind() { throw new Error("Codex edit-and-rerun is not supported; fork this conversation instead"); }
   async editTurn(_fork: string | null, _rewind: string | null, _text: string): Promise<any> { throw new Error("Codex edit-and-rerun is not supported; fork this conversation instead"); }
+  private titleStream(bid: string): CodexTitleStream {
+    let stream = this.titleStreams.get(bid);
+    if (!stream) {
+      stream = new CodexTitleStream(title => {
+        if (this.meta.generatedTitle) return;
+        this.meta.title = title; this.meta.generatedTitle = true;
+        this.persist(); this.emit({ t: "title", title });
+      });
+      this.titleStreams.set(bid, stream);
+    }
+    return stream;
+  }
   private notification(method: string, p: any) {
     if (!p || p.threadId !== this.meta.threadId) return;
     if (method === "turn/started") { this.turnId = p.turn.id; this.setPhase("waiting"); }
     else if (method === "item/agentMessage/delta" || method === "item/plan/delta") {
-      this.streamed.add(p.itemId); this.setPhase("writing"); this.emit({ t: "text_delta", text: p.delta, bid: p.itemId });
+      this.streamed.add(p.itemId); this.setPhase("writing");
+      const text = method === "item/agentMessage/delta" ? this.titleStream(p.itemId).push(p.delta) : p.delta;
+      if (text) this.emit({ t: "text_delta", text, bid: p.itemId });
     } else if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") {
       this.streamed.add(p.itemId); this.setPhase("thinking"); this.emit({ t: "thinking_delta", text: p.delta, bid: p.itemId });
     } else if (method === "item/started" || method === "item/completed") {
@@ -337,7 +380,7 @@ export class CodexConversation {
       this.emit({ t: "error", message: p.error?.message || p.message || "Codex error" });
       if (!p.willRetry) this.finish(); else this.setPhase("retrying");
     } else if (method === "thread/name/updated") {
-      this.meta.title = p.threadName || p.name || this.meta.title; this.persist(); this.emit({ t: "title", title: this.meta.title });
+      if (!this.meta.generatedTitle) { this.meta.title = providerChatTitle(p.threadName || p.name || this.meta.title, this.meta.first); this.persist(); this.emit({ t: "title", title: this.meta.title }); }
     } else if (method === "model/rerouted") {
       this.model = p.toModel || this.model; this.persist(); if (this.model) this.emit({ t: "model", model: this.model });
     } else if (method === "item/mcpToolCall/progress") this.emit({ t: "notice", kind: "info", text: p.message || "MCP tool is running" });
@@ -349,8 +392,13 @@ export class CodexConversation {
       if (!done) return;
       if (!this.streamed.has(id)) {
         if (item.type === "reasoning") { const text = (item.summary?.length ? item.summary : item.content || []).join("\n"); if (text) this.emit({ t: "thinking", text, bid: id }); }
-        else if (item.text) this.emit({ t: "text", text: item.text, bid: id });
+        else if (item.text) {
+          const text = item.type === "agentMessage" ? this.titleStream(id).push(item.text) : item.text;
+          if (text) this.emit({ t: "text", text, bid: id });
+        }
       }
+      const tail = this.titleStreams.get(id)?.finish();
+      if (tail) this.emit({ t: "text_delta", text: tail, bid: id });
       this.emit({ t: "block_end", bid: id }); return;
     }
     if (item.type === "contextCompaction") {
@@ -418,15 +466,25 @@ export function getOrCreateCodex(key: string | null, opts: ConvOpts): CodexConve
 export function getCodex(id: string): CodexConversation | undefined { const c = conversations.get(id); return c && !c.isClosed ? c : undefined; }
 export function codexLiveStatuses(): Record<string, LiveStatus> { return Object.fromEntries([...conversations].filter(([, c]) => !c.isClosed).map(([id, c]) => [id, c.statusInfo()])); }
 export function codexLiveActivity(): { id: string; busy: boolean; waiting: boolean; activitySeq: number }[] { return [...conversations].filter(([, c]) => !c.isClosed).map(([id, c]) => ({ id, ...c.statusInfo(), activitySeq: c.activitySeq })); }
+export function listCodexDelegations(): { id: string; parentSession?: string; agentDepth?: number; model?: string }[] {
+  try { return readdirSync(stateDir()).flatMap(name => {
+    if (!name.endsWith(".json") || !ID.test(name.slice(0, -5))) return [];
+    const meta = loadMeta(name.slice(0, -5));
+    return meta && (meta.parentSession || (meta.agentDepth ?? 0) > 0)
+      ? [{ id: meta.id, parentSession: meta.parentSession, agentDepth: meta.agentDepth, model: meta.model }] : [];
+  }); } catch { return []; }
+}
 export function listCodexConversations(): { sessionId: string; path: string; project: string; mtime: number }[] {
   try { return readdirSync(stateDir()).filter(name => ID.test(name.replace(/\.json$/, "")) && name.endsWith(".json")).flatMap(name => {
     const id = name.slice(0, -5), meta = loadMeta(id); if (!meta?.first) return [];
+    // Delegated work remains addressable by ID, but is not a top-level chat.
+    if (meta.parentSession || (meta.agentDepth ?? 0) > 0) return [];
     return [{ sessionId: id, path: pathFor(id, "jsonl"), project: "codex", mtime: meta.updatedAt || statSync(pathFor(id)).mtimeMs }];
   }).sort((a, b) => b.mtime - a.mtime); } catch { return []; }
 }
 export function isCodexTranscriptPath(path: string): boolean { return /^codex-[a-f0-9-]{36}\.jsonl$/i.test(basename(path)); }
 export function findCodexTranscript(id: string): { path: string; project: string } | null { return loadMeta(id) ? { path: pathFor(id, "jsonl"), project: "codex" } : null; }
-export function codexMeta(idOrPath: string) { const meta = loadMeta(idOrPath); return meta ? { title: meta.title, cwd: meta.cwd, first: meta.first, model: meta.model, settings: meta.settings } : { title: "", cwd: "", first: "" }; }
+export function codexMeta(idOrPath: string) { const meta = loadMeta(idOrPath); return meta ? { title: meta.title === meta.first.replace(/\s+/g, " ").slice(0, 80) ? chatTitle(meta.first) : providerChatTitle(meta.title, meta.first), cwd: meta.cwd, first: meta.first, model: meta.model, settings: meta.settings } : { title: "", cwd: "", first: "" }; }
 export async function replayCodexTranscript(idOrPath: string): Promise<AppEvent[]> {
   const id = basename(idOrPath).replace(/\.(jsonl|json)$/, "");
   const events: AppEvent[] = [];

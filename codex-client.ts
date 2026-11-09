@@ -21,7 +21,7 @@ export class CodexClient {
   private ready?: Promise<void>;
   onRequest?: (message: RpcMessage) => Promise<any>;
   onExit?: (error: Error) => void;
-  constructor(private cwd?: string, private extraArgs: string[] = []) {}
+  constructor(private cwd?: string, private extraArgs: string[] = [], private extraEnv: NodeJS.ProcessEnv = {}) {}
 
   onNotification(fn: Listener): () => void { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   start(): Promise<void> {
@@ -31,7 +31,7 @@ export class CodexClient {
   }
   private async initialize() {
     const child = this.process = spawn(codexExecutable(), ["app-server", "--listen", "stdio://", ...this.extraArgs], {
-      cwd: this.cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"],
+      cwd: this.cwd, env: { ...process.env, ...this.extraEnv }, stdio: ["pipe", "pipe", "pipe"],
     });
     // Consume stderr without forwarding configuration or authentication material into app logs.
     child.stderr.resume();

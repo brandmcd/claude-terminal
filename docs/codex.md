@@ -37,3 +37,27 @@ The phone bridge accepts “Use Codex,” “Use Claude,” or a model family an
 Both providers can use the existing `claude-call` command for requested outbound
 calls, including its quiet-hour checks. Phone-screen control isn't configured.
 Question and approval cards still require the web app.
+
+## Email approval
+
+The owner installs `codex-email-hook.py` as `~/.codex/hooks/email-gate.py` and
+registers it in `~/.codex/hooks.json` for `PreToolUse`, matcher `Bash|mcp__.*`,
+timeout 330 seconds. Trust that exact hook definition using Codex's hooks
+configuration. Verify `hooks/list` reports it enabled and trusted.
+
+The adapter calls the existing `~/.claude/hooks/email-gate.py` detector, including
+its one-use compose-card approvals. For an unapproved send it waits on a private
+Unix socket supplied by `CodexConversation` and displays the full send arguments
+in the existing chat approval UI. Only **Send email** releases the tool. Cancel,
+interrupt, a five-minute timeout, or a bridge error denies the send. Outside the
+chat app, sends without an existing compose approval are denied.
+
+Codex does not support Claude's `permissionDecision: "ask"`; passing that through
+would fail open. The adapter returns only explicit allow/deny decisions. See
+[OpenAI's hook contract](https://learn.chatgpt.com/docs/hooks#pretooluse).
+The detector retains the existing Claude gate's heuristic coverage; this is not
+an OS-level restriction on arbitrary code or network access.
+
+After installing backend changes, restart `ct-sidecar.service` when active chats
+have finished. Already-running Codex processes must be recreated to load the hook
+and the per-conversation approval socket. No frontend build is needed.

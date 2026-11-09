@@ -23,7 +23,7 @@
 // (`sk-ant-oat01-…` from `claude setup-token`), read from the environment. OAuth tokens go on
 // `Authorization: Bearer` with the oauth beta header — NOT `x-api-key`, which rejects them.
 const ENDPOINT = "https://api.anthropic.com/v1/messages";
-const PROBE_MODEL = "claude-fable-5-1";
+const PROBE_MODEL = "claude-fable-5-2";
 const FALLBACK_MODEL = "claude-haiku-4-5";
 const SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 const TTL_MS = 60_000;
@@ -46,11 +46,13 @@ let cache: Limits | null = null;
 let inflight: Promise<Limits | null> | null = null;
 
 // Header utilization is a fraction (0.16 = 16%); the rest of the stack speaks percent.
-function pct(raw: string | null): number | null {
-  if (raw == null) return null;
+export function pct(raw: string | null): number | null {
+  if (raw == null || raw.trim() === "") return null;
   const v = Number(raw);
   if (!isFinite(v)) return null;
-  return Math.max(0, Math.min(100, v <= 1 ? v * 100 : v));
+  // Fractions can exceed 1 when the account has exhausted its current plan's limit.
+  // 1.01 means 101% used, not 1.01%; keep exhausted windows full on the dashboard.
+  return Math.max(0, Math.min(100, v * 100));
 }
 
 function iso(raw: string | null): string | null {

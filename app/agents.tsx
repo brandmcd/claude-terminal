@@ -640,6 +640,7 @@ function SpawnStrip({ entries, onOpen, onOpenIndex }: { entries: SpawnedEntry[];
 }
 
 export interface SpawnedWorkProps {
+  busy?: boolean;
   items: readonly unknown[];                        // the open conversation's items (main.tsx `items`)
   sessionId: string | null;                         // the open conversation id, for the API calls
   onJump?: (toolUseId: string) => void;             // scroll the thread to the inline Task card
@@ -649,7 +650,7 @@ export interface SpawnedWorkProps {
 // The whole feature, so main.tsx mounts one element: the pinned strip, plus the full-height viewer it
 // opens. Kind decides what a tap does — subagent and workflow open the sheet (transcript / phases +
 // children), a tab switches conversation and never opens a viewer.
-export function SpawnedWork({ items, sessionId, onJump, onOpenConversation }: SpawnedWorkProps): React.JSX.Element | null {
+export function SpawnedWork({ items, sessionId, busy, onJump, onOpenConversation }: SpawnedWorkProps): React.JSX.Element | null {
   const local = useMemo(() => localSpawned(items), [items]);
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [sheet, setSheet] = useState(false);
@@ -657,7 +658,7 @@ export function SpawnedWork({ items, sessionId, onJump, onOpenConversation }: Sp
   // The server list is asked for only when it can change something: while work is in flight (so a
   // launched agent can stop saying "running"), or while the sheet is open. One owner, shared by both.
   const anyRunning = local.some((e) => e.running);
-  const { list, loading, err, reload } = useSpawnedList(sessionId, local, sheet || anyRunning);
+  const { list, loading, err, reload } = useSpawnedList(sessionId, local, sheet || anyRunning || !!busy);
 
   const onOpen = useCallback((e: SpawnedEntry) => {
     if (e.kind === "tab") {

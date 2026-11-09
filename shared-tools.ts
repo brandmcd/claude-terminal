@@ -14,6 +14,7 @@ class ToolError extends Error {
 const object = (properties: Args, required: string[]) => ({ type: "object", properties, required, additionalProperties: false });
 const string = { type: "string", minLength: 1 };
 const TOOLS: Tool[] = [
+  { name: "email_compose", description: "Show an editable email compose card with Send and Cancel. Use before sending any email. Leave signatures out of body; the card adds the selected account signature. Returns exact approved send fields or cancellation/revision instructions. Never sends by itself.", inputSchema: object({ question: string, from: string, to: string, cc: {type:"string"}, bcc: {type:"string"}, subject: {type:"string"}, body: {type:"string"}, attachments: {type:"array",items:string} }, ["to", "subject", "body"]) },
   { name: "agent_models", description: "List available Claude and Codex model IDs, labels and providers. Use this before delegation to map user names such as Sol or Opus to an available model ID.", inputSchema: object({}, []) },
   { name: "agent_spawn", description: "Start a scoped child chat on an explicit Claude or Codex model. Poll agent_status for its result. Delegation is limited to three levels. The child must use the shared vault tools for vault writes.", inputSchema: object({ model: string, prompt: string, cwd: string }, ["model", "prompt"]) },
   { name: "agent_status", description: "Read a child chat's latest assistant response, busy state, unanswered questions, and recent tool states.", inputSchema: object({ id: string }, ["id"]) },
@@ -38,7 +39,7 @@ function depth(): number {
   if (!Number.isInteger(value) || value < 0 || value > 3) throw new ToolError("configuration", "CT_AGENT_DEPTH must be an integer between 0 and 3");
   return value;
 }
-async function appRequest(path: string, body?: Args): Promise<any> {
+async function appRequest(path: string, body?: Args, timeoutMs = 30_000): Promise<any> {
   const url = new URL(process.env.CT_APP_URL || "http://127.0.0.1:3001");
   if (!["http:", "https:"].includes(url.protocol) || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) || url.username || url.password) {
     throw new ToolError("configuration", "CT_APP_URL must be a loopback HTTP URL without credentials");
@@ -46,7 +47,7 @@ async function appRequest(path: string, body?: Args): Promise<any> {
   const owner = process.env.CT_OWNER;
   if (!owner) throw new ToolError("configuration", "CT_OWNER is required for agent tools");
   const response = await fetch(new URL(path, url), {
-    method: body ? "POST" : "GET", redirect: "error", signal: AbortSignal.timeout(30_000),
+    method: body ? "POST" : "GET", redirect: "error", signal: AbortSignal.timeout(timeoutMs),
     headers: { "remote-user": owner, ...(body ? { "content-type": "application/json" } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
@@ -197,6 +198,11 @@ export async function callTool(name: string, args: Args = {}) {
   const properties = (tool.inputSchema.properties || {}) as Args;
   if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some(key => !(key in properties))) throw new ToolError("invalid_arguments", "Unexpected tool arguments");
   switch (name) {
+    case "email_compose": {
+      const id = process.env.CT_PARENT_SESSION;
+      if (!id) throw new ToolError("configuration", "Conversation ID required");
+      return appRequest("/app/api/email-compose", { ...args, id }, 960_000);
+    }
     case "agent_models": return agentModels();
     case "agent_spawn": return agentSpawn(args);
     case "agent_status": return agentStatus(args);

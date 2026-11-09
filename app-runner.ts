@@ -452,9 +452,12 @@ export type AskNotifier = (info: { sessionId: string; question: string; multiSel
 
 export interface ConvOpts {
   handoffContext?: string;
+  handoffTitle?: string;
+  handoffFork?: boolean;
   sharedTools?: { url: string; owner: string; vault: string };
   agentDepth?: number;
   parentSession?: string;
+  launchAlias?: string;
   cwd: string;
   model?: string;
   resume?: string; // existing session id to reattach to
@@ -485,7 +488,7 @@ export type PendingAsk = { askId: string; question: string; options: { label: st
 export type EmailAttachment = { path: string; name: string; size: number; sha256: string };
 export type EmailDraft = { from?: string; fromOptions?: string[]; signatures?: Record<string, string>; to: string; cc?: string; bcc?: string; subject: string; body: string; attachments?: EmailAttachment[] };
 // Pins each attachment to its resolved path and content hash, so the approval does not cover a file swapped in later.
-function resolveAttachments(paths: string[]): EmailAttachment[] {
+export function resolveAttachments(paths: string[]): EmailAttachment[] {
   return paths.map((p) => {
     const real = realpathSync(p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
     const st = statSync(real);
@@ -495,7 +498,7 @@ function resolveAttachments(paths: string[]): EmailAttachment[] {
 }
 // Per-account signatures the card appends below the body, keyed by address. Edit the file to change them.
 const EMAIL_SIGNATURES = join(homedir(), ".config", "ct-email", "signatures.json");
-function emailSignatures(): Record<string, string> {
+export function emailSignatures(): Record<string, string> {
   try {
     const o = JSON.parse(readFileSync(EMAIL_SIGNATURES, "utf8"));
     return Object.fromEntries(Object.entries(o || {}).filter(([k]) => k.includes("@")).map(([k, v]) => [k.toLowerCase(), String(v)]));
@@ -511,7 +514,7 @@ const escHtml = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").re
 const gmailHtml = (body: string) => `<div dir="ltr">${escHtml(body.replace(/\r\n/g, "\n").replace(/\s+$/, "")).split("\n").join("<br>")}</div>`;
 // Google accounts that can send: enabled workspace-mcp servers not started with --read-only.
 type EmailSender = { email: string; server: string };
-function emailSenders(stored: Record<string, any>): EmailSender[] {
+export function emailSenders(stored: Record<string, any>): EmailSender[] {
   const out: EmailSender[] = [];
   for (const [server, cfg] of Object.entries(stored || {})) {
     const args: string[] = Array.isArray(cfg?.args) ? cfg.args : [];
@@ -533,7 +536,7 @@ function canonEmail(d: Partial<EmailDraft>) {
 }
 // Tool result for an answer to an email ask. The card answers with {"action":"send"|"cancel",...};
 // anything else was typed in the composer and is a revision request.
-function emailAnswerText(answer: string, draft: EmailDraft, senders: EmailSender[]): string {
+export function emailAnswerText(answer: string, draft: EmailDraft, senders: EmailSender[]): string {
   let a: any = null;
   try { a = JSON.parse(answer); } catch { /* typed text */ }
   if (a?.action === "cancel") return "The user cancelled this email. Do not send it.";
@@ -1542,9 +1545,9 @@ let tmpCounter = 0;
 // arrives on the init event. For an existing chat pass its session id as both key+resume.
 export function getOrCreate(key: string | null, opts: ConvOpts): LiveConversation {
   const saved = key ? readLaunchContext(key) : null;
-  if (saved) opts = { ...saved.options, ...opts, model: opts.model || saved.options.model, agentDepth: saved.options.agentDepth, handoffContext: saved.options.handoffContext };
+  if (saved) opts = { ...saved.options, ...opts, model: opts.model || saved.options.model, agentDepth: saved.options.agentDepth, parentSession: saved.options.parentSession, launchAlias: saved.options.launchAlias, handoffContext: saved.options.handoffContext };
   const handoff = key ? readHandoff(key) : null;
-  if (handoff) opts = { ...opts, cwd: handoff.cwd, model: handoff.model, resume: undefined, handoffContext: handoff.context };
+  if (handoff) opts = { ...opts, cwd: handoff.cwd, model: handoff.model, resume: undefined, handoffContext: handoff.context, handoffTitle: handoff.title, handoffFork: handoff.title.endsWith(" (fork)") };
   if (isCodexModel(opts.model) || (!handoff && key?.startsWith("codex-"))) {
     const c = getOrCreateCodex(handoff ? null : key, opts);
     conversations.set(c.id, c);
@@ -1561,6 +1564,7 @@ export function getOrCreate(key: string | null, opts: ConvOpts): LiveConversatio
     return c;
   }
   const id = (handoff ? null : key) || `new-${Date.now().toString(36)}-${tmpCounter++}`;
+  opts = { ...opts, launchAlias: opts.launchAlias || id };
   const c = new Conversation(id, opts);
   conversations.set(id, c);
   if (key) conversations.set(key, c);
